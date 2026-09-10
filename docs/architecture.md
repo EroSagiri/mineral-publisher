@@ -403,11 +403,14 @@ Public Projection 中不允许存在没有被最终公开 Markdown 使用的孤�
 
 ```text
 ReferenceKind
-├── NoteLink
-├── AssetEmbed
-├── AssetLink
-└── ExternalLink
+├── WikiLink
+├── WikiEmbed
+├── MarkdownLink
+├── MarkdownImage
+└── ExternalUrl
 ```
+
+ReferenceKind 描述源 Markdown 使用的语法，而不是目标的最终类型。Parser 只保留未解析 target；后续 Resolver 才根据 Snapshot 判断 target 对应 Markdown、二进制资源、缺失项或歧义项。
 
 例如：
 
