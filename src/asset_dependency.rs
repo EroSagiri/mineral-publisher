@@ -1,5 +1,7 @@
 use std::{collections::BTreeMap, ops::Range};
 
+use serde::{Deserialize, Serialize};
+
 use crate::{
     domain::{
         ContentPath, InvalidResolutionReason, ReferenceKind, Resolution, ResolutionCandidate,
@@ -8,7 +10,7 @@ use crate::{
 };
 
 /// Where a resolved dependency or unresolved dependency problem appeared.
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct ReferenceOrigin {
     span_start: usize,
     span_end: usize,
@@ -56,7 +58,8 @@ impl AssetDependency {
 }
 
 /// Why a local reference could not be safely classified as an asset dependency.
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DependencyProblemKind {
     Missing {
         target: String,
@@ -72,7 +75,7 @@ pub enum DependencyProblemKind {
 }
 
 /// An unresolved local reference retained for later policy or reporting layers.
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct DependencyProblem {
     document_path: ContentPath,
     origin: ReferenceOrigin,

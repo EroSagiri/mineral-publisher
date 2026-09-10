@@ -1,11 +1,14 @@
 use std::ops::Range;
 
+use serde::{Deserialize, Serialize};
+
 /// The source syntax used for a reference found in Markdown.
 ///
 /// This intentionally does not describe the target's eventual type. Resolving
 /// a target to a note, asset, missing file, or ambiguous file needs a Snapshot
 /// and belongs to a later resolver.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ReferenceKind {
     WikiLink,
     WikiEmbed,

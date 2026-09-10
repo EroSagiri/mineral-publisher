@@ -5,13 +5,15 @@ use crate::{
     domain::ContentPath,
     privacy_filter::PublicCandidateMarkdown,
 };
+use serde::{Deserialize, Serialize};
 
 /// One deterministic structural issue found before external AI review.
 ///
 /// The underlying dependency problem is retained intact so callers can inspect
 /// the original reference, its source span, all ambiguous candidates, and a
 /// typed invalid-resolution reason.
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
 pub struct ProgramCheckIssue(DependencyProblem);
 
 impl ProgramCheckIssue {

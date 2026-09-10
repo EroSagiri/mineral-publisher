@@ -5,6 +5,7 @@ use std::{
     time::SystemTime,
 };
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256 as Sha256Hasher};
 
 use super::ContentPath;
@@ -41,7 +42,8 @@ impl SourceId {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(transparent)]
 pub struct Sha256([u8; 32]);
 
 impl Sha256 {

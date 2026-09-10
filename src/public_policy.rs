@@ -1,7 +1,9 @@
 use std::{error::Error, fmt};
 
+use serde::{Deserialize, Serialize};
+
 use crate::{
-    domain::ContentPath,
+    domain::{ContentPath, Sha256},
     privacy_filter::PublicCandidateMarkdown,
     program_check::{ProgramCheck, ProgramCheckIssue, ProgramCheckResult},
     snapshot_markdown_analysis::AnalyzedMarkdown,
@@ -26,7 +28,8 @@ impl ReviewCandidate {
 }
 
 /// Provider-independent semantic review result.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ReviewDecision {
     Approve,
     Reject,
@@ -37,7 +40,8 @@ pub enum ReviewDecision {
 ///
 /// Reviewer failures are distinct from review decisions so callers cannot
 /// accidentally treat an unavailable or malformed response as approval.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
 pub struct ReviewerError {
     message: String,
 }
@@ -70,14 +74,16 @@ pub trait Reviewer {
 }
 
 /// Why public policy requires a human decision.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum HumanReviewReason {
     ReviewerRequested,
     ReviewerFailed(ReviewerError),
 }
 
 /// The typed reason a document did not advance automatically through public policy.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "outcome", content = "details", rename_all = "snake_case")]
 pub enum PublicPolicyDecision {
     ProgramIssues(Vec<ProgramCheckIssue>),
     ReviewApproved,
@@ -89,6 +95,7 @@ pub enum PublicPolicyDecision {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PublicPolicyOutcome {
     path: ContentPath,
+    content_sha256: Sha256,
     decision: PublicPolicyDecision,
 }
 
@@ -99,6 +106,10 @@ impl PublicPolicyOutcome {
 
     pub fn decision(&self) -> &PublicPolicyDecision {
         &self.decision
+    }
+
+    pub fn content_sha256(&self) -> Sha256 {
+        self.content_sha256
     }
 }
 
@@ -120,6 +131,7 @@ impl PublicPolicy {
             .into_iter()
             .map(|document| {
                 let path = document.path().clone();
+                let content_sha256 = document.analysis().file().sha256();
                 let decision = match ProgramCheck::check(std::slice::from_ref(&document)) {
                     ProgramCheckResult::Issues(issues) => {
                         PublicPolicyDecision::ProgramIssues(issues)
@@ -141,7 +153,11 @@ impl PublicPolicy {
                     }
                 };
 
-                PublicPolicyOutcome { path, decision }
+                PublicPolicyOutcome {
+                    path,
+                    content_sha256,
+                    decision,
+                }
             })
             .collect()
     }

@@ -1,14 +1,16 @@
 use super::{ContentPath, Reference, ReferenceKind, Snapshot};
+use serde::{Deserialize, Serialize};
 
 /// The concrete type of a local Snapshot target.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ResolvedTargetKind {
     Note,
     Asset,
 }
 
 /// A deterministically ordered candidate retained for an ambiguous reference.
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct ResolutionCandidate {
     kind: ResolvedTargetKind,
     path: ContentPath,
@@ -28,7 +30,8 @@ impl ResolutionCandidate {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum InvalidResolutionReason {
     InvalidLocalPath,
     EscapesContentRoot,

@@ -1,7 +1,10 @@
 use std::{error::Error, fmt};
 
+use serde::{Deserialize, Deserializer, Serialize};
+
 /// A canonical, vault-relative path.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
 pub struct ContentPath(String);
 
 impl ContentPath {
@@ -35,6 +38,16 @@ impl ContentPath {
 impl fmt::Display for ContentPath {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for ContentPath {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
     }
 }
 
