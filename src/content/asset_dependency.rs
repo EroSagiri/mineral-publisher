@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, ops::Range};
 
 use serde::{Deserialize, Serialize};
 
-use crate::domain::ContentPath;
+use crate::domain::{ContentPath, SnapshotId};
 
 use super::{
     AnalyzedMarkdown, InvalidResolutionReason, ReferenceKind, Resolution, ResolutionCandidate,
@@ -96,114 +96,34 @@ impl DependencyProblem {
 }
 
 /// Deterministic asset dependency edges and unresolved local-reference problems.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AssetDependencyGraph {
+    snapshot_id: SnapshotId,
     dependencies: Vec<AssetDependency>,
     problems: Vec<DependencyProblem>,
 }
 
 impl AssetDependencyGraph {
     /// Analyzes the asset dependencies of one already-analyzed Markdown file.
-    pub fn from_document(document: &AnalyzedMarkdown) -> Self {
-        Self::build(std::slice::from_ref(document))
+    pub fn from_document(snapshot_id: SnapshotId, document: &AnalyzedMarkdown) -> Self {
+        Self::build(snapshot_id, std::slice::from_ref(document))
     }
 
     /// Builds a graph only from existing Markdown analysis results.
     ///
     /// This function performs no parsing, resolution, storage, or filesystem IO.
-    pub fn build(documents: &[AnalyzedMarkdown]) -> Self {
-        let mut dependencies = Vec::new();
-        let mut problems = Vec::new();
-
-        for document in documents {
-            let document_path = document.path().clone();
-            let mut document_assets: BTreeMap<ContentPath, Vec<ReferenceOrigin>> = BTreeMap::new();
-
-            for resolved_reference in document.references() {
-                let reference = resolved_reference.reference();
-                let span = reference.span();
-                let origin = ReferenceOrigin {
-                    kind: reference.kind(),
-                    target: reference.target().to_owned(),
-                    span_start: span.start,
-                    span_end: span.end,
-                };
-
-                match resolved_reference.resolution() {
-                    Resolution::ResolvedAsset { path }
-                        if matches!(
-                            reference.kind(),
-                            ReferenceKind::WikiEmbed
-                                | ReferenceKind::MarkdownImage
-                                | ReferenceKind::MarkdownLink
-                        ) =>
-                    {
-                        document_assets
-                            .entry(path.clone())
-                            .or_default()
-                            .push(origin);
-                    }
-                    // A note is never an asset dependency, including when embedded.
-                    Resolution::ResolvedNote { .. } | Resolution::External { .. } => {}
-                    Resolution::Missing { target } => problems.push(DependencyProblem {
-                        document_path: document_path.clone(),
-                        origin,
-                        kind: DependencyProblemKind::Missing {
-                            target: target.clone(),
-                        },
-                    }),
-                    Resolution::Ambiguous { target, candidates } => {
-                        let mut candidates = candidates.clone();
-                        candidates.sort();
-                        candidates.dedup();
-                        problems.push(DependencyProblem {
-                            document_path: document_path.clone(),
-                            origin,
-                            kind: DependencyProblemKind::Ambiguous {
-                                target: target.clone(),
-                                candidates,
-                            },
-                        });
-                    }
-                    Resolution::Invalid { target, reason } => {
-                        problems.push(DependencyProblem {
-                            document_path: document_path.clone(),
-                            origin,
-                            kind: DependencyProblemKind::Invalid {
-                                target: target.clone(),
-                                reason: *reason,
-                            },
-                        });
-                    }
-                    // These combinations cannot be produced by the current resolver.
-                    Resolution::ResolvedAsset { .. } => {}
-                }
-            }
-
-            dependencies.extend(
-                document_assets
-                    .into_iter()
-                    .map(|(asset_path, mut origins)| {
-                        origins.sort();
-                        origins.dedup();
-                        AssetDependency {
-                            document_path: document_path.clone(),
-                            asset_path,
-                            origins,
-                        }
-                    }),
-            );
-        }
-
-        dependencies.sort();
-        dependencies.dedup();
-        problems.sort();
-        problems.dedup();
+    pub fn build(snapshot_id: SnapshotId, documents: &[AnalyzedMarkdown]) -> Self {
+        let (dependencies, problems) = analyze_documents(documents);
 
         Self {
+            snapshot_id,
             dependencies,
             problems,
         }
+    }
+
+    pub fn snapshot_id(&self) -> SnapshotId {
+        self.snapshot_id
     }
 
     pub fn dependencies(&self) -> &[AssetDependency] {
@@ -213,6 +133,104 @@ impl AssetDependencyGraph {
     pub fn problems(&self) -> &[DependencyProblem] {
         &self.problems
     }
+}
+
+pub(crate) fn dependency_problems(documents: &[AnalyzedMarkdown]) -> Vec<DependencyProblem> {
+    analyze_documents(documents).1
+}
+
+fn analyze_documents(
+    documents: &[AnalyzedMarkdown],
+) -> (Vec<AssetDependency>, Vec<DependencyProblem>) {
+    let mut dependencies = Vec::new();
+    let mut problems = Vec::new();
+
+    for document in documents {
+        let document_path = document.path().clone();
+        let mut document_assets: BTreeMap<ContentPath, Vec<ReferenceOrigin>> = BTreeMap::new();
+
+        for resolved_reference in document.references() {
+            let reference = resolved_reference.reference();
+            let span = reference.span();
+            let origin = ReferenceOrigin {
+                kind: reference.kind(),
+                target: reference.target().to_owned(),
+                span_start: span.start,
+                span_end: span.end,
+            };
+
+            match resolved_reference.resolution() {
+                Resolution::ResolvedAsset { path }
+                    if matches!(
+                        reference.kind(),
+                        ReferenceKind::WikiEmbed
+                            | ReferenceKind::MarkdownImage
+                            | ReferenceKind::MarkdownLink
+                    ) =>
+                {
+                    document_assets
+                        .entry(path.clone())
+                        .or_default()
+                        .push(origin);
+                }
+                // A note is never an asset dependency, including when embedded.
+                Resolution::ResolvedNote { .. } | Resolution::External { .. } => {}
+                Resolution::Missing { target } => problems.push(DependencyProblem {
+                    document_path: document_path.clone(),
+                    origin,
+                    kind: DependencyProblemKind::Missing {
+                        target: target.clone(),
+                    },
+                }),
+                Resolution::Ambiguous { target, candidates } => {
+                    let mut candidates = candidates.clone();
+                    candidates.sort();
+                    candidates.dedup();
+                    problems.push(DependencyProblem {
+                        document_path: document_path.clone(),
+                        origin,
+                        kind: DependencyProblemKind::Ambiguous {
+                            target: target.clone(),
+                            candidates,
+                        },
+                    });
+                }
+                Resolution::Invalid { target, reason } => {
+                    problems.push(DependencyProblem {
+                        document_path: document_path.clone(),
+                        origin,
+                        kind: DependencyProblemKind::Invalid {
+                            target: target.clone(),
+                            reason: *reason,
+                        },
+                    });
+                }
+                // These combinations cannot be produced by the current resolver.
+                Resolution::ResolvedAsset { .. } => {}
+            }
+        }
+
+        dependencies.extend(
+            document_assets
+                .into_iter()
+                .map(|(asset_path, mut origins)| {
+                    origins.sort();
+                    origins.dedup();
+                    AssetDependency {
+                        document_path: document_path.clone(),
+                        asset_path,
+                        origins,
+                    }
+                }),
+        );
+    }
+
+    dependencies.sort();
+    dependencies.dedup();
+    problems.sort();
+    problems.dedup();
+
+    (dependencies, problems)
 }
 
 #[cfg(test)]
@@ -226,6 +244,10 @@ mod tests {
 
     fn path(value: &str) -> ContentPath {
         ContentPath::new(value).unwrap()
+    }
+
+    fn snapshot_id() -> SnapshotId {
+        SnapshotId::new(1).unwrap()
     }
 
     fn candidate(kind: ResolvedTargetKind, value: &str) -> ResolutionCandidate {
@@ -273,7 +295,7 @@ mod tests {
             ],
         );
 
-        let graph = AssetDependencyGraph::from_document(&document);
+        let graph = AssetDependencyGraph::from_document(snapshot_id(), &document);
 
         assert_eq!(
             graph
@@ -298,7 +320,7 @@ mod tests {
             ],
         );
 
-        let graph = AssetDependencyGraph::build(&[document]);
+        let graph = AssetDependencyGraph::build(snapshot_id(), &[document]);
 
         assert!(graph.dependencies().is_empty());
         assert!(graph.problems().is_empty());
@@ -319,7 +341,7 @@ mod tests {
             ],
         );
 
-        let graph = AssetDependencyGraph::build(&[document]);
+        let graph = AssetDependencyGraph::build(snapshot_id(), &[document]);
 
         assert!(graph.dependencies().is_empty());
         assert!(graph.problems().is_empty());
@@ -333,7 +355,7 @@ mod tests {
             vec![asset("image.png"), asset("image.png")],
         );
 
-        let graph = AssetDependencyGraph::build(&[document]);
+        let graph = AssetDependencyGraph::build(snapshot_id(), &[document]);
 
         assert_eq!(graph.dependencies().len(), 1);
         assert_eq!(graph.dependencies()[0].origins().len(), 2);
@@ -344,7 +366,7 @@ mod tests {
         let a = analyzed("a.md", "![[image.png]]", vec![asset("image.png")]);
         let b = analyzed("b.md", "![image](image.png)", vec![asset("image.png")]);
 
-        let graph = AssetDependencyGraph::build(&[a, b]);
+        let graph = AssetDependencyGraph::build(snapshot_id(), &[a, b]);
 
         assert_eq!(graph.dependencies().len(), 2);
         assert_eq!(graph.dependencies()[0].document_path().as_str(), "a.md");
@@ -380,7 +402,7 @@ mod tests {
             ],
         );
 
-        let graph = AssetDependencyGraph::build(&[document]);
+        let graph = AssetDependencyGraph::build(snapshot_id(), &[document]);
 
         assert!(graph.dependencies().is_empty());
         assert_eq!(graph.problems().len(), 3);
@@ -440,8 +462,16 @@ mod tests {
         let second_b = analyzed("b.md", "[file](b.pdf)", vec![asset("b.pdf")]);
 
         assert_eq!(
-            AssetDependencyGraph::build(&[first_a, first_b]),
-            AssetDependencyGraph::build(&[second_b, second_a])
+            AssetDependencyGraph::build(snapshot_id(), &[first_a, first_b]),
+            AssetDependencyGraph::build(snapshot_id(), &[second_b, second_a])
         );
+    }
+
+    #[test]
+    fn graph_retains_snapshot_identity() {
+        let id = SnapshotId::new(42).unwrap();
+        let graph = AssetDependencyGraph::build(id, &[]);
+
+        assert_eq!(graph.snapshot_id(), id);
     }
 }

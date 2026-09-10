@@ -1,5 +1,5 @@
 use crate::{
-    content::{AssetDependencyGraph, DependencyProblem, DependencyProblemKind, ReferenceOrigin},
+    content::{DependencyProblem, DependencyProblemKind, ReferenceOrigin, dependency_problems},
     domain::ContentPath,
 };
 
@@ -68,11 +68,8 @@ impl ProgramCheck {
             .iter()
             .map(|document| document.analysis().clone())
             .collect::<Vec<_>>();
-        let graph = AssetDependencyGraph::build(&analyses);
-        let issues = graph
-            .problems()
-            .iter()
-            .cloned()
+        let issues = dependency_problems(&analyses)
+            .into_iter()
             .map(ProgramCheckIssue)
             .collect::<Vec<_>>();
 
@@ -92,7 +89,7 @@ mod tests {
             MarkdownReferenceParser, ReferenceKind, Resolution, ResolutionCandidate,
             ResolvedReference, ResolvedTargetKind,
         },
-        domain::{ContentPath, Sha256, SnapshotFile},
+        domain::{ContentPath, Sha256, SnapshotFile, SnapshotId},
         policy::{MarkdownFrontmatterParser, PrivacyFilter},
     };
 
@@ -243,7 +240,7 @@ mod tests {
                 },
             ],
         );
-        let graph = AssetDependencyGraph::from_document(&document);
+        let graph = AssetDependencyGraph::from_document(SnapshotId::new(1).unwrap(), &document);
         let documents = public_candidates(vec![document]);
 
         assert!(graph.dependencies().is_empty());

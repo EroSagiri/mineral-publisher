@@ -863,14 +863,21 @@ Shell 发布权限
 ```text
 ApprovedMarkdownSet
         │
+        ├── 与同一 Snapshot 的 AssetDependencyGraph
         ▼
- Dependency Resolver
+ Asset Dependency Closure
         │
         ▼
 CandidateAssetSet
 ```
 
 CandidateAssetSet 为所有待发布 Markdown 所需资源的并集。
+
+该步骤只消费既有 Public Policy 结果与依赖图，不重新解析 Markdown 或读取 Source。只有
+`Approved` Markdown 的 `ResolvedAsset` 边能够产生候选资源；共享资源只出现一次，并保留
+所有已批准来源 Markdown。若两项输入的 Snapshot identity 不一致，或已批准 Markdown
+仍存在 unresolved dependency problem，则必须 fail closed。CandidateAssetSet 只表示资源有
+资格进入后续 Asset Review，不表示资源已经获准公开。
 
 例如：
 

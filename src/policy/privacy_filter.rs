@@ -149,7 +149,7 @@ impl PrivacyFilter {
 mod tests {
     use crate::{
         content::{AssetDependencyGraph, MarkdownReferenceParser, Resolution, ResolvedReference},
-        domain::{Sha256, SnapshotFile},
+        domain::{Sha256, SnapshotFile, SnapshotId},
         policy::{FrontmatterParseResult, MarkdownFrontmatterParser},
     };
 
@@ -331,6 +331,7 @@ mod tests {
 
         let candidates = PrivacyFilter::filter(vec![private, public]).into_public_candidates();
         let public_graph = AssetDependencyGraph::build(
+            SnapshotId::new(1).unwrap(),
             &candidates
                 .into_iter()
                 .map(PublicCandidateMarkdown::into_analysis)

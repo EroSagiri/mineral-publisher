@@ -92,13 +92,26 @@ impl PublicPolicyRunResult {
         &self.document_outcomes
     }
 
-    /// The Markdown set eligible for the later asset-resolution stage.
+    /// The Markdown set eligible to contribute edges to candidate asset selection.
     pub fn approved_markdown_paths(&self) -> Vec<&ContentPath> {
         self.document_outcomes
             .iter()
             .filter(|run| matches!(run.decision(), PublicPolicyDecision::ReviewApproved))
             .map(ReviewRun::content_path)
             .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_document_outcomes_for_test(
+        snapshot_id: SnapshotId,
+        document_outcomes: Vec<ReviewRun>,
+    ) -> Self {
+        Self {
+            snapshot_id,
+            private_documents: Vec::new(),
+            invalid_privacy_documents: Vec::new(),
+            document_outcomes,
+        }
     }
 }
 
