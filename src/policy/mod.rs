@@ -8,7 +8,10 @@ pub use privacy::{
     FrontmatterParseResult, MarkdownFrontmatter, MarkdownFrontmatterParser, PrivacyClassification,
     PrivacyClassifier, PrivateReason,
 };
-pub use privacy_filter::{PrivacyFilter, PrivacyFilterResult, PublicCandidateMarkdown};
+pub use privacy_filter::{
+    InvalidPrivacyDocument, PrivacyFilter, PrivacyFilterResult, PrivateDocument,
+    PublicCandidateMarkdown,
+};
 pub use program_check::{ProgramCheck, ProgramCheckIssue, ProgramCheckResult};
 pub use public_policy::{
     HumanReviewReason, PublicPolicy, PublicPolicyDecision, PublicPolicyOutcome, ReviewCandidate,

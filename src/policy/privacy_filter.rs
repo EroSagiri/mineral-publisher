@@ -83,6 +83,20 @@ impl PrivacyFilterResult {
     pub fn into_public_candidates(self) -> Vec<PublicCandidateMarkdown> {
         self.public_candidates
     }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        Vec<PublicCandidateMarkdown>,
+        Vec<PrivateDocument>,
+        Vec<InvalidPrivacyDocument>,
+    ) {
+        (
+            self.public_candidates,
+            self.private_documents,
+            self.invalid_documents,
+        )
+    }
 }
 
 /// Applies existing privacy classifications without content or source access.
