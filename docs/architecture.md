@@ -669,6 +669,24 @@ private=true
 
 的优先级永远高于 AI。
 
+确定性隐私过滤由完整规范化 `ContentPath` 规则和 Markdown 开头的 Frontmatter 规则共同组成，并遵循 deny-only 语义：
+
+```text
+没有命中任何明确 Private 信号
+→ PublicCandidate
+
+ContentPath 包含 私有 / 私人 / private
+或 Frontmatter 命中明确 Private 信号
+→ Private
+
+隐私元数据存在但无法安全解释
+→ Invalid
+```
+
+完整 `ContentPath` 使用保守的 substring matching；英文 `private` 按 ASCII 大小写不敏感匹配。Frontmatter 的 `private: true`、`visibility: private`、`public: false`、`publish: false` 和明确 private tag 都是累积的 Private 信号。任何 `public` 或 `publish` 正向字段都不能覆盖已经命中的 Private 信号。
+
+`PublicCandidate` 只表示没有被确定性隐私规则拒绝，不代表已经获准发布。`Invalid` 必须 fail closed。确定性 Private Filter 必须位于任何外部 AI 之前；Frontmatter 必须从 Snapshot 引用的不可变 Markdown 内容读取，不得重新读取 Source。Parser 只提取元数据，Private Filter 负责分类；Reference Resolver 和 Asset Dependency Graph 不传播 Markdown 的公开权限，也不直接分类 Asset。
+
 ---
 
 # 15. 程序确定性检查

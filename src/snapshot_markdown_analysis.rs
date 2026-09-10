@@ -3,8 +3,9 @@ use std::{error::Error, fmt, string::FromUtf8Error};
 use crate::{
     content_store::{ContentStoreError, LocalContentStore},
     domain::{
-        ContentPath, MarkdownReferenceParser, Reference, ReferenceResolver, Resolution, Snapshot,
-        SnapshotFile,
+        ContentPath, FrontmatterParseResult, MarkdownFrontmatterParser, MarkdownReferenceParser,
+        PrivacyClassification, PrivacyClassifier, Reference, ReferenceResolver, Resolution,
+        Snapshot, SnapshotFile,
     },
 };
 
@@ -12,12 +13,29 @@ use crate::{
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AnalyzedMarkdown {
     file: SnapshotFile,
+    frontmatter: FrontmatterParseResult,
+    privacy: PrivacyClassification,
     references: Vec<ResolvedReference>,
 }
 
 impl AnalyzedMarkdown {
+    pub(crate) fn with_frontmatter(
+        file: SnapshotFile,
+        frontmatter: FrontmatterParseResult,
+        references: Vec<ResolvedReference>,
+    ) -> Self {
+        let privacy = PrivacyClassifier::classify(file.path(), &frontmatter);
+        Self {
+            file,
+            frontmatter,
+            privacy,
+            references,
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn new(file: SnapshotFile, references: Vec<ResolvedReference>) -> Self {
-        Self { file, references }
+        Self::with_frontmatter(file, FrontmatterParseResult::Absent, references)
     }
 
     pub fn file(&self) -> &SnapshotFile {
@@ -30,6 +48,14 @@ impl AnalyzedMarkdown {
 
     pub fn references(&self) -> &[ResolvedReference] {
         &self.references
+    }
+
+    pub fn frontmatter(&self) -> &FrontmatterParseResult {
+        &self.frontmatter
+    }
+
+    pub fn privacy(&self) -> &PrivacyClassification {
+        &self.privacy
     }
 }
 
@@ -98,6 +124,7 @@ impl SnapshotMarkdownAnalyzer {
                 source,
             }
         })?;
+        let frontmatter = MarkdownFrontmatterParser::parse(&markdown);
         let references = MarkdownReferenceParser::parse(&markdown)
             .into_iter()
             .map(|reference| {
@@ -106,7 +133,11 @@ impl SnapshotMarkdownAnalyzer {
             })
             .collect();
 
-        Ok(AnalyzedMarkdown::new(file.clone(), references))
+        Ok(AnalyzedMarkdown::with_frontmatter(
+            file.clone(),
+            frontmatter,
+            references,
+        ))
     }
 }
 
@@ -308,6 +339,60 @@ mod tests {
                 path: path("a.png")
             }
         );
+    }
+
+    #[test]
+    fn privacy_uses_private_snapshot_content_after_source_becomes_public() {
+        let directory = TestDirectory::new();
+        directory.write("note.md", b"---\nprivate: true\n---\nold body");
+        let store = directory.store();
+        let snapshot = snapshot(&directory, store.clone());
+
+        directory.write("note.md", b"---\nprivate: false\n---\nnew body");
+
+        let analyzed = SnapshotMarkdownAnalyzer::new(store)
+            .analyze(&snapshot, &path("note.md"))
+            .unwrap();
+
+        assert!(matches!(
+            analyzed.privacy(),
+            PrivacyClassification::Private { reasons }
+                if reasons == &[crate::domain::PrivateReason::FrontmatterPrivate]
+        ));
+    }
+
+    #[test]
+    fn privacy_uses_public_snapshot_content_after_source_becomes_private() {
+        let directory = TestDirectory::new();
+        directory.write("note.md", b"---\nprivate: false\n---\nsnapshot body");
+        let store = directory.store();
+        let snapshot = snapshot(&directory, store.clone());
+
+        directory.write("note.md", b"---\nprivate: true\n---\nnew body");
+
+        let analyzed = SnapshotMarkdownAnalyzer::new(store)
+            .analyze(&snapshot, &path("note.md"))
+            .unwrap();
+
+        assert_eq!(analyzed.privacy(), &PrivacyClassification::PublicCandidate);
+    }
+
+    #[test]
+    fn privacy_classification_uses_the_complete_snapshot_content_path() {
+        let directory = TestDirectory::new();
+        directory.write("notes/PRIVATE/note.md", b"ordinary body");
+        let store = directory.store();
+        let snapshot = snapshot(&directory, store.clone());
+
+        let analyzed = SnapshotMarkdownAnalyzer::new(store)
+            .analyze(&snapshot, &path("notes/PRIVATE/note.md"))
+            .unwrap();
+
+        assert!(matches!(
+            analyzed.privacy(),
+            PrivacyClassification::Private { reasons }
+                if reasons == &[crate::domain::PrivateReason::PathContainsPrivateMarker]
+        ));
     }
 
     #[test]

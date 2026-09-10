@@ -34,7 +34,7 @@ Source
 
 ## 开发
 
-项目当前使用 Rust 2024 edition，且暂不依赖第三方 crate。
+项目当前使用 Rust 2024 edition。
 
 ```bash
 cargo fmt --check
