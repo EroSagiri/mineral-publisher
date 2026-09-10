@@ -15,6 +15,10 @@ pub struct ResolutionCandidate {
 }
 
 impl ResolutionCandidate {
+    pub fn new(kind: ResolvedTargetKind, path: ContentPath) -> Self {
+        Self { kind, path }
+    }
+
     pub fn kind(&self) -> ResolvedTargetKind {
         self.kind
     }
@@ -24,7 +28,7 @@ impl ResolutionCandidate {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum InvalidResolutionReason {
     InvalidLocalPath,
     EscapesContentRoot,
@@ -228,14 +232,14 @@ fn resolved(candidate: ResolutionCandidate) -> Resolution {
 }
 
 fn candidate(path: ContentPath) -> ResolutionCandidate {
-    ResolutionCandidate {
-        kind: if is_note(&path) {
+    ResolutionCandidate::new(
+        if is_note(&path) {
             ResolvedTargetKind::Note
         } else {
             ResolvedTargetKind::Asset
         },
         path,
-    }
+    )
 }
 
 fn normalize_relative(

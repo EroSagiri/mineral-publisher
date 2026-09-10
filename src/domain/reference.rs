@@ -5,7 +5,7 @@ use std::ops::Range;
 /// This intentionally does not describe the target's eventual type. Resolving
 /// a target to a note, asset, missing file, or ambiguous file needs a Snapshot
 /// and belongs to a later resolver.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum ReferenceKind {
     WikiLink,
     WikiEmbed,

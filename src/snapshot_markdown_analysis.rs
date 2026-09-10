@@ -16,6 +16,10 @@ pub struct AnalyzedMarkdown {
 }
 
 impl AnalyzedMarkdown {
+    pub(crate) fn new(file: SnapshotFile, references: Vec<ResolvedReference>) -> Self {
+        Self { file, references }
+    }
+
     pub fn file(&self) -> &SnapshotFile {
         &self.file
     }
@@ -37,6 +41,13 @@ pub struct ResolvedReference {
 }
 
 impl ResolvedReference {
+    pub(crate) fn new(reference: Reference, resolution: Resolution) -> Self {
+        Self {
+            reference,
+            resolution,
+        }
+    }
+
     pub fn reference(&self) -> &Reference {
         &self.reference
     }
@@ -91,17 +102,11 @@ impl SnapshotMarkdownAnalyzer {
             .into_iter()
             .map(|reference| {
                 let resolution = ReferenceResolver::resolve(&reference, file.path(), snapshot);
-                ResolvedReference {
-                    reference,
-                    resolution,
-                }
+                ResolvedReference::new(reference, resolution)
             })
             .collect();
 
-        Ok(AnalyzedMarkdown {
-            file: file.clone(),
-            references,
-        })
+        Ok(AnalyzedMarkdown::new(file.clone(), references))
     }
 }
 
