@@ -5,5 +5,6 @@ pub mod content_store;
 pub mod domain;
 pub mod privacy_filter;
 pub mod program_check;
+pub mod public_policy;
 pub mod snapshot_markdown_analysis;
 pub mod source;
