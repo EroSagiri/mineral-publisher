@@ -34,4 +34,10 @@ Source
 
 ## 开发
 
-具体构建、运行和测试方式将在实现过程中补充。
+项目当前使用 Rust 2024 edition，且暂不依赖第三方 crate。
+
+```bash
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-targets --all-features
+```
