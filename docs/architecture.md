@@ -203,6 +203,8 @@ Source 负责：
 * 获取文件元信息
 * 读取文件内容
 
+Source 创建 Snapshot 时，必须以同一次实际读取的内容为准计算文件大小和内容身份，并在 Snapshot 创建成功前保证该内容已经被不可变地保存。
+
 Source 不负责：
 
 * 判断内容是否私有
@@ -254,6 +256,10 @@ attachments/image.jpg
 ```
 
 所有后续操作都基于明确的 Snapshot。
+
+`SnapshotFile.sha256` 是对应文件内容 bytes 的身份，必须等于这些 bytes 的 SHA-256。Snapshot 引用的内容必须能够通过该身份取回；相同 bytes 可以共享同一个内容身份。
+
+Snapshot 创建完成后，即使 Source 中的文件被修改或删除，Snapshot 所引用的原始内容仍必须可读。Parser、Review、Publish 等后续处理必须读取 Snapshot 引用的不可变内容，不得重新读取可能已经变化的 Source 来代替它。
 
 任何最终发布结果都必须能够追溯到：
 

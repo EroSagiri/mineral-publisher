@@ -5,11 +5,9 @@ use std::{
     time::SystemTime,
 };
 
-use sha2::{Digest, Sha256 as Sha256Hasher};
-
+use crate::content_store::{ContentStoreError, LocalContentStore};
 use crate::domain::{
-    ContentPath, ContentPathError, Sha256, Snapshot, SnapshotError, SnapshotFile, SnapshotId,
-    SourceId,
+    ContentPath, ContentPathError, Snapshot, SnapshotError, SnapshotFile, SnapshotId, SourceId,
 };
 
 /// A source adapter that reads regular files from one local directory tree.
@@ -17,13 +15,19 @@ use crate::domain::{
 pub struct LocalSource {
     root: PathBuf,
     source_id: SourceId,
+    content_store: LocalContentStore,
 }
 
 impl LocalSource {
-    pub fn new(root: impl Into<PathBuf>, source_id: SourceId) -> Self {
+    pub fn new(
+        root: impl Into<PathBuf>,
+        source_id: SourceId,
+        content_store: LocalContentStore,
+    ) -> Self {
         Self {
             root: root.into(),
             source_id,
+            content_store,
         }
     }
 
@@ -124,7 +128,13 @@ impl LocalSource {
         })?;
         let size = u64::try_from(bytes.len())
             .map_err(|_| LocalSourceError::FileTooLarge { path: path.clone() })?;
-        let sha256 = Sha256::new(Sha256Hasher::digest(bytes).into());
+        let sha256 =
+            self.content_store
+                .store(&bytes)
+                .map_err(|source| LocalSourceError::ContentStore {
+                    path: path.clone(),
+                    source,
+                })?;
 
         Ok(SnapshotFile::new(content_path, size, sha256, None))
     }
@@ -189,6 +199,10 @@ pub enum LocalSourceError {
         path: PathBuf,
         source: ContentPathError,
     },
+    ContentStore {
+        path: PathBuf,
+        source: ContentStoreError,
+    },
     Snapshot(SnapshotError),
 }
 
@@ -240,6 +254,11 @@ impl fmt::Display for LocalSourceError {
                 "local source path cannot be represented as a content path: {}",
                 path.display()
             ),
+            Self::ContentStore { path, .. } => write!(
+                formatter,
+                "could not preserve local source file content: {}",
+                path.display()
+            ),
             Self::Snapshot(_) => {
                 formatter.write_str("could not create snapshot from local source files")
             }
@@ -254,6 +273,7 @@ impl Error for LocalSourceError {
             | Self::DirectoryRead { source, .. }
             | Self::FileRead { source, .. } => Some(source),
             Self::InvalidContentPath { source, .. } => Some(source),
+            Self::ContentStore { source, .. } => Some(source),
             Self::Snapshot(source) => Some(source),
             _ => None,
         }
@@ -264,7 +284,7 @@ impl Error for LocalSourceError {
 mod tests {
     use std::{
         fs,
-        path::{Path, PathBuf},
+        path::PathBuf,
         sync::atomic::{AtomicUsize, Ordering},
         time::SystemTime,
     };
@@ -282,18 +302,26 @@ mod tests {
                 "mineral-publisher-local-source-{}-{sequence}",
                 std::process::id()
             ));
-            fs::create_dir_all(&path).unwrap();
+            fs::create_dir_all(path.join("source")).unwrap();
             Self(path)
         }
 
-        fn path(&self) -> &Path {
-            &self.0
+        fn source_path(&self) -> PathBuf {
+            self.0.join("source")
+        }
+
+        fn store_path(&self) -> PathBuf {
+            self.0.join("content-store")
         }
 
         fn write(&self, relative_path: &str, content: &[u8]) {
-            let path = self.0.join(relative_path);
+            let path = self.source_path().join(relative_path);
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             fs::write(path, content).unwrap();
+        }
+
+        fn remove(&self, relative_path: &str) {
+            fs::remove_file(self.source_path().join(relative_path)).unwrap();
         }
     }
 
@@ -303,8 +331,20 @@ mod tests {
         }
     }
 
-    fn source(root: impl Into<PathBuf>) -> LocalSource {
-        LocalSource::new(root, SourceId::new("test-local-source").unwrap())
+    fn source(directory: &TestDirectory) -> LocalSource {
+        LocalSource::new(
+            directory.source_path(),
+            SourceId::new("test-local-source").unwrap(),
+            LocalContentStore::new(directory.store_path()),
+        )
+    }
+
+    fn source_at(root: impl Into<PathBuf>, store: impl Into<PathBuf>) -> LocalSource {
+        LocalSource::new(
+            root,
+            SourceId::new("test-local-source").unwrap(),
+            LocalContentStore::new(store),
+        )
     }
 
     fn snapshot(source: &LocalSource) -> Snapshot {
@@ -317,7 +357,7 @@ mod tests {
     fn snapshots_an_empty_directory() {
         let directory = TestDirectory::new();
 
-        let snapshot = snapshot(&source(directory.path()));
+        let snapshot = snapshot(&source(&directory));
 
         assert!(snapshot.files().is_empty());
     }
@@ -327,7 +367,9 @@ mod tests {
         let directory = TestDirectory::new();
         directory.write("note.md", b"hello");
 
-        let snapshot = snapshot(&source(directory.path()));
+        let content_store = LocalContentStore::new(directory.store_path());
+        let local_source = source(&directory);
+        let snapshot = snapshot(&local_source);
 
         assert_eq!(snapshot.files().len(), 1);
         let file = &snapshot.files()[0];
@@ -337,6 +379,10 @@ mod tests {
             file.sha256().to_string(),
             "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
         );
+        assert_eq!(
+            file.size(),
+            u64::try_from(content_store.read(file.sha256()).unwrap().len()).unwrap()
+        );
     }
 
     #[test]
@@ -344,7 +390,7 @@ mod tests {
         let directory = TestDirectory::new();
         directory.write("notes/2026/first.md", b"first");
 
-        let snapshot = snapshot(&source(directory.path()));
+        let snapshot = snapshot(&source(&directory));
 
         assert_eq!(snapshot.files()[0].path().as_str(), "notes/2026/first.md");
     }
@@ -356,8 +402,9 @@ mod tests {
         directory.write("a/note.md", b"a");
         directory.write("a.md", b"a");
 
-        let first = snapshot(&source(directory.path()));
-        let second = snapshot(&source(directory.path()));
+        let local_source = source(&directory);
+        let first = snapshot(&local_source);
+        let second = snapshot(&local_source);
         let paths = first
             .files()
             .iter()
@@ -372,12 +419,72 @@ mod tests {
     fn changes_sha256_when_file_content_changes() {
         let directory = TestDirectory::new();
         directory.write("note.md", b"before");
-        let first = snapshot(&source(directory.path()));
+        let content_store = LocalContentStore::new(directory.store_path());
+        let local_source = source(&directory);
+        let first = snapshot(&local_source);
+        let first_identity = first.files()[0].sha256();
 
         directory.write("note.md", b"after");
-        let second = snapshot(&source(directory.path()));
+        let second = snapshot(&local_source);
+        let second_identity = second.files()[0].sha256();
 
-        assert_ne!(first.files()[0].sha256(), second.files()[0].sha256());
+        assert_ne!(first_identity, second_identity);
+        assert_eq!(content_store.read(first_identity).unwrap(), b"before");
+        assert_eq!(content_store.read(second_identity).unwrap(), b"after");
+    }
+
+    #[test]
+    fn old_snapshot_content_survives_source_modification() {
+        let directory = TestDirectory::new();
+        directory.write("note.md", b"version A");
+        let content_store = LocalContentStore::new(directory.store_path());
+        let local_source = source(&directory);
+        let old_snapshot = snapshot(&local_source);
+
+        directory.write("note.md", b"version B");
+
+        let old_identity = old_snapshot.files()[0].sha256();
+        assert_eq!(content_store.read(old_identity).unwrap(), b"version A");
+    }
+
+    #[test]
+    fn snapshot_content_survives_source_deletion() {
+        let directory = TestDirectory::new();
+        directory.write("note.md", b"preserved");
+        let content_store = LocalContentStore::new(directory.store_path());
+        let local_source = source(&directory);
+        let old_snapshot = snapshot(&local_source);
+
+        directory.remove("note.md");
+
+        let identity = old_snapshot.files()[0].sha256();
+        assert_eq!(content_store.read(identity).unwrap(), b"preserved");
+    }
+
+    #[test]
+    fn identical_files_share_one_content_identity_and_blob() {
+        let directory = TestDirectory::new();
+        directory.write("a.md", b"hello");
+        directory.write("b.md", b"hello");
+        let local_source = source(&directory);
+
+        let snapshot = snapshot(&local_source);
+
+        assert_eq!(snapshot.files()[0].sha256(), snapshot.files()[1].sha256());
+        assert_eq!(fs::read_dir(directory.store_path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn snapshot_fails_when_content_cannot_be_stored() {
+        let directory = TestDirectory::new();
+        directory.write("note.md", b"content");
+        let store_file = directory.store_path();
+        fs::write(&store_file, b"not a directory").unwrap();
+        let local_source = source_at(directory.source_path(), store_file);
+
+        let result = local_source.snapshot(SnapshotId::new(1).unwrap(), SystemTime::UNIX_EPOCH);
+
+        assert!(matches!(result, Err(LocalSourceError::ContentStore { .. })));
     }
 
     #[test]
@@ -386,7 +493,8 @@ mod tests {
             "mineral-publisher-missing-root-{}",
             std::process::id()
         ));
-        let result = source(&missing).snapshot(SnapshotId::new(1).unwrap(), SystemTime::UNIX_EPOCH);
+        let result = source_at(&missing, missing.with_extension("content-store"))
+            .snapshot(SnapshotId::new(1).unwrap(), SystemTime::UNIX_EPOCH);
 
         assert!(matches!(result, Err(LocalSourceError::RootNotFound(path)) if path == missing));
     }
@@ -395,9 +503,10 @@ mod tests {
     fn rejects_a_file_as_the_root() {
         let directory = TestDirectory::new();
         directory.write("not-a-directory.md", b"content");
-        let root = directory.path().join("not-a-directory.md");
+        let root = directory.source_path().join("not-a-directory.md");
 
-        let result = source(&root).snapshot(SnapshotId::new(1).unwrap(), SystemTime::UNIX_EPOCH);
+        let result = source_at(&root, directory.store_path())
+            .snapshot(SnapshotId::new(1).unwrap(), SystemTime::UNIX_EPOCH);
 
         assert!(matches!(result, Err(LocalSourceError::RootNotDirectory(path)) if path == root));
     }
@@ -409,7 +518,7 @@ mod tests {
         directory.write("note\\with-backslash.md", b"content");
 
         let result =
-            source(directory.path()).snapshot(SnapshotId::new(1).unwrap(), SystemTime::UNIX_EPOCH);
+            source(&directory).snapshot(SnapshotId::new(1).unwrap(), SystemTime::UNIX_EPOCH);
 
         assert!(matches!(
             result,

@@ -5,6 +5,8 @@ use std::{
     time::SystemTime,
 };
 
+use sha2::{Digest, Sha256 as Sha256Hasher};
+
 use super::ContentPath;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -49,6 +51,10 @@ impl Sha256 {
 
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
+    }
+
+    pub fn digest(content: &[u8]) -> Self {
+        Self(Sha256Hasher::digest(content).into())
     }
 }
 

@@ -1,0 +1,285 @@
+use std::{
+    error::Error,
+    fmt, fs,
+    fs::OpenOptions,
+    io::{self, Write},
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
+};
+
+use crate::domain::Sha256;
+
+static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(0);
+
+/// A local filesystem content-addressed store keyed by the SHA-256 of each blob.
+#[derive(Clone, Debug)]
+pub struct LocalContentStore {
+    root: PathBuf,
+}
+
+impl LocalContentStore {
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Stores `content` under its SHA-256 identity without replacing an existing blob.
+    pub fn store(&self, content: &[u8]) -> Result<Sha256, ContentStoreError> {
+        let identity = Sha256::digest(content);
+        fs::create_dir_all(&self.root)
+            .map_err(|source| ContentStoreError::io("create content store", &self.root, source))?;
+
+        let blob_path = self.blob_path(identity);
+        match fs::read(&blob_path) {
+            Ok(existing) => {
+                Self::verify_existing(identity, content, &existing)?;
+                return Ok(identity);
+            }
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(ContentStoreError::io(
+                    "read existing blob",
+                    blob_path,
+                    source,
+                ));
+            }
+        }
+
+        let temp_path = self.temp_path(identity);
+        let write_result = (|| {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp_path)
+                .map_err(|source| {
+                    ContentStoreError::io("create temporary blob", &temp_path, source)
+                })?;
+            file.write_all(content).map_err(|source| {
+                ContentStoreError::io("write temporary blob", &temp_path, source)
+            })?;
+            file.sync_all().map_err(|source| {
+                ContentStoreError::io("sync temporary blob", &temp_path, source)
+            })?;
+            Ok::<(), ContentStoreError>(())
+        })();
+        if let Err(error) = write_result {
+            let _ = fs::remove_file(&temp_path);
+            return Err(error);
+        }
+
+        match fs::hard_link(&temp_path, &blob_path) {
+            Ok(()) => {
+                let _ = fs::remove_file(&temp_path);
+                Ok(identity)
+            }
+            Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
+                let _ = fs::remove_file(&temp_path);
+                let existing = fs::read(&blob_path).map_err(|source| {
+                    ContentStoreError::io("read concurrently stored blob", &blob_path, source)
+                })?;
+                Self::verify_existing(identity, content, &existing)?;
+                Ok(identity)
+            }
+            Err(source) => {
+                let _ = fs::remove_file(&temp_path);
+                Err(ContentStoreError::io("publish blob", blob_path, source))
+            }
+        }
+    }
+
+    /// Reads a blob and verifies that its bytes still match the requested identity.
+    pub fn read(&self, identity: Sha256) -> Result<Vec<u8>, ContentStoreError> {
+        let path = self.blob_path(identity);
+        let content = match fs::read(&path) {
+            Ok(content) => content,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {
+                return Err(ContentStoreError::Missing(identity));
+            }
+            Err(source) => return Err(ContentStoreError::io("read blob", path, source)),
+        };
+        let actual = Sha256::digest(&content);
+        if actual != identity {
+            return Err(ContentStoreError::Corrupt {
+                expected: identity,
+                actual,
+            });
+        }
+        Ok(content)
+    }
+
+    fn blob_path(&self, identity: Sha256) -> PathBuf {
+        self.root.join(identity.to_string())
+    }
+
+    fn temp_path(&self, identity: Sha256) -> PathBuf {
+        let sequence = NEXT_TEMP_FILE.fetch_add(1, Ordering::Relaxed);
+        self.root.join(format!(
+            ".{}-{}-{sequence}.tmp",
+            identity,
+            std::process::id()
+        ))
+    }
+
+    fn verify_existing(
+        identity: Sha256,
+        expected_content: &[u8],
+        existing: &[u8],
+    ) -> Result<(), ContentStoreError> {
+        let actual = Sha256::digest(existing);
+        if actual != identity {
+            return Err(ContentStoreError::Corrupt {
+                expected: identity,
+                actual,
+            });
+        }
+        if existing != expected_content {
+            return Err(ContentStoreError::HashCollision(identity));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub enum ContentStoreError {
+    Missing(Sha256),
+    Corrupt {
+        expected: Sha256,
+        actual: Sha256,
+    },
+    HashCollision(Sha256),
+    Io {
+        operation: &'static str,
+        path: PathBuf,
+        source: io::Error,
+    },
+}
+
+impl ContentStoreError {
+    fn io(operation: &'static str, path: impl Into<PathBuf>, source: io::Error) -> Self {
+        Self::Io {
+            operation,
+            path: path.into(),
+            source,
+        }
+    }
+}
+
+impl fmt::Display for ContentStoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Missing(identity) => write!(formatter, "content blob does not exist: {identity}"),
+            Self::Corrupt { expected, actual } => write!(
+                formatter,
+                "content blob failed integrity verification: expected {expected}, got {actual}"
+            ),
+            Self::HashCollision(identity) => write!(
+                formatter,
+                "existing content differs despite matching SHA-256 identity: {identity}"
+            ),
+            Self::Io {
+                operation, path, ..
+            } => write!(formatter, "could not {operation}: {}", path.display()),
+        }
+    }
+}
+
+impl Error for ContentStoreError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Io { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
+    use super::*;
+
+    static NEXT_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "mineral-publisher-content-store-{}-{sequence}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn stores_and_reads_content_by_sha256() {
+        let directory = TestDirectory::new();
+        let store = LocalContentStore::new(directory.path());
+
+        let identity = store.store(b"hello").unwrap();
+
+        assert_eq!(store.read(identity).unwrap(), b"hello");
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn storing_identical_content_again_is_idempotent() {
+        let directory = TestDirectory::new();
+        let store = LocalContentStore::new(directory.path());
+
+        let first = store.store(b"hello").unwrap();
+        let second = store.store(b"hello").unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn missing_blob_is_an_explicit_error() {
+        let directory = TestDirectory::new();
+        let store = LocalContentStore::new(directory.path());
+        let identity = Sha256::digest(b"missing");
+
+        assert!(matches!(
+            store.read(identity),
+            Err(ContentStoreError::Missing(missing)) if missing == identity
+        ));
+    }
+
+    #[test]
+    fn corrupted_blob_is_not_returned_as_valid_content() {
+        let directory = TestDirectory::new();
+        let store = LocalContentStore::new(directory.path());
+        let identity = store.store(b"original").unwrap();
+        fs::write(directory.path().join(identity.to_string()), b"corrupt").unwrap();
+
+        assert!(matches!(
+            store.read(identity),
+            Err(ContentStoreError::Corrupt { expected, .. }) if expected == identity
+        ));
+        assert!(matches!(
+            store.store(b"original"),
+            Err(ContentStoreError::Corrupt { expected, .. }) if expected == identity
+        ));
+    }
+}
