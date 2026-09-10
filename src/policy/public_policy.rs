@@ -3,11 +3,11 @@ use std::{error::Error, fmt};
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    content::AnalyzedMarkdown,
     domain::{ContentPath, Sha256},
-    privacy_filter::PublicCandidateMarkdown,
-    program_check::{ProgramCheck, ProgramCheckIssue, ProgramCheckResult},
-    snapshot_markdown_analysis::AnalyzedMarkdown,
 };
+
+use super::{ProgramCheck, ProgramCheckIssue, ProgramCheckResult, PublicCandidateMarkdown};
 
 /// A public Markdown candidate that passed all deterministic program checks.
 ///
@@ -168,12 +168,9 @@ mod tests {
     use std::{cell::Cell, collections::BTreeMap};
 
     use crate::{
-        domain::{
-            ContentPath, MarkdownFrontmatterParser, MarkdownReferenceParser, Resolution, Sha256,
-            SnapshotFile,
-        },
-        privacy_filter::PrivacyFilter,
-        snapshot_markdown_analysis::{AnalyzedMarkdown, ResolvedReference},
+        content::{AnalyzedMarkdown, MarkdownReferenceParser, Resolution, ResolvedReference},
+        domain::{ContentPath, Sha256, SnapshotFile},
+        policy::{MarkdownFrontmatterParser, PrivacyFilter},
     };
 
     use super::*;

@@ -1,6 +1,6 @@
 use serde_yaml_ng::Value;
 
-use super::ContentPath;
+use crate::domain::ContentPath;
 
 /// The minimal supported metadata extracted from a Markdown YAML frontmatter block.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]

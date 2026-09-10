@@ -5,10 +5,10 @@ use std::{
     time::SystemTime,
 };
 
-use crate::content_store::{ContentStoreError, LocalContentStore};
 use crate::domain::{
     ContentPath, ContentPathError, Snapshot, SnapshotError, SnapshotFile, SnapshotId, SourceId,
 };
+use crate::storage::{ContentStoreError, LocalContentStore};
 
 /// A source adapter that reads regular files from one local directory tree.
 #[derive(Clone, Debug)]

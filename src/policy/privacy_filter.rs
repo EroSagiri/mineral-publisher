@@ -1,7 +1,6 @@
-use crate::{
-    domain::{ContentPath, PrivacyClassification, PrivateReason},
-    snapshot_markdown_analysis::AnalyzedMarkdown,
-};
+use crate::{content::AnalyzedMarkdown, domain::ContentPath};
+
+use super::{PrivacyClassification, PrivateReason};
 
 /// A Markdown analysis that passed the deterministic privacy boundary.
 ///
@@ -135,12 +134,9 @@ impl PrivacyFilter {
 #[cfg(test)]
 mod tests {
     use crate::{
-        asset_dependency::AssetDependencyGraph,
-        domain::{
-            FrontmatterParseResult, MarkdownFrontmatterParser, MarkdownReferenceParser, Resolution,
-            Sha256, SnapshotFile,
-        },
-        snapshot_markdown_analysis::ResolvedReference,
+        content::{AssetDependencyGraph, MarkdownReferenceParser, Resolution, ResolvedReference},
+        domain::{Sha256, SnapshotFile},
+        policy::{FrontmatterParseResult, MarkdownFrontmatterParser},
     };
 
     use super::*;

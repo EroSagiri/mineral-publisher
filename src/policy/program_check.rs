@@ -1,10 +1,9 @@
 use crate::{
-    asset_dependency::{
-        AssetDependencyGraph, DependencyProblem, DependencyProblemKind, ReferenceOrigin,
-    },
+    content::{AssetDependencyGraph, DependencyProblem, DependencyProblemKind, ReferenceOrigin},
     domain::ContentPath,
-    privacy_filter::PublicCandidateMarkdown,
 };
+
+use super::PublicCandidateMarkdown;
 use serde::{Deserialize, Serialize};
 
 /// One deterministic structural issue found before external AI review.
@@ -88,14 +87,13 @@ impl ProgramCheck {
 #[cfg(test)]
 mod tests {
     use crate::{
-        asset_dependency::{AssetDependencyGraph, DependencyProblemKind},
-        domain::{
-            ContentPath, InvalidResolutionReason, MarkdownFrontmatterParser,
+        content::{
+            AnalyzedMarkdown, AssetDependencyGraph, DependencyProblemKind, InvalidResolutionReason,
             MarkdownReferenceParser, ReferenceKind, Resolution, ResolutionCandidate,
-            ResolvedTargetKind, Sha256, SnapshotFile,
+            ResolvedReference, ResolvedTargetKind,
         },
-        privacy_filter::PrivacyFilter,
-        snapshot_markdown_analysis::{AnalyzedMarkdown, ResolvedReference},
+        domain::{ContentPath, Sha256, SnapshotFile},
+        policy::{MarkdownFrontmatterParser, PrivacyFilter},
     };
 
     use super::*;

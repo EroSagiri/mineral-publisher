@@ -2,11 +2,10 @@ use std::{collections::BTreeMap, ops::Range};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    domain::{
-        ContentPath, InvalidResolutionReason, ReferenceKind, Resolution, ResolutionCandidate,
-    },
-    snapshot_markdown_analysis::AnalyzedMarkdown,
+use crate::domain::ContentPath;
+
+use super::{
+    AnalyzedMarkdown, InvalidResolutionReason, ReferenceKind, Resolution, ResolutionCandidate,
 };
 
 /// Where a resolved dependency or unresolved dependency problem appeared.
@@ -219,8 +218,8 @@ impl AssetDependencyGraph {
 #[cfg(test)]
 mod tests {
     use crate::{
-        domain::{MarkdownReferenceParser, Resolution, ResolvedTargetKind, Sha256, SnapshotFile},
-        snapshot_markdown_analysis::ResolvedReference,
+        content::{MarkdownReferenceParser, Resolution, ResolvedReference, ResolvedTargetKind},
+        domain::{Sha256, SnapshotFile},
     };
 
     use super::*;

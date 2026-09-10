@@ -1,9 +1,8 @@
 use std::{error::Error, fmt, time::SystemTime};
 
-use crate::{
-    domain::{ContentPath, Sha256, Snapshot, SnapshotId},
-    public_policy::{PublicPolicyDecision, PublicPolicyOutcome},
-};
+use crate::domain::{ContentPath, Sha256, Snapshot, SnapshotId};
+
+use super::{PublicPolicyDecision, PublicPolicyOutcome};
 
 /// Stable identity of one immutable review attempt.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]

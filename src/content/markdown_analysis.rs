@@ -1,13 +1,14 @@
 use std::{error::Error, fmt, string::FromUtf8Error};
 
 use crate::{
-    content_store::{ContentStoreError, LocalContentStore},
-    domain::{
-        ContentPath, FrontmatterParseResult, MarkdownFrontmatterParser, MarkdownReferenceParser,
-        PrivacyClassification, PrivacyClassifier, Reference, ReferenceResolver, Resolution,
-        Snapshot, SnapshotFile,
+    domain::{ContentPath, Snapshot, SnapshotFile},
+    policy::{
+        FrontmatterParseResult, MarkdownFrontmatterParser, PrivacyClassification, PrivacyClassifier,
     },
+    storage::{ContentStoreError, LocalContentStore},
 };
+
+use super::{MarkdownReferenceParser, Reference, ReferenceResolver, Resolution};
 
 /// Parsed and resolved references from one Markdown file in an immutable Snapshot.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -203,10 +204,9 @@ mod tests {
     };
 
     use crate::{
-        domain::{
-            ContentPath, ReferenceKind, Resolution, Sha256, Snapshot, SnapshotFile, SnapshotId,
-            SourceId,
-        },
+        content::{ReferenceKind, Resolution},
+        domain::{ContentPath, Sha256, Snapshot, SnapshotFile, SnapshotId, SourceId},
+        policy::PrivateReason,
         source::LocalSource,
     };
 
@@ -357,7 +357,7 @@ mod tests {
         assert!(matches!(
             analyzed.privacy(),
             PrivacyClassification::Private { reasons }
-                if reasons == &[crate::domain::PrivateReason::FrontmatterPrivate]
+                if reasons == &[PrivateReason::FrontmatterPrivate]
         ));
     }
 
@@ -391,7 +391,7 @@ mod tests {
         assert!(matches!(
             analyzed.privacy(),
             PrivacyClassification::Private { reasons }
-                if reasons == &[crate::domain::PrivateReason::PathContainsPrivateMarker]
+                if reasons == &[PrivateReason::PathContainsPrivateMarker]
         ));
     }
 

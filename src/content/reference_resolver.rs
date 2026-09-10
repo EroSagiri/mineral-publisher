@@ -1,4 +1,6 @@
-use super::{ContentPath, Reference, ReferenceKind, Snapshot};
+use crate::domain::{ContentPath, Snapshot};
+
+use super::{Reference, ReferenceKind};
 use serde::{Deserialize, Serialize};
 
 /// The concrete type of a local Snapshot target.
@@ -318,7 +320,10 @@ mod tests {
     use std::time::SystemTime;
 
     use super::*;
-    use crate::domain::{MarkdownReferenceParser, Sha256, SnapshotFile, SnapshotId, SourceId};
+    use crate::{
+        content::MarkdownReferenceParser,
+        domain::{Sha256, SnapshotFile, SnapshotId, SourceId},
+    };
 
     fn file(path: &str) -> SnapshotFile {
         SnapshotFile::new(

@@ -4,8 +4,7 @@ use rusqlite::{Connection, OptionalExtension, params, types::Type};
 
 use crate::{
     domain::{ContentPath, Sha256, SnapshotId},
-    public_policy::PublicPolicyDecision,
-    review_run::{PolicyIdentity, ReviewRun, ReviewRunId, ReviewRunStore},
+    policy::{PolicyIdentity, PublicPolicyDecision, ReviewRun, ReviewRunId, ReviewRunStore},
 };
 
 const SCHEMA_VERSION: i64 = 1;
@@ -351,17 +350,12 @@ mod tests {
     };
 
     use crate::{
-        domain::{
-            MarkdownFrontmatterParser, MarkdownReferenceParser, Resolution, Sha256, Snapshot,
-            SnapshotFile, SourceId,
+        content::{AnalyzedMarkdown, MarkdownReferenceParser, Resolution, ResolvedReference},
+        domain::{Sha256, Snapshot, SnapshotFile, SourceId},
+        policy::{
+            HumanReviewReason, MarkdownFrontmatterParser, PolicyIdentity, PrivacyFilter,
+            PublicPolicy, ReviewCandidate, ReviewDecision, ReviewRunError, Reviewer, ReviewerError,
         },
-        privacy_filter::PrivacyFilter,
-        public_policy::{
-            HumanReviewReason, PublicPolicy, ReviewCandidate, ReviewDecision, Reviewer,
-            ReviewerError,
-        },
-        review_run::{PolicyIdentity, ReviewRunError},
-        snapshot_markdown_analysis::{AnalyzedMarkdown, ResolvedReference},
     };
 
     use super::*;
@@ -439,7 +433,7 @@ mod tests {
     fn outcome(
         document: AnalyzedMarkdown,
         response: Result<ReviewDecision, ReviewerError>,
-    ) -> crate::public_policy::PublicPolicyOutcome {
+    ) -> crate::policy::PublicPolicyOutcome {
         let filtered = PrivacyFilter::filter(vec![document]);
         let reviewer = FixedReviewer {
             calls: Cell::new(0),
@@ -476,7 +470,7 @@ mod tests {
     fn run(
         id: u64,
         snapshot: &Snapshot,
-        outcome: &crate::public_policy::PublicPolicyOutcome,
+        outcome: &crate::policy::PublicPolicyOutcome,
         created_at_ms: u64,
     ) -> ReviewRun {
         ReviewRun::from_policy_outcome(
