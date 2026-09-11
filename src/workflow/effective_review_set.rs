@@ -32,12 +32,30 @@ impl EffectiveReviewSet {
     #[cfg(test)]
     pub(crate) fn from_assets_for_test(
         snapshot_id: SnapshotId,
+        assets: Vec<EffectiveAssetReview>,
+    ) -> Self {
+        Self::from_parts_for_test(snapshot_id, Vec::new(), assets)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_parts_for_test(
+        snapshot_id: SnapshotId,
+        documents: Vec<(ContentPath, EffectiveDocumentDecision)>,
         mut assets: Vec<EffectiveAssetReview>,
     ) -> Self {
+        let mut documents = documents
+            .into_iter()
+            .map(|(content_path, decision)| EffectiveDocumentReview {
+                content_path,
+                review_run_id: None,
+                decision,
+            })
+            .collect::<Vec<_>>();
+        documents.sort_by(|left, right| left.content_path.cmp(&right.content_path));
         assets.sort_by(|left, right| left.content_path.cmp(&right.content_path));
         Self {
             snapshot_id,
-            documents: Vec::new(),
+            documents,
             assets,
         }
     }

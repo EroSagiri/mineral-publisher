@@ -5,6 +5,7 @@ mod asset_review_workflow;
 mod asset_sanitization;
 mod candidate_asset;
 mod effective_review_set;
+mod final_dependency_closure;
 mod human_review;
 mod public_policy_run;
 
@@ -34,6 +35,9 @@ pub use candidate_asset::{CandidateAsset, CandidateAssetSelectionError, Candidat
 pub use effective_review_set::{
     EffectiveAssetReview, EffectiveDocumentDecision, EffectiveDocumentReview, EffectiveReviewSet,
     EffectiveReviewSetError,
+};
+pub use final_dependency_closure::{
+    BlockedMarkdown, FinalDependencyClosureError, FinalPublicationSet, MarkdownBlockingReason,
 };
 pub use human_review::{
     EffectiveReviewDecision, EffectiveReviewDecisionError, HumanReviewDecision, HumanReviewId,

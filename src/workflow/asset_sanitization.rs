@@ -55,6 +55,25 @@ pub struct SanitizedAsset {
 }
 
 impl SanitizedAsset {
+    #[cfg(test)]
+    pub(crate) fn from_parts_for_test(
+        path: ContentPath,
+        review_run_id: AssetReviewRunId,
+        source_sha256: Sha256,
+        published_sha256: Sha256,
+        published_size: u64,
+        transformations: Vec<SanitizationTransformation>,
+    ) -> Self {
+        Self {
+            path,
+            review_run_id,
+            source_sha256,
+            published_sha256,
+            published_size,
+            transformations,
+        }
+    }
+
     pub fn path(&self) -> &ContentPath {
         &self.path
     }
@@ -93,6 +112,18 @@ pub struct SanitizedAssetSet {
 }
 
 impl SanitizedAssetSet {
+    #[cfg(test)]
+    pub(crate) fn from_assets_for_test(
+        snapshot_id: SnapshotId,
+        mut assets: Vec<SanitizedAsset>,
+    ) -> Self {
+        assets.sort_by(|left, right| left.path.cmp(&right.path));
+        Self {
+            snapshot_id,
+            assets,
+        }
+    }
+
     pub fn snapshot_id(&self) -> SnapshotId {
         self.snapshot_id
     }
