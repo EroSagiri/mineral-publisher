@@ -3,8 +3,11 @@ mod deepseek;
 mod deepseek_asset;
 
 pub use calibration::{
+    AssetCalibrationCase, AssetCalibrationCaseResult, AssetCalibrationCaseStatus,
+    AssetCalibrationCorpusError, AssetCalibrationExpectation, AssetCalibrationObservation,
     CalibrationCaseResult, CalibrationCaseStatus, CalibrationExitStatus, CalibrationExpectation,
     CalibrationExpectationError, CalibrationObservation, CalibrationSummary,
+    load_asset_calibration_cases,
 };
 pub use deepseek::{
     DeepSeekApiKey, DeepSeekMarkdownReviewer, DeepSeekMarkdownReviewerConfig,

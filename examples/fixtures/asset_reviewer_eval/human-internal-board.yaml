@@ -1,0 +1,3 @@
+acceptable_decisions: [needs_human_review, reject]
+expected_reason_codes: [internal_work_information]
+forbidden_reason_codes: [visible_credential_secret]

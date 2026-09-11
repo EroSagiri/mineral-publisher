@@ -1,0 +1,3 @@
+acceptable_decisions: [approve]
+expected_reason_codes: [ordinary_visual_content]
+forbidden_reason_codes: [other_visual_privacy_risk]

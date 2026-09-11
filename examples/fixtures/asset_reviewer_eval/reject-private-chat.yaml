@@ -1,0 +1,3 @@
+acceptable_decisions: [reject]
+expected_reason_codes: [visible_private_correspondence]
+forbidden_reason_codes: [ordinary_visual_content]

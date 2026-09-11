@@ -1,0 +1,2 @@
+acceptable_decisions: [approve]
+forbidden_reason_codes: [visible_third_party_private_information, uncertain_visual_disclosure_authorization]

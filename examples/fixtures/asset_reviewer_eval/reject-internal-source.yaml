@@ -1,0 +1,3 @@
+acceptable_decisions: [reject]
+expected_reason_codes: [confidential_work_material]
+forbidden_reason_codes: [public_technical_visual]

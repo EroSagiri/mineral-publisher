@@ -12,8 +12,8 @@ use crate::{
     domain::Sha256,
     storage::LocalContentStore,
     workflow::{
-        ActualAssetType, AssetReviewCandidate, AssetReviewer, AssetReviewerError,
-        AssetReviewerErrorKind, AssetReviewerReport,
+        ActualAssetType, AssetReviewCandidate, AssetReviewDecision, AssetReviewReasonCode,
+        AssetReviewer, AssetReviewerError, AssetReviewerErrorKind, AssetReviewerReport,
     },
 };
 
@@ -829,10 +829,13 @@ fn parse_response(
             "DeepSeek asset review response was empty",
         ));
     }
-    let envelope: ChatCompletionResponse = serde_json::from_slice(&body).map_err(|_| {
+    let envelope: ChatCompletionResponse = serde_json::from_slice(&body).map_err(|error| {
         asset_error(
             AssetReviewerErrorKind::MalformedResponse,
-            "DeepSeek asset review response did not match the expected JSON envelope",
+            format!(
+                "DeepSeek asset review response did not match the expected JSON envelope ({})",
+                safe_json_error_diagnostic(&error)
+            ),
         )
     })?;
     let [choice] = envelope.choices.as_slice() else {
@@ -858,10 +861,13 @@ fn parse_response(
                 "DeepSeek asset review response contained no classification",
             )
         })?;
-    let value: serde_json::Value = serde_json::from_str(content).map_err(|_| {
+    let value: serde_json::Value = serde_json::from_str(content).map_err(|error| {
         asset_error(
             AssetReviewerErrorKind::MalformedResponse,
-            "DeepSeek asset review classification was not valid JSON",
+            format!(
+                "DeepSeek asset review classification was not valid JSON ({})",
+                safe_json_error_diagnostic(&error)
+            ),
         )
     })?;
     if !matches!(
@@ -873,12 +879,37 @@ fn parse_response(
             "DeepSeek asset review classification used an invalid decision",
         ));
     }
-    serde_json::from_value(value).map_err(|_| {
+    let report: AssetReviewerWireReport = serde_json::from_str(content).map_err(|error| {
         asset_error(
             AssetReviewerErrorKind::InvalidReport,
-            "DeepSeek asset review classification failed strict schema or semantic validation",
+            format!(
+                "DeepSeek asset review classification failed strict schema validation ({})",
+                safe_json_error_diagnostic(&error)
+            ),
         )
-    })
+    })?;
+    AssetReviewerReport::new(report.decision, report.reason_codes, report.summary).map_err(
+        |error| {
+            asset_error(
+                AssetReviewerErrorKind::InvalidReport,
+                format!("DeepSeek asset review classification failed semantic validation: {error}"),
+            )
+        },
+    )
+}
+
+fn safe_json_error_diagnostic(error: &serde_json::Error) -> String {
+    let category = match error.classify() {
+        serde_json::error::Category::Io => "I/O error",
+        serde_json::error::Category::Syntax => "syntax error",
+        serde_json::error::Category::Data => "data error",
+        serde_json::error::Category::Eof => "unexpected end of input",
+    };
+    format!(
+        "{category} at line {} column {}",
+        error.line(),
+        error.column()
+    )
 }
 
 fn asset_error(kind: AssetReviewerErrorKind, message: impl Into<String>) -> AssetReviewerError {
@@ -946,6 +977,14 @@ struct Choice {
 #[derive(Deserialize)]
 struct AssistantMessage {
     content: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AssetReviewerWireReport {
+    decision: AssetReviewDecision,
+    reason_codes: Vec<AssetReviewReasonCode>,
+    summary: String,
 }
 
 #[cfg(test)]
@@ -1191,7 +1230,9 @@ mod tests {
             report.decision(),
             crate::workflow::AssetReviewDecision::Approve
         );
-        assert_multimodal_request(&server.body(), "image/jpeg", &original);
+        let body = server.body();
+        assert_multimodal_request(&body, "image/jpeg", &original);
+        assert!(!body.to_string().contains("photo.jpg"));
     }
 
     #[test]
@@ -1341,6 +1382,49 @@ mod tests {
             let error =
                 review_source("image.png", &png(), |_| {}, &server, 1024 * 1024).unwrap_err();
             assert_eq!(error.kind(), expected);
+        }
+    }
+
+    #[test]
+    fn response_diagnostics_are_specific_without_echoing_provider_content() {
+        let cases = [
+            (
+                "not json provider-secret",
+                AssetReviewerErrorKind::MalformedResponse,
+                "not valid JSON (syntax error at line 1 column",
+                "provider-secret",
+            ),
+            (
+                r#"{"decision":"reject","reason_codes":["visible_credential_secret"],"summary":"A credential is visible.","leaked_secret":"do-not-echo"}"#,
+                AssetReviewerErrorKind::InvalidReport,
+                "failed strict schema validation (data error at line 1 column",
+                "do-not-echo",
+            ),
+            (
+                r#"{"decision":"reject","reason_codes":["visible_credential_secret","visible_credential_secret"],"summary":"A credential is visible."}"#,
+                AssetReviewerErrorKind::InvalidReport,
+                "failed semantic validation: asset reviewer report contains a duplicate reason code",
+                "A credential is visible.",
+            ),
+            (
+                r#"{"decision":"reject","reason_codes":["visible_credential_secret"],"summary":"Credential sk-live-super-secret is visible."}"#,
+                AssetReviewerErrorKind::InvalidReport,
+                "failed semantic validation: invalid asset review summary: review summary may contain sensitive raw values",
+                "sk-live-super-secret",
+            ),
+        ];
+
+        for (content, expected_kind, expected_diagnostic, forbidden_content) in cases {
+            let server = FakeServer::new(200, completion(content, "stop"), Duration::ZERO);
+            let error =
+                review_source("image.png", &png(), |_| {}, &server, 1024 * 1024).unwrap_err();
+            assert_eq!(error.kind(), expected_kind);
+            assert!(
+                error.message().contains(expected_diagnostic),
+                "unexpected diagnostic: {}",
+                error.message()
+            );
+            assert!(!error.message().contains(forbidden_content));
         }
     }
 
