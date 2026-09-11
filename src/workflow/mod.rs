@@ -1,6 +1,7 @@
 mod asset_policy;
 mod asset_program_check;
 mod asset_review_run;
+mod asset_review_workflow;
 mod candidate_asset;
 mod public_policy_run;
 
@@ -15,6 +16,12 @@ pub use asset_program_check::{
 };
 pub use asset_review_run::{
     AssetReviewRun, AssetReviewRunError, AssetReviewRunId, AssetReviewRunStore,
+};
+pub use asset_review_workflow::{
+    AssetReviewRunIdGenerator, AssetReviewWorkflow, AssetReviewWorkflowEntry,
+    AssetReviewWorkflowError, AssetReviewWorkflowFailure, AssetReviewWorkflowInput,
+    AssetReviewWorkflowResult, SequentialAssetReviewRunIdGenerator,
+    SequentialAssetReviewRunIdGeneratorError,
 };
 pub use candidate_asset::{CandidateAsset, CandidateAssetSelectionError, CandidateAssetSet};
 pub use public_policy_run::{

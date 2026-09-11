@@ -88,6 +88,42 @@ impl AssetPolicyOutcome {
     pub fn review_candidate(&self) -> Option<&AssetReviewCandidate> {
         self.review_candidate.as_ref()
     }
+
+    /// Applies the already-made policy decision and calls a reviewer only for a
+    /// policy-created candidate. This keeps the reviewer boundary impossible to
+    /// bypass while allowing orchestration to durably persist each outcome
+    /// before moving to the next asset.
+    pub fn review<R: AssetReviewer + ?Sized>(&self, reviewer: &R) -> AssetReviewOutcome {
+        let disposition = match self.decision {
+            AssetPolicyDecision::Blocked => AssetReviewDisposition::Blocked,
+            AssetPolicyDecision::NeedsHumanReview => {
+                AssetReviewDisposition::NeedsHumanReview(AssetHumanReviewReason::PolicyFindings)
+            }
+            AssetPolicyDecision::ReadyForAssetReview => {
+                let candidate = self
+                    .review_candidate
+                    .as_ref()
+                    .expect("ready asset policy outcome must contain a candidate");
+                match reviewer.review(candidate) {
+                    Ok(decision) => AssetReviewDisposition::Reviewed(decision),
+                    Err(error) => AssetReviewDisposition::NeedsHumanReview(
+                        AssetHumanReviewReason::ReviewerFailed(error),
+                    ),
+                }
+            }
+        };
+
+        AssetReviewOutcome {
+            path: self.path().clone(),
+            dependents: self.dependents().to_vec(),
+            sha256: self.checked_asset.sha256(),
+            actual_type: self.checked_asset.actual_type().clone(),
+            size: self.checked_asset.size(),
+            image_dimensions: self.checked_asset.image_dimensions(),
+            findings: self.findings().to_vec(),
+            disposition,
+        }
+    }
 }
 
 /// Complete deterministic Asset Policy output for one immutable Snapshot.
@@ -111,39 +147,7 @@ impl AssetPolicyResult {
         let outcomes = self
             .outcomes
             .iter()
-            .map(|outcome| {
-                let disposition = match outcome.decision {
-                    AssetPolicyDecision::Blocked => AssetReviewDisposition::Blocked,
-                    AssetPolicyDecision::NeedsHumanReview => {
-                        AssetReviewDisposition::NeedsHumanReview(
-                            AssetHumanReviewReason::PolicyFindings,
-                        )
-                    }
-                    AssetPolicyDecision::ReadyForAssetReview => {
-                        let candidate = outcome
-                            .review_candidate
-                            .as_ref()
-                            .expect("ready asset policy outcome must contain a candidate");
-                        match reviewer.review(candidate) {
-                            Ok(decision) => AssetReviewDisposition::Reviewed(decision),
-                            Err(error) => AssetReviewDisposition::NeedsHumanReview(
-                                AssetHumanReviewReason::ReviewerFailed(error),
-                            ),
-                        }
-                    }
-                };
-
-                AssetReviewOutcome {
-                    path: outcome.path().clone(),
-                    dependents: outcome.dependents().to_vec(),
-                    sha256: outcome.checked_asset.sha256(),
-                    actual_type: outcome.checked_asset.actual_type().clone(),
-                    size: outcome.checked_asset.size(),
-                    image_dimensions: outcome.checked_asset.image_dimensions(),
-                    findings: outcome.findings().to_vec(),
-                    disposition,
-                }
-            })
+            .map(|outcome| outcome.review(reviewer))
             .collect();
 
         AssetReviewResult {

@@ -40,6 +40,26 @@ pub struct CandidateAssetSet {
 }
 
 impl CandidateAssetSet {
+    #[cfg(test)]
+    pub(crate) fn from_entries_for_test(
+        snapshot_id: SnapshotId,
+        entries: impl IntoIterator<Item = (ContentPath, Vec<ContentPath>)>,
+    ) -> Self {
+        let mut assets = entries
+            .into_iter()
+            .map(|(path, mut dependents)| {
+                dependents.sort();
+                dependents.dedup();
+                CandidateAsset { path, dependents }
+            })
+            .collect::<Vec<_>>();
+        assets.sort_by(|left, right| left.path.cmp(&right.path));
+        Self {
+            snapshot_id,
+            assets,
+        }
+    }
+
     /// Selects only resolved asset edges originating from approved Markdown.
     ///
     /// This consumes existing policy and dependency results and performs no IO,
