@@ -54,6 +54,17 @@ pub enum ProjectionEntryKind {
     Asset,
 }
 
+/// The V1 publication mode of a managed file.
+///
+/// Projection entries are always ordinary, non-executable files. Keeping this
+/// publisher-neutral fact explicit prevents a Git materializer from changing
+/// mode behind a byte-only `PublishPlan`.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum PublicationFileMode {
+    Regular,
+    Executable,
+}
+
 /// One exact blob at one exact path in the complete desired target tree.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProjectionEntry {
@@ -72,6 +83,10 @@ impl ProjectionEntry {
     /// The final bytes identity a Publisher must materialize.
     pub fn blob_sha256(&self) -> Sha256 {
         self.blob_sha256
+    }
+
+    pub fn file_mode(&self) -> PublicationFileMode {
+        PublicationFileMode::Regular
     }
 
     pub fn kind(&self) -> ProjectionEntryKind {

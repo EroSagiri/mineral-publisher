@@ -52,7 +52,7 @@ pub use public_policy_run::{
 };
 pub use public_projection::{
     ManagedRoot, ProjectionEntry, ProjectionEntryKind, ProjectionTargetPath,
-    ProjectionTargetPathError, PublicProjection, PublicProjectionError,
+    ProjectionTargetPathError, PublicProjection, PublicProjectionError, PublicationFileMode,
 };
 pub use publish_plan::{
     CurrentTargetEntry, CurrentTargetState, CurrentTargetStateError, PublishOperation, PublishPlan,

@@ -9,7 +9,7 @@ use crate::{
     domain::Sha256,
     workflow::{
         CurrentTargetEntry, CurrentTargetState, CurrentTargetStateError, ManagedRoot,
-        ProjectionTargetPath, ProjectionTargetPathError,
+        ProjectionTargetPath, ProjectionTargetPathError, PublicationFileMode,
     },
 };
 
@@ -48,14 +48,21 @@ impl GitCurrentTargetAdapter {
         validate_repository_path(repository)?;
         ensure_git_repository(repository)?;
         let base_commit = resolve_commit(repository, revision)?;
-        let root_entry = read_root_entry(repository, &base_commit, &managed_root)?;
+        let state = Self::read_tree(repository, &base_commit, managed_root)?;
+
+        Ok(GitCurrentTarget { base_commit, state })
+    }
+
+    pub(crate) fn read_tree(
+        repository: &Path,
+        treeish: &str,
+        managed_root: ManagedRoot,
+    ) -> Result<CurrentTargetState, GitCurrentTargetError> {
+        let root_entry = read_root_entry(repository, treeish, &managed_root)?;
 
         let Some(root_entry) = root_entry else {
-            return Ok(GitCurrentTarget {
-                base_commit,
-                state: CurrentTargetState::new(managed_root, Vec::new())
-                    .map_err(GitCurrentTargetError::CurrentTargetState)?,
-            });
+            return CurrentTargetState::new(managed_root, Vec::new())
+                .map_err(GitCurrentTargetError::CurrentTargetState);
         };
         if root_entry.mode != b"040000" || root_entry.kind != b"tree" {
             return Err(GitCurrentTargetError::ManagedRootNotTree {
@@ -73,7 +80,7 @@ impl GitCurrentTargetAdapter {
                 "-r",
                 "-z",
                 "--full-tree",
-                base_commit.as_str(),
+                treeish,
                 "--",
                 &literal_pathspec(&managed_root),
             ],
@@ -84,12 +91,20 @@ impl GitCurrentTargetAdapter {
             classify_regular_file(&tree_entry)?;
             let target_path = target_path_from_bytes(tree_entry.path)?;
             let blob = read_blob(repository, tree_entry.object_id)?;
-            entries.push(CurrentTargetEntry::new(target_path, Sha256::digest(&blob)));
+            let file_mode = match tree_entry.mode {
+                b"100644" => PublicationFileMode::Regular,
+                b"100755" => PublicationFileMode::Executable,
+                _ => unreachable!("regular file classification checked the mode"),
+            };
+            entries.push(CurrentTargetEntry::with_mode(
+                target_path,
+                Sha256::digest(&blob),
+                file_mode,
+            ));
         }
 
-        let state = CurrentTargetState::new(managed_root, entries)
-            .map_err(GitCurrentTargetError::CurrentTargetState)?;
-        Ok(GitCurrentTarget { base_commit, state })
+        CurrentTargetState::new(managed_root, entries)
+            .map_err(GitCurrentTargetError::CurrentTargetState)
     }
 }
 
@@ -748,6 +763,10 @@ mod tests {
         assert_eq!(
             target.state().entries()[0].blob_sha256(),
             Sha256::digest(b"#!/bin/sh\nexit 0\n")
+        );
+        assert_eq!(
+            target.state().entries()[0].file_mode(),
+            PublicationFileMode::Executable
         );
     }
 

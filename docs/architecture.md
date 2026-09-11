@@ -1261,6 +1261,10 @@ Git 目标的当前状态必须从调用者明确选择的不可变 commit/tree 
 working tree 或 index。Git object identifier 只标识 Git 对象，不能替代 Mineral Publisher
 基于 blob 原始 bytes 计算的内容 SHA-256 identity。
 
+V1 中所有受管理的 publication entry 都是 mode `100644` 的普通非可执行文件；symlink 与
+gitlink 不属于 publication state。CurrentTargetState 和 PublishPlan 必须保留这一 mode 语义，
+避免 byte identity 相同但 mode 非规范时被错误判断为 Noop。
+
 ---
 
 # 28. Publisher
@@ -1398,6 +1402,11 @@ git push --force
 对于 Git 发布，需要保证：
 
 > 被审核的 Git Tree 与最终 commit 的 Git Tree 完全相同。
+
+PublicProjection materialization 必须绑定调用方明确选择的 base commit，并生成一个 Git tree：
+managed subtree 的 target path、最终 blob 原始 bytes identity 和规范 file mode 必须与完整
+Projection 精确一致；managed root 外必须与 base commit tree 完全一致。用户可变的 working
+tree 与 index 不是 publication input，materialization 不得读取或修改它们。
 
 审核前：
 
