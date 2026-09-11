@@ -65,6 +65,20 @@ pub struct FinalPublicationSet {
 }
 
 impl FinalPublicationSet {
+    #[cfg(test)]
+    pub(crate) fn from_parts_for_test(
+        snapshot_id: SnapshotId,
+        markdown: Vec<ContentPath>,
+        assets: Vec<SanitizedAsset>,
+    ) -> Self {
+        Self {
+            snapshot_id,
+            markdown,
+            assets,
+            blocked_markdown: Vec::new(),
+        }
+    }
+
     /// Computes the final Markdown set and then derives its exact asset closure.
     ///
     /// This consumes existing results only. It performs no parsing, policy,

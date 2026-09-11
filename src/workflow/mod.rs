@@ -8,6 +8,7 @@ mod effective_review_set;
 mod final_dependency_closure;
 mod human_review;
 mod public_policy_run;
+mod public_projection;
 
 pub use asset_policy::{
     AssetHumanReviewReason, AssetPolicy, AssetPolicyDecision, AssetPolicyOutcome,
@@ -47,4 +48,8 @@ pub use human_review::{
 pub use public_policy_run::{
     PublicPolicyRun, PublicPolicyRunError, PublicPolicyRunFailure, PublicPolicyRunResult,
     ReviewRunIdGenerator, SequentialReviewRunIdGenerator, SequentialReviewRunIdGeneratorError,
+};
+pub use public_projection::{
+    ManagedRoot, ProjectionEntry, ProjectionEntryKind, ProjectionTargetPath,
+    ProjectionTargetPathError, PublicProjection, PublicProjectionError,
 };

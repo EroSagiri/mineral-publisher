@@ -1086,6 +1086,13 @@ Projection 本身不关心：
 还是 R2
 ```
 
+Projection 是受管理目标空间的完整期望状态，不是 changed files 或文件系统操作列表。每个
+entry 必须同时标识规范化的目标相对路径和最终 blob identity，使 Publisher 无需再根据路径
+猜测应写入的 bytes。Markdown entry 引用对应 SnapshotFile 的不可变 blob identity；经过资源
+清理的 Asset entry 引用 Sanitization 产生的 published blob identity，并保留到 source blob
+identity 的审计关系。Projection 的计算独立于 ChangeSet，相同 FinalPublicationSet、Snapshot
+与路径配置必须产生顺序和身份均确定的结果。
+
 ---
 
 # 24. Public Projection
