@@ -9,6 +9,7 @@ mod final_dependency_closure;
 mod human_review;
 mod public_policy_run;
 mod public_projection;
+mod publish_plan;
 
 pub use asset_policy::{
     AssetHumanReviewReason, AssetPolicy, AssetPolicyDecision, AssetPolicyOutcome,
@@ -52,4 +53,8 @@ pub use public_policy_run::{
 pub use public_projection::{
     ManagedRoot, ProjectionEntry, ProjectionEntryKind, ProjectionTargetPath,
     ProjectionTargetPathError, PublicProjection, PublicProjectionError,
+};
+pub use publish_plan::{
+    CurrentTargetEntry, CurrentTargetState, CurrentTargetStateError, PublishOperation, PublishPlan,
+    PublishPlanError,
 };
