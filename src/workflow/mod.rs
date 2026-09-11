@@ -2,6 +2,7 @@ mod asset_policy;
 mod asset_program_check;
 mod asset_review_run;
 mod asset_review_workflow;
+mod asset_sanitization;
 mod candidate_asset;
 mod effective_review_set;
 mod human_review;
@@ -24,6 +25,10 @@ pub use asset_review_workflow::{
     AssetReviewWorkflowError, AssetReviewWorkflowFailure, AssetReviewWorkflowInput,
     AssetReviewWorkflowResult, SequentialAssetReviewRunIdGenerator,
     SequentialAssetReviewRunIdGeneratorError,
+};
+pub use asset_sanitization::{
+    AssetContentStore, AssetSanitizationError, AssetSanitizer, ImageSanitizationFormat,
+    SanitizationTransformation, SanitizedAsset, SanitizedAssetSet,
 };
 pub use candidate_asset::{CandidateAsset, CandidateAssetSelectionError, CandidateAssetSet};
 pub use effective_review_set::{

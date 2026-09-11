@@ -354,7 +354,7 @@ fn check_bytes(
     }
 }
 
-fn detect_actual_type(bytes: &[u8]) -> ActualAssetType {
+pub(super) fn detect_actual_type(bytes: &[u8]) -> ActualAssetType {
     if bytes.starts_with(b"%PDF-") {
         return ActualAssetType::Pdf;
     }
@@ -378,7 +378,10 @@ fn detect_actual_type(bytes: &[u8]) -> ActualAssetType {
     }
 }
 
-fn check_image(bytes: &[u8], findings: &mut Vec<AssetCheckFinding>) -> Option<ImageDimensions> {
+pub(super) fn check_image(
+    bytes: &[u8],
+    findings: &mut Vec<AssetCheckFinding>,
+) -> Option<ImageDimensions> {
     let image = match ImageReader::new(Cursor::new(bytes)).with_guessed_format() {
         Ok(reader) => match reader.decode() {
             Ok(image) => image,

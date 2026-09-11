@@ -29,6 +29,19 @@ pub type EffectiveReviewSetBuildResult<D, A, H> = Result<
 >;
 
 impl EffectiveReviewSet {
+    #[cfg(test)]
+    pub(crate) fn from_assets_for_test(
+        snapshot_id: SnapshotId,
+        mut assets: Vec<EffectiveAssetReview>,
+    ) -> Self {
+        assets.sort_by(|left, right| left.content_path.cmp(&right.content_path));
+        Self {
+            snapshot_id,
+            documents: Vec::new(),
+            assets,
+        }
+    }
+
     pub fn build<D, A, H>(
         documents: &PublicPolicyRunResult,
         assets: &AssetReviewWorkflowResult,
@@ -237,6 +250,21 @@ pub struct EffectiveAssetReview {
     dependents: Vec<ContentPath>,
 }
 impl EffectiveAssetReview {
+    #[cfg(test)]
+    pub(crate) fn from_parts_for_test(
+        content_path: ContentPath,
+        review_run_id: AssetReviewRunId,
+        decision: EffectiveReviewDecision,
+        dependents: Vec<ContentPath>,
+    ) -> Self {
+        Self {
+            content_path,
+            review_run_id,
+            decision,
+            dependents,
+        }
+    }
+
     pub fn content_path(&self) -> &ContentPath {
         &self.content_path
     }
