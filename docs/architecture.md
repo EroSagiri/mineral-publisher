@@ -966,11 +966,20 @@ Check，也不重新读取 Source。`MissingBlob`、`CorruptBlob`、`SizeMismatc
 `Blocked`；`UnknownType`、`UnsupportedType`、扩展名与实际内容不一致，以及 metadata
 无法可靠检查时进入 `NeedsHumanReview`，不得默认批准，也不得送入 AI。
 
-只有具有不可变内容身份和大小、且类型为可解码图片或明确 PDF 的资产才能构造
+只有具有不可变内容身份和大小、且类型为当前 publication/sanitization 边界支持的可解码图片才能构造
 `AssetReviewCandidate`。EXIF、GPS、XMP finding 不属于结构损坏，会完整保留在 candidate
-及最终 outcome 中。`AssetReviewer` 只能接收该 candidate，并只返回 `Approve`、`Reject`
-或 `NeedsHumanReview`；Reviewer 错误必须转换为 `NeedsHumanReview`。共享资源按资产路径只
+及最终 outcome 中。`AssetReviewer` 只能接收该 candidate，并返回包含 `Approve`、`Reject`
+或 `NeedsHumanReview` 的结构化解释报告；Reviewer 错误必须转换为 `NeedsHumanReview`。共享资源按资产路径只
 审核一次，同时保留所有依赖它的 Markdown。此边界不执行清理、Projection 或发布。
+
+语义资源审核必须绑定不可变 Snapshot 中的 source asset identity，并读取该 identity 对应的
+原始 blob；不得重新读取可变 Source，也不得审核 sanitizer 输出或未来 publication blob。语义
+视觉审核发生在 Asset Sanitization 之前，后者只负责确定性的发布变换，不能替代对原始可见内容
+的隐私与披露风险审核。Reviewer 返回的 decision、reason code 与安全摘要只是供 Asset Policy
+解释和审计的事实，本身不拥有发布权限。
+
+不受支持的格式必须 fail closed。外部 Provider 能理解某种多模态格式，并不自动扩大 Mineral
+Publisher 的可发布格式集合；可发布能力仍须同时满足程序检查、审核策略和 sanitizer 能力边界。
 
 ---
 

@@ -435,12 +435,31 @@ mod tests {
         fn review(
             &self,
             candidate: &super::super::AssetReviewCandidate,
-        ) -> Result<AssetReviewDecision, super::super::AssetReviewerError> {
+        ) -> Result<super::super::AssetReviewerReport, super::super::AssetReviewerError> {
             self.calls.borrow_mut().push(candidate.path().clone());
             self.responses
                 .get(candidate.path())
                 .cloned()
                 .expect("reviewer response is configured")
+                .map(|decision| {
+                    let reasons = match decision {
+                        AssetReviewDecision::Approve => vec![
+                            super::super::AssetReviewReasonCode::OrdinaryVisualContent,
+                        ],
+                        AssetReviewDecision::Reject => vec![
+                            super::super::AssetReviewReasonCode::OtherVisualPrivacyRisk,
+                        ],
+                        AssetReviewDecision::NeedsHumanReview => vec![
+                            super::super::AssetReviewReasonCode::UncertainVisualDisclosureAuthorization,
+                        ],
+                    };
+                    super::super::AssetReviewerReport::new(
+                        decision,
+                        reasons,
+                        "test visual classification",
+                    )
+                    .unwrap()
+                })
         }
     }
 

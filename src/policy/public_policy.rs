@@ -69,8 +69,6 @@ impl ReviewReasonCode {
     }
 }
 
-pub const MAX_REVIEW_SUMMARY_CHARS: usize = 200;
-
 /// Structured semantic-review result. Explanatory fields are audit context only.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -147,50 +145,13 @@ impl ReviewerReport {
             _ => {}
         }
 
-        let summary = self.summary.trim();
-        if summary.is_empty() {
-            return Err(ReviewerReportError::EmptySummary);
-        }
-        if summary.chars().count() > MAX_REVIEW_SUMMARY_CHARS {
-            return Err(ReviewerReportError::SummaryTooLong);
-        }
-        if summary.contains(['\r', '\n']) {
-            return Err(ReviewerReportError::SummaryNotBrief);
-        }
-        let sentence_endings = summary
-            .chars()
-            .filter(|character| matches!(character, '.' | '!' | '?' | '。' | '！' | '？'))
-            .count();
-        if sentence_endings > 2 {
-            return Err(ReviewerReportError::SummaryNotBrief);
-        }
-        if contains_sensitive_summary_value(summary) {
-            return Err(ReviewerReportError::SummaryNotSafe);
-        }
-        Ok(())
+        crate::policy::validate_review_summary(&self.summary).map_err(|error| match error {
+            crate::policy::ReviewSummaryError::Empty => ReviewerReportError::EmptySummary,
+            crate::policy::ReviewSummaryError::TooLong => ReviewerReportError::SummaryTooLong,
+            crate::policy::ReviewSummaryError::NotBrief => ReviewerReportError::SummaryNotBrief,
+            crate::policy::ReviewSummaryError::NotSafe => ReviewerReportError::SummaryNotSafe,
+        })
     }
-}
-
-fn contains_sensitive_summary_value(value: &str) -> bool {
-    let lower = value.to_ascii_lowercase();
-    if ["sk-", "ghp_", "akia", "bearer "]
-        .iter()
-        .any(|marker| lower.contains(marker))
-    {
-        return true;
-    }
-
-    let runs = value.split(|character: char| !character.is_ascii_alphanumeric());
-    for run in runs {
-        let digit_count = run.bytes().filter(u8::is_ascii_digit).count();
-        if (run.len() >= 20 && digit_count > 0)
-            || (run.len() == 11 && digit_count == 11)
-            || (run.len() == 18 && digit_count >= 17)
-        {
-            return true;
-        }
-    }
-    false
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -633,7 +594,7 @@ mod tests {
             assert!(serde_json::from_str::<ReviewerReport>(valid).is_ok());
         }
 
-        let too_long = "a".repeat(MAX_REVIEW_SUMMARY_CHARS + 1);
+        let too_long = "a".repeat(crate::policy::MAX_REVIEW_SUMMARY_CHARS + 1);
         let invalid = [
             r#"{"decision":"probably_safe","reason_codes":[],"summary":"unknown decision"}"#.to_owned(),
             r#"{"decision":"approve","reason_codes":["unknown_reason"],"summary":"unknown reason"}"#.to_owned(),

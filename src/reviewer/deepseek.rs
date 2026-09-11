@@ -643,7 +643,7 @@ impl DeepSeekApiKey {
         Self::new(value)
     }
 
-    fn expose(&self) -> &str {
+    pub(crate) fn expose(&self) -> &str {
         &self.0
     }
 }
@@ -1073,6 +1073,20 @@ fn provider_http_error(
     status: u16,
     response: &mut Response,
 ) -> ReviewerError {
+    let (provider_error_code, provider_error_message) = read_safe_provider_error(response);
+
+    ReviewerError::with_provider_error(
+        kind,
+        status,
+        format!("DeepSeek review request returned HTTP status {status}"),
+        provider_error_code,
+        provider_error_message,
+    )
+}
+
+pub(crate) fn read_safe_provider_error(
+    response: &mut Response,
+) -> (Option<String>, Option<String>) {
     let mut body = Vec::new();
     let _ = response
         .by_ref()
@@ -1082,11 +1096,7 @@ fn provider_http_error(
         .then(|| serde_json::from_slice::<ProviderErrorEnvelope>(&body).ok())
         .flatten()
         .and_then(|envelope| envelope.error);
-
-    ReviewerError::with_provider_error(
-        kind,
-        status,
-        format!("DeepSeek review request returned HTTP status {status}"),
+    (
         provider_error
             .as_ref()
             .and_then(|error| safe_provider_error_code(error.code.as_deref())),

@@ -1,5 +1,6 @@
 use std::{cell::RefCell, collections::BTreeMap, error::Error, fmt};
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::domain::{ContentPath, Sha256, SnapshotId};
@@ -94,6 +95,7 @@ impl AssetPolicyOutcome {
     /// bypass while allowing orchestration to durably persist each outcome
     /// before moving to the next asset.
     pub fn review<R: AssetReviewer + ?Sized>(&self, reviewer: &R) -> AssetReviewOutcome {
+        let mut reviewer_report = None;
         let disposition = match self.decision {
             AssetPolicyDecision::Blocked => AssetReviewDisposition::Blocked,
             AssetPolicyDecision::NeedsHumanReview => {
@@ -105,7 +107,11 @@ impl AssetPolicyOutcome {
                     .as_ref()
                     .expect("ready asset policy outcome must contain a candidate");
                 match reviewer.review(candidate) {
-                    Ok(decision) => AssetReviewDisposition::Reviewed(decision),
+                    Ok(report) => {
+                        let decision = report.decision();
+                        reviewer_report = Some(report);
+                        AssetReviewDisposition::Reviewed(decision)
+                    }
                     Err(error) => AssetReviewDisposition::NeedsHumanReview(
                         AssetHumanReviewReason::ReviewerFailed(error),
                     ),
@@ -122,6 +128,7 @@ impl AssetPolicyOutcome {
             image_dimensions: self.checked_asset.image_dimensions(),
             findings: self.findings().to_vec(),
             disposition,
+            reviewer_report,
         }
     }
 }
@@ -218,10 +225,13 @@ fn classify(asset: &CheckedAsset) -> AssetPolicyDecision {
     }
 
     match asset.actual_type() {
-        ActualAssetType::Image { .. } if asset.image_dimensions().is_some() => {
+        ActualAssetType::Image { media_type, .. }
+            if asset.image_dimensions().is_some()
+                && matches!(media_type.as_str(), "image/jpeg" | "image/png") =>
+        {
             AssetPolicyDecision::ReadyForAssetReview
         }
-        ActualAssetType::Pdf => AssetPolicyDecision::ReadyForAssetReview,
+        ActualAssetType::Pdf => AssetPolicyDecision::NeedsHumanReview,
         ActualAssetType::Image { .. }
         | ActualAssetType::OtherBinary { .. }
         | ActualAssetType::Unknown => AssetPolicyDecision::NeedsHumanReview,
@@ -256,28 +266,272 @@ fn finding_effect(finding: &AssetCheckFinding) -> FindingEffect {
 }
 
 /// Provider-independent semantic review decision.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AssetReviewDecision {
     Approve,
     Reject,
     NeedsHumanReview,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(transparent)]
+impl<'de> Deserialize<'de> for AssetReviewDecision {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        match String::deserialize(deserializer)?.as_str() {
+            "approve" | "Approve" => Ok(Self::Approve),
+            "reject" | "Reject" => Ok(Self::Reject),
+            "needs_human_review" | "NeedsHumanReview" => Ok(Self::NeedsHumanReview),
+            _ => Err(serde::de::Error::custom("unknown asset review decision")),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssetReviewReasonCode {
+    OrdinaryVisualContent,
+    OrdinaryPersonalPhoto,
+    PublicTechnicalVisual,
+    VisibleCredentialSecret,
+    VisiblePrivateContactInformation,
+    VisiblePrivateIdentityInformation,
+    VisiblePrivateCorrespondence,
+    VisibleThirdPartyPrivateInformation,
+    VisibleHomeOrPreciseLocationInformation,
+    InternalWorkInformation,
+    ConfidentialWorkMaterial,
+    SecuritySensitiveInformation,
+    UncertainVisualDisclosureAuthorization,
+    OtherVisualPrivacyRisk,
+}
+
+impl AssetReviewReasonCode {
+    pub fn is_risk(self) -> bool {
+        !matches!(
+            self,
+            Self::OrdinaryVisualContent | Self::OrdinaryPersonalPhoto | Self::PublicTechnicalVisual
+        )
+    }
+}
+
+pub const MAX_ASSET_REVIEW_SUMMARY_CHARS: usize = crate::policy::MAX_REVIEW_SUMMARY_CHARS;
+
+/// Structured visual-review result. Explanatory fields never grant publication authority.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AssetReviewerReport {
+    decision: AssetReviewDecision,
+    reason_codes: Vec<AssetReviewReasonCode>,
+    summary: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UncheckedAssetReviewerReport {
+    decision: AssetReviewDecision,
+    reason_codes: Vec<AssetReviewReasonCode>,
+    summary: String,
+}
+
+impl<'de> Deserialize<'de> for AssetReviewerReport {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let report = UncheckedAssetReviewerReport::deserialize(deserializer)?;
+        Self::new(report.decision, report.reason_codes, report.summary)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+impl AssetReviewerReport {
+    pub fn new(
+        decision: AssetReviewDecision,
+        reason_codes: Vec<AssetReviewReasonCode>,
+        summary: impl Into<String>,
+    ) -> Result<Self, AssetReviewerReportError> {
+        let report = Self {
+            decision,
+            reason_codes,
+            summary: summary.into(),
+        };
+        report.validate()?;
+        Ok(report)
+    }
+
+    pub fn decision(&self) -> AssetReviewDecision {
+        self.decision
+    }
+
+    pub fn reason_codes(&self) -> &[AssetReviewReasonCode] {
+        &self.reason_codes
+    }
+
+    pub fn summary(&self) -> &str {
+        &self.summary
+    }
+
+    pub fn validate(&self) -> Result<(), AssetReviewerReportError> {
+        if self.reason_codes.len() > 8 {
+            return Err(AssetReviewerReportError::TooManyReasonCodes);
+        }
+        for (index, reason) in self.reason_codes.iter().enumerate() {
+            if self.reason_codes[..index].contains(reason) {
+                return Err(AssetReviewerReportError::DuplicateReasonCode);
+            }
+        }
+        let has_risk = self.reason_codes.iter().any(|reason| reason.is_risk());
+        match self.decision {
+            AssetReviewDecision::Approve if has_risk => {
+                return Err(AssetReviewerReportError::ApproveWithRiskReason);
+            }
+            AssetReviewDecision::Reject | AssetReviewDecision::NeedsHumanReview if !has_risk => {
+                return Err(AssetReviewerReportError::RiskDecisionWithoutRiskReason);
+            }
+            _ => {}
+        }
+        crate::policy::validate_review_summary(&self.summary)
+            .map_err(AssetReviewerReportError::UnsafeSummary)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AssetReviewerReportError {
+    TooManyReasonCodes,
+    DuplicateReasonCode,
+    ApproveWithRiskReason,
+    RiskDecisionWithoutRiskReason,
+    UnsafeSummary(crate::policy::ReviewSummaryError),
+}
+
+impl fmt::Display for AssetReviewerReportError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TooManyReasonCodes => {
+                formatter.write_str("asset reviewer report contains too many reason codes")
+            }
+            Self::DuplicateReasonCode => {
+                formatter.write_str("asset reviewer report contains a duplicate reason code")
+            }
+            Self::ApproveWithRiskReason => {
+                formatter.write_str("asset approve report contains a risk reason")
+            }
+            Self::RiskDecisionWithoutRiskReason => {
+                formatter.write_str("asset reject or human-review report requires a risk reason")
+            }
+            Self::UnsafeSummary(error) => {
+                write!(formatter, "invalid asset review summary: {error}")
+            }
+        }
+    }
+}
+
+impl Error for AssetReviewerReportError {}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct AssetReviewerError {
+    kind: AssetReviewerErrorKind,
     message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    http_status: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider_error_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider_error_message: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum AssetReviewerErrorRepresentation {
+    Legacy(String),
+    Structured {
+        #[serde(default)]
+        kind: AssetReviewerErrorKind,
+        message: String,
+        #[serde(default)]
+        http_status: Option<u16>,
+        #[serde(default)]
+        provider_error_code: Option<String>,
+        #[serde(default)]
+        provider_error_message: Option<String>,
+    },
+}
+
+impl<'de> Deserialize<'de> for AssetReviewerError {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(
+            match AssetReviewerErrorRepresentation::deserialize(deserializer)? {
+                AssetReviewerErrorRepresentation::Legacy(message) => Self::new(message),
+                AssetReviewerErrorRepresentation::Structured {
+                    kind,
+                    message,
+                    http_status,
+                    provider_error_code,
+                    provider_error_message,
+                } => Self {
+                    kind,
+                    message,
+                    http_status,
+                    provider_error_code,
+                    provider_error_message,
+                },
+            },
+        )
+    }
 }
 
 impl AssetReviewerError {
     pub fn new(message: impl Into<String>) -> Self {
+        Self::with_kind(AssetReviewerErrorKind::Other, message)
+    }
+
+    pub fn with_kind(kind: AssetReviewerErrorKind, message: impl Into<String>) -> Self {
         Self {
+            kind,
             message: message.into(),
+            http_status: None,
+            provider_error_code: None,
+            provider_error_message: None,
         }
+    }
+
+    pub fn with_provider_error(
+        kind: AssetReviewerErrorKind,
+        status: u16,
+        message: impl Into<String>,
+        provider_error_code: Option<String>,
+        provider_error_message: Option<String>,
+    ) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+            http_status: Some(status),
+            provider_error_code,
+            provider_error_message,
+        }
+    }
+
+    pub fn kind(&self) -> AssetReviewerErrorKind {
+        self.kind
     }
 
     pub fn message(&self) -> &str {
         &self.message
+    }
+
+    pub fn http_status(&self) -> Option<u16> {
+        self.http_status
+    }
+    pub fn provider_error_code(&self) -> Option<&str> {
+        self.provider_error_code.as_deref()
+    }
+    pub fn provider_error_message(&self) -> Option<&str> {
+        self.provider_error_message.as_deref()
     }
 }
 
@@ -289,12 +543,31 @@ impl fmt::Display for AssetReviewerError {
 
 impl Error for AssetReviewerError {}
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssetReviewerErrorKind {
+    ContentStore,
+    InputTooLarge,
+    UnsupportedFormat,
+    Transport,
+    Timeout,
+    Authentication,
+    HttpStatus,
+    ResponseTooLarge,
+    EmptyResponse,
+    MalformedResponse,
+    InvalidReport,
+    TruncatedResponse,
+    #[default]
+    Other,
+}
+
 /// Reviews only assets that crossed the deterministic Asset Policy boundary.
 pub trait AssetReviewer {
     fn review(
         &self,
         candidate: &AssetReviewCandidate,
-    ) -> Result<AssetReviewDecision, AssetReviewerError>;
+    ) -> Result<AssetReviewerReport, AssetReviewerError>;
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -320,6 +593,8 @@ pub struct AssetReviewOutcome {
     image_dimensions: Option<ImageDimensions>,
     findings: Vec<AssetCheckFinding>,
     disposition: AssetReviewDisposition,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reviewer_report: Option<AssetReviewerReport>,
 }
 
 impl AssetReviewOutcome {
@@ -355,6 +630,10 @@ impl AssetReviewOutcome {
         &self.disposition
     }
 
+    pub fn reviewer_report(&self) -> Option<&AssetReviewerReport> {
+        self.reviewer_report.as_ref()
+    }
+
     #[cfg(test)]
     pub(crate) fn from_parts_for_test(
         path: ContentPath,
@@ -372,6 +651,7 @@ impl AssetReviewOutcome {
             image_dimensions: None,
             findings,
             disposition,
+            reviewer_report: None,
         }
     }
 }
@@ -430,7 +710,7 @@ impl AssetReviewer for MockAssetReviewer {
     fn review(
         &self,
         candidate: &AssetReviewCandidate,
-    ) -> Result<AssetReviewDecision, AssetReviewerError> {
+    ) -> Result<AssetReviewerReport, AssetReviewerError> {
         self.reviewed_paths
             .borrow_mut()
             .push(candidate.path.clone());
@@ -438,7 +718,19 @@ impl AssetReviewer for MockAssetReviewer {
             .get(candidate.path())
             .unwrap_or(&self.default_response)
             .clone()
+            .map(test_report)
     }
+}
+
+fn test_report(decision: AssetReviewDecision) -> AssetReviewerReport {
+    let reasons = match decision {
+        AssetReviewDecision::Approve => vec![AssetReviewReasonCode::OrdinaryVisualContent],
+        AssetReviewDecision::Reject => vec![AssetReviewReasonCode::OtherVisualPrivacyRisk],
+        AssetReviewDecision::NeedsHumanReview => {
+            vec![AssetReviewReasonCode::UncertainVisualDisclosureAuthorization]
+        }
+    };
+    AssetReviewerReport::new(decision, reasons, "test visual classification").unwrap()
 }
 
 #[cfg(test)]
@@ -447,6 +739,90 @@ mod tests {
 
     fn path(value: &str) -> ContentPath {
         ContentPath::new(value).unwrap()
+    }
+
+    #[test]
+    fn asset_reviewer_report_json_is_strict_and_semantically_validated() {
+        let valid = [
+            r#"{"decision":"approve","reason_codes":["ordinary_visual_content"],"summary":"Ordinary public scene."}"#,
+            r#"{"decision":"needs_human_review","reason_codes":["uncertain_visual_disclosure_authorization"],"summary":"A concrete authorization question remains."}"#,
+            r#"{"decision":"reject","reason_codes":["visible_credential_secret"],"summary":"A likely access credential is visible."}"#,
+        ];
+        for value in valid {
+            assert!(serde_json::from_str::<AssetReviewerReport>(value).is_ok());
+        }
+
+        let invalid = [
+            r#"{"decision":"unknown","reason_codes":["ordinary_visual_content"],"summary":"x"}"#,
+            r#"{"decision":"approve","reason_codes":["unknown_reason"],"summary":"x"}"#,
+            r#"{"decision":"approve","reason_codes":["ordinary_visual_content","ordinary_visual_content"],"summary":"x"}"#,
+            r#"{"decision":"approve","reason_codes":["ordinary_visual_content"],"summary":"x","extra":true}"#,
+            r#"{"decision":"approve","reason_codes":["ordinary_visual_content"]}"#,
+            r#"{"decision":"approve","reason_codes":["visible_credential_secret"],"summary":"x"}"#,
+            r#"{"decision":"reject","reason_codes":[],"summary":"x"}"#,
+            r#"{"decision":"needs_human_review","reason_codes":[],"summary":"x"}"#,
+            r#"{"decision":"reject","reason_codes":["visible_credential_secret"],"summary":"The token is sk-prod-123456789."}"#,
+        ];
+        for value in invalid {
+            assert!(
+                serde_json::from_str::<AssetReviewerReport>(value).is_err(),
+                "{value}"
+            );
+        }
+        let too_long = "a".repeat(MAX_ASSET_REVIEW_SUMMARY_CHARS + 1);
+        assert!(
+            AssetReviewerReport::new(
+                AssetReviewDecision::Approve,
+                vec![AssetReviewReasonCode::OrdinaryVisualContent],
+                too_long,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn provider_capability_does_not_expand_jpeg_png_publication_boundary() {
+        for (media_type, extension) in [("image/gif", "gif"), ("image/webp", "webp")] {
+            let asset = CheckedAsset::new(
+                path(&format!("image.{extension}")),
+                vec![path("a.md")],
+                Some(Sha256::digest(b"image")),
+                ActualAssetType::Image {
+                    media_type: media_type.to_owned(),
+                    extension: extension.to_owned(),
+                },
+                Some(5),
+                Some(ImageDimensions::new(1, 1)),
+                vec![],
+            );
+            let policy = AssetPolicy::evaluate(&result(vec![asset]));
+            let reviewer = MockAssetReviewer::returning(Ok(AssetReviewDecision::Approve));
+            assert_eq!(
+                policy.outcomes()[0].decision(),
+                AssetPolicyDecision::NeedsHumanReview
+            );
+            assert!(policy.outcomes()[0].review_candidate().is_none());
+            let _ = policy.review(&reviewer);
+            assert!(reviewer.reviewed_paths().is_empty());
+        }
+
+        let pdf = CheckedAsset::new(
+            path("document.pdf"),
+            vec![path("a.md")],
+            Some(Sha256::digest(b"%PDF-1.7")),
+            ActualAssetType::Pdf,
+            Some(8),
+            None,
+            vec![],
+        );
+        let policy = AssetPolicy::evaluate(&result(vec![pdf]));
+        let reviewer = MockAssetReviewer::returning(Ok(AssetReviewDecision::Approve));
+        let _ = policy.review(&reviewer);
+        assert_eq!(
+            policy.outcomes()[0].decision(),
+            AssetPolicyDecision::NeedsHumanReview
+        );
+        assert!(reviewer.reviewed_paths().is_empty());
     }
 
     fn image(path_value: &str, findings: Vec<AssetCheckFinding>) -> CheckedAsset {
