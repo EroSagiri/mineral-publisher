@@ -39,6 +39,11 @@ impl PrivateDocument {
     pub fn reasons(&self) -> &[PrivateReason] {
         &self.reasons
     }
+
+    #[cfg(test)]
+    pub(crate) fn from_parts_for_test(path: ContentPath, reasons: Vec<PrivateReason>) -> Self {
+        Self { path, reasons }
+    }
 }
 
 /// A Markdown document whose privacy metadata could not be interpreted safely.
@@ -55,6 +60,14 @@ impl InvalidPrivacyDocument {
 
     pub fn reason(&self) -> &str {
         &self.reason
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_parts_for_test(path: ContentPath, reason: impl Into<String>) -> Self {
+        Self {
+            path,
+            reason: reason.into(),
+        }
     }
 }
 

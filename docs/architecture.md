@@ -1984,6 +1984,8 @@ Quartz / Cloudflare Pages 集成
 
 21. API Key、Secret 不得写入 Git、日志或审计数据库。
 
+22. 有效发布决策必须基于明确选定的审核 attempt；不得从最新审核记录推断。
+
 ---
 
 # 45. 第一版明确不做的事情

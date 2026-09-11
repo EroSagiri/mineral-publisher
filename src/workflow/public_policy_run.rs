@@ -113,6 +113,21 @@ impl PublicPolicyRunResult {
             document_outcomes,
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn from_parts_for_test(
+        snapshot_id: SnapshotId,
+        private_documents: Vec<PrivateDocument>,
+        invalid_privacy_documents: Vec<InvalidPrivacyDocument>,
+        document_outcomes: Vec<ReviewRun>,
+    ) -> Self {
+        Self {
+            snapshot_id,
+            private_documents,
+            invalid_privacy_documents,
+            document_outcomes,
+        }
+    }
 }
 
 /// The stage that prevented a run from completing successfully.

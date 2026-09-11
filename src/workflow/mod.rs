@@ -3,6 +3,7 @@ mod asset_program_check;
 mod asset_review_run;
 mod asset_review_workflow;
 mod candidate_asset;
+mod effective_review_set;
 mod human_review;
 mod public_policy_run;
 
@@ -25,6 +26,10 @@ pub use asset_review_workflow::{
     SequentialAssetReviewRunIdGeneratorError,
 };
 pub use candidate_asset::{CandidateAsset, CandidateAssetSelectionError, CandidateAssetSet};
+pub use effective_review_set::{
+    EffectiveAssetReview, EffectiveDocumentDecision, EffectiveDocumentReview, EffectiveReviewSet,
+    EffectiveReviewSetError,
+};
 pub use human_review::{
     EffectiveReviewDecision, EffectiveReviewDecisionError, HumanReviewDecision, HumanReviewId,
     HumanReviewRecord, HumanReviewRecordError, HumanReviewResolution, HumanReviewResolutionError,

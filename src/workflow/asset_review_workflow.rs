@@ -118,6 +118,33 @@ impl AssetReviewWorkflowResult {
             .map(AssetReviewWorkflowEntry::content_path)
             .collect()
     }
+
+    #[cfg(test)]
+    pub(crate) fn from_entries_for_test(
+        snapshot_id: SnapshotId,
+        mut entries: Vec<AssetReviewWorkflowEntry>,
+    ) -> Self {
+        entries.sort_by(|left, right| left.content_path.cmp(&right.content_path));
+        Self {
+            snapshot_id,
+            entries,
+        }
+    }
+}
+
+#[cfg(test)]
+impl AssetReviewWorkflowEntry {
+    pub(crate) fn from_parts_for_test(
+        content_path: ContentPath,
+        review_run_id: AssetReviewRunId,
+        outcome: AssetReviewOutcome,
+    ) -> Self {
+        Self {
+            content_path,
+            review_run_id,
+            outcome,
+        }
+    }
 }
 
 /// The boundary that stopped a workflow before it had a complete durable result.
