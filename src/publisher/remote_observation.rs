@@ -186,12 +186,14 @@ pub trait RemoteObservationStore {
 pub struct GitRemoteObserver;
 
 impl GitRemoteObserver {
-    pub fn observe(
-        id: RemoteObservationId,
-        publish_run: &PublishRun,
-        observed_at: SystemTime,
-    ) -> Result<RemoteRefObservation, GitRemoteObservationError> {
-        let repository = publish_run.repository().path();
+    /// Observes a target directly for preparation, before a `PublishRun` exists.
+    /// This deliberately does not create an audit record: durable observations are
+    /// scoped to a durable publish run by `PublicationWorkflow`.
+    pub fn observe_target(
+        repository: impl AsRef<std::path::Path>,
+        target: &PublicationTarget,
+    ) -> Result<RemoteRefState, GitRemoteObservationError> {
+        let repository = repository.as_ref();
         match fs::metadata(repository) {
             Ok(metadata) if metadata.is_dir() => {}
             _ => return Err(GitRemoteObservationError::RepositoryUnavailable),
@@ -206,7 +208,6 @@ impl GitRemoteObserver {
             return Err(GitRemoteObservationError::RepositoryUnavailable);
         }
 
-        let target = publish_run.target();
         let remote_check = Command::new("git")
             .current_dir(repository)
             .args(["remote", "get-url", "--", target.remote_name()])
@@ -240,7 +241,15 @@ impl GitRemoteObserver {
             return Err(error);
         }
 
-        let observed = parse_ls_remote(&output.stdout, target.destination_ref())?;
+        parse_ls_remote(&output.stdout, target.destination_ref())
+    }
+
+    pub fn observe(
+        id: RemoteObservationId,
+        publish_run: &PublishRun,
+        observed_at: SystemTime,
+    ) -> Result<RemoteRefObservation, GitRemoteObservationError> {
+        let observed = Self::observe_target(publish_run.repository().path(), publish_run.target())?;
         RemoteRefObservation::new(id, publish_run, observed, observed_at)
             .map_err(GitRemoteObservationError::Observation)
     }

@@ -1,6 +1,7 @@
 mod git_commit_object;
 mod git_current_target;
 mod git_projection_materializer;
+mod git_publication;
 mod git_push_executor;
 mod publication_workflow;
 mod publish_reconciliation;
@@ -14,6 +15,12 @@ pub use git_commit_object::{
 pub use git_current_target::{GitCurrentTarget, GitCurrentTargetAdapter, GitCurrentTargetError};
 pub use git_projection_materializer::{
     GitProjectionMaterializationError, GitProjectionMaterializer, ReviewedGitTree,
+};
+pub use git_publication::{
+    GitPublicationApplication, GitPublicationApplicationError, GitPublicationApplicationResult,
+    PublishRunIdGenerator, SequentialPublishRunIdGenerator, SequentialPublishRunIdGeneratorError,
+    UuidPublishRunIdGenerator, UuidPublishRunIdGeneratorError, UuidRemoteObservationIdGenerator,
+    UuidRemoteObservationIdGeneratorError,
 };
 pub use git_push_executor::{
     GitCompareAndPushExecutor, GitPushCommandOutcome, GitPushExecutionError, GitPushExecutionResult,
