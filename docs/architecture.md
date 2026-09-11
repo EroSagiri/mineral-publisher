@@ -954,6 +954,18 @@ AI Vision Review 可以检查：
 * 私人照片
 * 其他隐私信息
 
+`AssetCheckResult` 之后由 Asset Policy 执行纯确定性分类，不重新运行 Asset Program
+Check，也不重新读取 Source。`MissingBlob`、`CorruptBlob`、`SizeMismatch`、
+`SnapshotFileMissing`、误入的 Markdown 和 `DecodeFailed` 等完整性问题直接
+`Blocked`；`UnknownType`、`UnsupportedType`、扩展名与实际内容不一致，以及 metadata
+无法可靠检查时进入 `NeedsHumanReview`，不得默认批准，也不得送入 AI。
+
+只有具有不可变内容身份和大小、且类型为可解码图片或明确 PDF 的资产才能构造
+`AssetReviewCandidate`。EXIF、GPS、XMP finding 不属于结构损坏，会完整保留在 candidate
+及最终 outcome 中。`AssetReviewer` 只能接收该 candidate，并只返回 `Approve`、`Reject`
+或 `NeedsHumanReview`；Reviewer 错误必须转换为 `NeedsHumanReview`。共享资源按资产路径只
+审核一次，同时保留所有依赖它的 Markdown。此边界不执行清理、Projection 或发布。
+
 ---
 
 # 21. Asset Sanitization

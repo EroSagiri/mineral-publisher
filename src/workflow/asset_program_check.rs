@@ -52,6 +52,11 @@ pub struct ImageDimensions {
 }
 
 impl ImageDimensions {
+    #[cfg(test)]
+    pub(crate) fn new(width: u32, height: u32) -> Self {
+        Self { width, height }
+    }
+
     pub fn width(self) -> u32 {
         self.width
     }
@@ -103,6 +108,27 @@ pub struct CheckedAsset {
 }
 
 impl CheckedAsset {
+    #[cfg(test)]
+    pub(crate) fn new(
+        path: ContentPath,
+        dependents: Vec<ContentPath>,
+        sha256: Option<Sha256>,
+        actual_type: ActualAssetType,
+        size: Option<u64>,
+        image_dimensions: Option<ImageDimensions>,
+        findings: Vec<AssetCheckFinding>,
+    ) -> Self {
+        Self {
+            path,
+            dependents,
+            sha256,
+            actual_type,
+            size,
+            image_dimensions,
+            findings,
+        }
+    }
+
     pub fn path(&self) -> &ContentPath {
         &self.path
     }
@@ -144,6 +170,14 @@ pub struct AssetCheckResult {
 }
 
 impl AssetCheckResult {
+    #[cfg(test)]
+    pub(crate) fn from_assets_for_test(snapshot_id: SnapshotId, assets: Vec<CheckedAsset>) -> Self {
+        Self {
+            snapshot_id,
+            assets,
+        }
+    }
+
     pub fn snapshot_id(&self) -> SnapshotId {
         self.snapshot_id
     }

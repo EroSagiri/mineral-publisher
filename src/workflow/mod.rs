@@ -1,7 +1,13 @@
+mod asset_policy;
 mod asset_program_check;
 mod candidate_asset;
 mod public_policy_run;
 
+pub use asset_policy::{
+    AssetHumanReviewReason, AssetPolicy, AssetPolicyDecision, AssetPolicyOutcome,
+    AssetPolicyResult, AssetReviewCandidate, AssetReviewDecision, AssetReviewDisposition,
+    AssetReviewOutcome, AssetReviewResult, AssetReviewer, AssetReviewerError, MockAssetReviewer,
+};
 pub use asset_program_check::{
     ActualAssetType, AssetCheckFinding, AssetCheckResult, AssetProgramCheck,
     AssetProgramCheckError, CheckedAsset, ImageDimensions,
