@@ -658,7 +658,7 @@ mod tests {
                     path(document),
                     Sha256::digest(document.as_bytes()),
                     PolicyIdentity::new("public", "1", Sha256::digest(b"policy")).unwrap(),
-                    PublicPolicyDecision::ReviewApproved,
+                    (PublicPolicyDecision::ReviewApproved, None),
                     0,
                 )
             })

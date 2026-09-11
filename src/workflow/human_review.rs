@@ -488,7 +488,7 @@ mod tests {
             path(&format!("document-{id}.md")),
             Sha256::digest(format!("document-{id}").as_bytes()),
             PolicyIdentity::new("public", "v1", Sha256::new([1; 32])).unwrap(),
-            decision,
+            (decision, None),
             1_000 + id,
         )
     }

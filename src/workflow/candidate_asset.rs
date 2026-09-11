@@ -232,7 +232,7 @@ mod tests {
             path(document_path),
             Sha256::digest(document_path.as_bytes()),
             PolicyIdentity::new("public", "1", Sha256::digest(b"policy")).unwrap(),
-            decision,
+            (decision, None),
             0,
         )
     }

@@ -99,12 +99,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         PublicPolicyDecision::ReviewApproved => {
             println!("policy_decision: Approved");
             println!("reviewer_result: Approve");
-            print_reviewer_diagnostic(&reviewer);
+            print_reviewer_report(review.reviewer_report());
         }
         PublicPolicyDecision::ReviewRejected => {
             println!("policy_decision: Rejected");
             println!("reviewer_result: Reject");
-            print_reviewer_diagnostic(&reviewer);
+            print_reviewer_report(review.reviewer_report());
         }
         PublicPolicyDecision::ProgramIssues(_) => {
             println!("policy_decision: NeedsHumanReview");
@@ -115,7 +115,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             match reason {
                 HumanReviewReason::ReviewerRequested => {
                     println!("reviewer_result: NeedsHumanReview");
-                    print_reviewer_diagnostic(&reviewer);
+                    print_reviewer_report(review.reviewer_report());
                 }
                 HumanReviewReason::ReviewerFailed(error) => {
                     println!("reviewer_result: Error");
@@ -136,24 +136,16 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn print_reviewer_diagnostic(reviewer: &DeepSeekMarkdownReviewer) {
-    let Some(diagnostic) = reviewer.last_diagnostic() else {
+fn print_reviewer_report(report: Option<&mineral_publisher::policy::ReviewerReport>) {
+    let Some(report) = report else {
         return;
     };
-    if !diagnostic.reason_codes().is_empty() {
-        println!(
-            "reason_codes: {}",
-            diagnostic
-                .reason_codes()
-                .iter()
-                .map(String::as_str)
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
+    println!("reason_codes:");
+    for reason in report.reason_codes() {
+        let value = serde_json::to_value(reason).expect("reason code is serializable");
+        println!("  - {}", value.as_str().expect("reason code is a string"));
     }
-    if let Some(summary) = diagnostic.summary() {
-        println!("summary: {summary}");
-    }
+    println!("summary: {}", report.summary());
 }
 
 fn parse_input_path() -> Result<PathBuf, Box<dyn Error>> {

@@ -2,7 +2,7 @@ use std::{error::Error, fmt, time::SystemTime};
 
 use crate::domain::{ContentPath, Sha256, Snapshot, SnapshotId};
 
-use super::{PublicPolicyDecision, PublicPolicyOutcome};
+use super::{PublicPolicyDecision, PublicPolicyOutcome, ReviewerReport};
 
 /// Stable identity of one immutable review attempt.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -71,6 +71,7 @@ pub struct ReviewRun {
     content_sha256: Sha256,
     policy: PolicyIdentity,
     decision: PublicPolicyDecision,
+    reviewer_report: Option<ReviewerReport>,
     created_at_unix_ms: u64,
 }
 
@@ -109,6 +110,7 @@ impl ReviewRun {
             content_sha256: outcome.content_sha256(),
             policy,
             decision: outcome.decision().clone(),
+            reviewer_report: outcome.reviewer_report().cloned(),
             created_at_unix_ms,
         })
     }
@@ -137,6 +139,10 @@ impl ReviewRun {
         &self.decision
     }
 
+    pub fn reviewer_report(&self) -> Option<&ReviewerReport> {
+        self.reviewer_report.as_ref()
+    }
+
     /// Program issues stop before semantic review; every other current outcome
     /// was produced after calling the Reviewer.
     pub fn reviewer_was_called(&self) -> bool {
@@ -157,9 +163,10 @@ impl ReviewRun {
         content_path: ContentPath,
         content_sha256: Sha256,
         policy: PolicyIdentity,
-        decision: PublicPolicyDecision,
+        review: (PublicPolicyDecision, Option<ReviewerReport>),
         created_at_unix_ms: u64,
     ) -> Self {
+        let (decision, reviewer_report) = review;
         Self {
             id,
             snapshot_id,
@@ -167,6 +174,7 @@ impl ReviewRun {
             content_sha256,
             policy,
             decision,
+            reviewer_report,
             created_at_unix_ms,
         }
     }

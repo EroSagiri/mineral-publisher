@@ -1,1 +1,3 @@
 /target
+.env
+examples/fixtures/deepseek_markdown_reviewer_smoke

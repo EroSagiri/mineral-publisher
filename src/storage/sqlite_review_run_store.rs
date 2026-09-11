@@ -4,7 +4,10 @@ use rusqlite::{Connection, OptionalExtension, params, types::Type};
 
 use crate::{
     domain::{ContentPath, Sha256, SnapshotId},
-    policy::{PolicyIdentity, PublicPolicyDecision, ReviewRun, ReviewRunId, ReviewRunStore},
+    policy::{
+        HumanReviewReason, PolicyIdentity, PublicPolicyDecision, ReviewDecision, ReviewRun,
+        ReviewRunId, ReviewRunStore, ReviewerReport,
+    },
 };
 
 const SCHEMA_VERSION: i64 = 1;
@@ -44,6 +47,7 @@ impl SqliteReviewRunStore {
                              )
                          ),
                          decision_json TEXT NOT NULL,
+                         reviewer_report_json TEXT,
                          reviewer_called INTEGER NOT NULL CHECK (reviewer_called IN (0, 1)),
                          created_at_unix_ms INTEGER NOT NULL CHECK (created_at_unix_ms >= 0),
                          CHECK (
@@ -92,15 +96,20 @@ impl ReviewRunStore for SqliteReviewRunStore {
     fn save(&self, run: &ReviewRun) -> Result<(), Self::Error> {
         let decision_json = serde_json::to_string(run.decision())
             .map_err(SqliteReviewRunStoreError::Serialization)?;
+        let reviewer_report_json = run
+            .reviewer_report()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(SqliteReviewRunStoreError::Serialization)?;
         let inserted = self
             .connection
             .execute(
                 "INSERT OR IGNORE INTO review_runs (
                      id, snapshot_id, content_path, content_sha256,
                      policy_name, policy_version, policy_hash,
-                     decision_kind, decision_json, reviewer_called,
+                     decision_kind, decision_json, reviewer_report_json, reviewer_called,
                      created_at_unix_ms
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 params![
                     to_sqlite_integer("review run id", run.id().get())?,
                     to_sqlite_integer("snapshot id", run.snapshot_id().get())?,
@@ -111,6 +120,7 @@ impl ReviewRunStore for SqliteReviewRunStore {
                     run.policy().hash().as_bytes().as_slice(),
                     decision_kind(run.decision()),
                     decision_json,
+                    reviewer_report_json,
                     run.reviewer_was_called(),
                     to_sqlite_integer("review timestamp", run.created_at_unix_ms())?,
                 ],
@@ -134,7 +144,7 @@ impl ReviewRunStore for SqliteReviewRunStore {
             .query_row(
                 "SELECT id, snapshot_id, content_path, content_sha256,
                         policy_name, policy_version, policy_hash,
-                        decision_kind, decision_json, reviewer_called,
+                        decision_kind, decision_json, reviewer_report_json, reviewer_called,
                         created_at_unix_ms
                  FROM review_runs
                  WHERE id = ?1",
@@ -149,7 +159,7 @@ impl ReviewRunStore for SqliteReviewRunStore {
         self.load_many(
             "SELECT id, snapshot_id, content_path, content_sha256,
                     policy_name, policy_version, policy_hash,
-                    decision_kind, decision_json, reviewer_called,
+                    decision_kind, decision_json, reviewer_report_json, reviewer_called,
                     created_at_unix_ms
              FROM review_runs
              WHERE snapshot_id = ?1
@@ -162,7 +172,7 @@ impl ReviewRunStore for SqliteReviewRunStore {
         self.load_many(
             "SELECT id, snapshot_id, content_path, content_sha256,
                     policy_name, policy_version, policy_hash,
-                    decision_kind, decision_json, reviewer_called,
+                    decision_kind, decision_json, reviewer_report_json, reviewer_called,
                     created_at_unix_ms
              FROM review_runs
              WHERE decision_kind = 'needs_human_review'
@@ -198,16 +208,40 @@ fn row_to_review_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReviewRun> {
             "decision kind does not match decision payload",
         ));
     }
-    let reviewer_called: bool = row.get(9)?;
+    let reviewer_report_json: Option<String> = row.get(9)?;
+    let reviewer_report = reviewer_report_json
+        .map(|json| {
+            serde_json::from_str::<ReviewerReport>(&json).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(9, Type::Text, Box::new(error))
+            })
+        })
+        .transpose()?;
+    if let Some(report) = &reviewer_report {
+        let expected = review_decision(&decision).ok_or_else(|| {
+            conversion_error(
+                9,
+                Type::Text,
+                "reviewer report exists for an outcome not produced by a report",
+            )
+        })?;
+        if report.decision() != expected {
+            return Err(conversion_error(
+                9,
+                Type::Text,
+                "reviewer report decision does not match policy decision",
+            ));
+        }
+    }
+    let reviewer_called: bool = row.get(10)?;
     let derived_reviewer_called = !matches!(decision, PublicPolicyDecision::ProgramIssues(_));
     if reviewer_called != derived_reviewer_called {
         return Err(conversion_error(
-            9,
+            10,
             Type::Integer,
             "reviewer-called flag does not match decision",
         ));
     }
-    let created_at_unix_ms = nonnegative_u64(row.get(10)?, 10, "review timestamp")?;
+    let created_at_unix_ms = nonnegative_u64(row.get(11)?, 11, "review timestamp")?;
 
     Ok(ReviewRun::rehydrate(
         id,
@@ -215,9 +249,21 @@ fn row_to_review_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReviewRun> {
         content_path,
         content_sha256,
         policy,
-        decision,
+        (decision, reviewer_report),
         created_at_unix_ms,
     ))
+}
+
+fn review_decision(decision: &PublicPolicyDecision) -> Option<ReviewDecision> {
+    match decision {
+        PublicPolicyDecision::ReviewApproved => Some(ReviewDecision::Approve),
+        PublicPolicyDecision::ReviewRejected => Some(ReviewDecision::Reject),
+        PublicPolicyDecision::NeedsHumanReview(HumanReviewReason::ReviewerRequested) => {
+            Some(ReviewDecision::NeedsHumanReview)
+        }
+        PublicPolicyDecision::NeedsHumanReview(HumanReviewReason::ReviewerFailed(_))
+        | PublicPolicyDecision::ProgramIssues(_) => None,
+    }
 }
 
 fn decision_kind(decision: &PublicPolicyDecision) -> &'static str {
@@ -354,7 +400,8 @@ mod tests {
         domain::{Sha256, Snapshot, SnapshotFile, SourceId},
         policy::{
             HumanReviewReason, MarkdownFrontmatterParser, PolicyIdentity, PrivacyFilter,
-            PublicPolicy, ReviewCandidate, ReviewDecision, ReviewRunError, Reviewer, ReviewerError,
+            PublicPolicy, ReviewCandidate, ReviewDecision, ReviewReasonCode, ReviewRunError,
+            Reviewer, ReviewerError, ReviewerReport,
         },
     };
 
@@ -396,10 +443,23 @@ mod tests {
     }
 
     impl Reviewer for FixedReviewer {
-        fn review(&self, _candidate: &ReviewCandidate) -> Result<ReviewDecision, ReviewerError> {
+        fn review(&self, _candidate: &ReviewCandidate) -> Result<ReviewerReport, ReviewerError> {
             self.calls.set(self.calls.get() + 1);
-            self.response.clone()
+            match self.response.clone() {
+                Ok(decision) => Ok(test_report(decision)),
+                Err(error) => Err(error),
+            }
         }
+    }
+
+    fn test_report(decision: ReviewDecision) -> ReviewerReport {
+        let reasons = match decision {
+            ReviewDecision::Approve => vec![ReviewReasonCode::PublicTechnicalContent],
+            ReviewDecision::Reject | ReviewDecision::NeedsHumanReview => {
+                vec![ReviewReasonCode::OtherPrivacyRisk]
+            }
+        };
+        ReviewerReport::new(decision, reasons, "test summary").unwrap()
     }
 
     fn path(value: &str) -> ContentPath {
@@ -500,7 +560,16 @@ mod tests {
             .unwrap();
         let reopened = SqliteReviewRunStore::open(&database).unwrap();
 
-        assert_eq!(reopened.get(expected.id()).unwrap(), Some(expected));
+        let restored = reopened.get(expected.id()).unwrap().unwrap();
+        assert_eq!(restored, expected);
+        assert_eq!(
+            restored.reviewer_report().unwrap().reason_codes(),
+            [ReviewReasonCode::PublicTechnicalContent]
+        );
+        assert_eq!(
+            restored.reviewer_report().unwrap().summary(),
+            "test summary"
+        );
     }
 
     #[test]

@@ -417,7 +417,7 @@ mod tests {
             path(path_value),
             Sha256::new([id as u8; 32]),
             policy(),
-            decision,
+            (decision, None),
             id,
         )
     }

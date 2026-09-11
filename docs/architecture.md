@@ -753,11 +753,15 @@ Reviewer
 领域层只认统一结果：
 
 ```text
-ReviewVerdict
-├── Pass
-├── NeedsReview
-└── Block
+ReviewerReport
+├── decision: Approve | Reject | NeedsHumanReview
+├── reason_codes[]
+└── summary
 ```
+
+`reason_codes` 与经过安全约束的短 `summary` 仅用于审计、校准和人工审核上下文。发布策略的
+权限仍然只由既有 `decision` 决定；解释元数据不能改变或提升 AI 的发布权限，也不得复制 Secret、
+敏感原值或大段 Source 内容。
 
 AI 没有最终发布权限。
 

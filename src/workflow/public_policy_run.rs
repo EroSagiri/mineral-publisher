@@ -330,7 +330,8 @@ mod tests {
         content::Resolution,
         domain::{Sha256, SnapshotFile, SourceId},
         policy::{
-            HumanReviewReason, PrivateReason, ReviewCandidate, ReviewDecision, ReviewerError,
+            HumanReviewReason, PrivateReason, ReviewCandidate, ReviewDecision, ReviewReasonCode,
+            ReviewerError, ReviewerReport,
         },
         source::LocalSource,
         storage::SqliteReviewRunStore,
@@ -405,14 +406,29 @@ mod tests {
     }
 
     impl Reviewer for RecordingReviewer {
-        fn review(&self, candidate: &ReviewCandidate) -> Result<ReviewDecision, ReviewerError> {
+        fn review(&self, candidate: &ReviewCandidate) -> Result<ReviewerReport, ReviewerError> {
             let path = candidate.path().as_str().to_owned();
             self.calls.borrow_mut().push(path.clone());
-            self.responses
+            match self
+                .responses
                 .get(&path)
                 .cloned()
                 .expect("configured reviewer response")
+            {
+                Ok(decision) => Ok(test_report(decision)),
+                Err(error) => Err(error),
+            }
         }
+    }
+
+    fn test_report(decision: ReviewDecision) -> ReviewerReport {
+        let reasons = match decision {
+            ReviewDecision::Approve => vec![ReviewReasonCode::PublicTechnicalContent],
+            ReviewDecision::Reject | ReviewDecision::NeedsHumanReview => {
+                vec![ReviewReasonCode::OtherPrivacyRisk]
+            }
+        };
+        ReviewerReport::new(decision, reasons, "test summary").unwrap()
     }
 
     #[derive(Clone, Debug, Eq, PartialEq)]

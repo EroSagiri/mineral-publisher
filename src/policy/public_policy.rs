@@ -1,5 +1,6 @@
 use std::{error::Error, fmt};
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -28,13 +29,200 @@ impl ReviewCandidate {
 }
 
 /// Provider-independent semantic review result.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReviewDecision {
     Approve,
     Reject,
     NeedsHumanReview,
 }
+
+/// Stable, provider-independent reasons that explain a semantic review decision.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewReasonCode {
+    CredentialSecret,
+    PrivateContactInformation,
+    PrivateIdentityInformation,
+    PrivateCorrespondence,
+    ThirdPartyPrivateInformation,
+    InternalWorkInformation,
+    ConfidentialWorkMaterial,
+    UnpublishedProductOrTechnicalPlan,
+    CustomerOrPartnerInformation,
+    SecuritySensitiveInformation,
+    UncertainDisclosureAuthorization,
+    OrdinaryPersonalContent,
+    OrdinaryWorkExperience,
+    PublicTechnicalContent,
+    OtherPrivacyRisk,
+}
+
+impl ReviewReasonCode {
+    pub fn is_risk(self) -> bool {
+        !matches!(
+            self,
+            Self::OrdinaryPersonalContent
+                | Self::OrdinaryWorkExperience
+                | Self::PublicTechnicalContent
+        )
+    }
+}
+
+pub const MAX_REVIEW_SUMMARY_CHARS: usize = 200;
+
+/// Structured semantic-review result. Explanatory fields are audit context only.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewerReport {
+    decision: ReviewDecision,
+    reason_codes: Vec<ReviewReasonCode>,
+    summary: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UncheckedReviewerReport {
+    decision: ReviewDecision,
+    reason_codes: Vec<ReviewReasonCode>,
+    summary: String,
+}
+
+impl<'de> Deserialize<'de> for ReviewerReport {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let report = UncheckedReviewerReport::deserialize(deserializer)?;
+        Self::new(report.decision, report.reason_codes, report.summary)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+impl ReviewerReport {
+    pub fn new(
+        decision: ReviewDecision,
+        reason_codes: Vec<ReviewReasonCode>,
+        summary: impl Into<String>,
+    ) -> Result<Self, ReviewerReportError> {
+        let report = Self {
+            decision,
+            reason_codes,
+            summary: summary.into(),
+        };
+        report.validate()?;
+        Ok(report)
+    }
+
+    pub fn decision(&self) -> ReviewDecision {
+        self.decision
+    }
+
+    pub fn reason_codes(&self) -> &[ReviewReasonCode] {
+        &self.reason_codes
+    }
+
+    pub fn summary(&self) -> &str {
+        &self.summary
+    }
+
+    pub fn validate(&self) -> Result<(), ReviewerReportError> {
+        if self.reason_codes.len() > 8 {
+            return Err(ReviewerReportError::TooManyReasonCodes);
+        }
+        for (index, reason) in self.reason_codes.iter().enumerate() {
+            if self.reason_codes[..index].contains(reason) {
+                return Err(ReviewerReportError::DuplicateReasonCode);
+            }
+        }
+
+        let has_risk_reason = self.reason_codes.iter().any(|reason| reason.is_risk());
+        match self.decision {
+            ReviewDecision::Approve if has_risk_reason => {
+                return Err(ReviewerReportError::ApproveWithRiskReason);
+            }
+            ReviewDecision::Reject | ReviewDecision::NeedsHumanReview if !has_risk_reason => {
+                return Err(ReviewerReportError::RiskDecisionWithoutRiskReason);
+            }
+            _ => {}
+        }
+
+        let summary = self.summary.trim();
+        if summary.is_empty() {
+            return Err(ReviewerReportError::EmptySummary);
+        }
+        if summary.chars().count() > MAX_REVIEW_SUMMARY_CHARS {
+            return Err(ReviewerReportError::SummaryTooLong);
+        }
+        if summary.contains(['\r', '\n']) {
+            return Err(ReviewerReportError::SummaryNotBrief);
+        }
+        let sentence_endings = summary
+            .chars()
+            .filter(|character| matches!(character, '.' | '!' | '?' | '。' | '！' | '？'))
+            .count();
+        if sentence_endings > 2 {
+            return Err(ReviewerReportError::SummaryNotBrief);
+        }
+        if contains_sensitive_summary_value(summary) {
+            return Err(ReviewerReportError::SummaryNotSafe);
+        }
+        Ok(())
+    }
+}
+
+fn contains_sensitive_summary_value(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    if ["sk-", "ghp_", "akia", "bearer "]
+        .iter()
+        .any(|marker| lower.contains(marker))
+    {
+        return true;
+    }
+
+    let runs = value.split(|character: char| !character.is_ascii_alphanumeric());
+    for run in runs {
+        let digit_count = run.bytes().filter(u8::is_ascii_digit).count();
+        if (run.len() >= 20 && digit_count > 0)
+            || (run.len() == 11 && digit_count == 11)
+            || (run.len() == 18 && digit_count >= 17)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReviewerReportError {
+    TooManyReasonCodes,
+    DuplicateReasonCode,
+    ApproveWithRiskReason,
+    RiskDecisionWithoutRiskReason,
+    EmptySummary,
+    SummaryTooLong,
+    SummaryNotBrief,
+    SummaryNotSafe,
+}
+
+impl fmt::Display for ReviewerReportError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::TooManyReasonCodes => "reviewer report contains too many reason codes",
+            Self::DuplicateReasonCode => "reviewer report contains a duplicate reason code",
+            Self::ApproveWithRiskReason => "approve report contains a risk reason",
+            Self::RiskDecisionWithoutRiskReason => {
+                "reject or human-review report requires a risk reason"
+            }
+            Self::EmptySummary => "reviewer report summary cannot be empty",
+            Self::SummaryTooLong => "reviewer report summary is too long",
+            Self::SummaryNotBrief => "reviewer report summary must be one or two short sentences",
+            Self::SummaryNotSafe => "reviewer report summary may contain sensitive raw values",
+        })
+    }
+}
+
+impl Error for ReviewerReportError {}
 
 /// A failure while executing a reviewer.
 ///
@@ -194,7 +382,7 @@ pub enum ReviewerErrorKind {
 ///
 /// Implementations return a decision and have no publishing authority.
 pub trait Reviewer {
-    fn review(&self, candidate: &ReviewCandidate) -> Result<ReviewDecision, ReviewerError>;
+    fn review(&self, candidate: &ReviewCandidate) -> Result<ReviewerReport, ReviewerError>;
 }
 
 /// Why public policy requires a human decision.
@@ -221,6 +409,7 @@ pub struct PublicPolicyOutcome {
     path: ContentPath,
     content_sha256: Sha256,
     decision: PublicPolicyDecision,
+    reviewer_report: Option<ReviewerReport>,
 }
 
 impl PublicPolicyOutcome {
@@ -234,6 +423,10 @@ impl PublicPolicyOutcome {
 
     pub fn content_sha256(&self) -> Sha256 {
         self.content_sha256
+    }
+
+    pub fn reviewer_report(&self) -> Option<&ReviewerReport> {
+        self.reviewer_report.as_ref()
     }
 }
 
@@ -256,31 +449,45 @@ impl PublicPolicy {
             .map(|document| {
                 let path = document.path().clone();
                 let content_sha256 = document.analysis().file().sha256();
-                let decision = match ProgramCheck::check(std::slice::from_ref(&document)) {
-                    ProgramCheckResult::Issues(issues) => {
-                        PublicPolicyDecision::ProgramIssues(issues)
-                    }
-                    ProgramCheckResult::Pass => {
-                        let candidate = ReviewCandidate(document);
-                        match reviewer.review(&candidate) {
-                            Ok(ReviewDecision::Approve) => PublicPolicyDecision::ReviewApproved,
-                            Ok(ReviewDecision::Reject) => PublicPolicyDecision::ReviewRejected,
-                            Ok(ReviewDecision::NeedsHumanReview) => {
-                                PublicPolicyDecision::NeedsHumanReview(
-                                    HumanReviewReason::ReviewerRequested,
-                                )
-                            }
-                            Err(error) => PublicPolicyDecision::NeedsHumanReview(
-                                HumanReviewReason::ReviewerFailed(error),
-                            ),
+                let (decision, reviewer_report) =
+                    match ProgramCheck::check(std::slice::from_ref(&document)) {
+                        ProgramCheckResult::Issues(issues) => {
+                            (PublicPolicyDecision::ProgramIssues(issues), None)
                         }
-                    }
-                };
+                        ProgramCheckResult::Pass => {
+                            let candidate = ReviewCandidate(document);
+                            match reviewer.review(&candidate) {
+                                Ok(report) => {
+                                    let decision = match report.decision() {
+                                        ReviewDecision::Approve => {
+                                            PublicPolicyDecision::ReviewApproved
+                                        }
+                                        ReviewDecision::Reject => {
+                                            PublicPolicyDecision::ReviewRejected
+                                        }
+                                        ReviewDecision::NeedsHumanReview => {
+                                            PublicPolicyDecision::NeedsHumanReview(
+                                                HumanReviewReason::ReviewerRequested,
+                                            )
+                                        }
+                                    };
+                                    (decision, Some(report))
+                                }
+                                Err(error) => (
+                                    PublicPolicyDecision::NeedsHumanReview(
+                                        HumanReviewReason::ReviewerFailed(error),
+                                    ),
+                                    None,
+                                ),
+                            }
+                        }
+                    };
 
                 PublicPolicyOutcome {
                     path,
                     content_sha256,
                     decision,
+                    reviewer_report,
                 }
             })
             .collect()
@@ -330,13 +537,28 @@ mod tests {
     }
 
     impl Reviewer for MockReviewer {
-        fn review(&self, candidate: &ReviewCandidate) -> Result<ReviewDecision, ReviewerError> {
+        fn review(&self, candidate: &ReviewCandidate) -> Result<ReviewerReport, ReviewerError> {
             self.calls.set(self.calls.get() + 1);
-            self.responses
+            match self
+                .responses
                 .get(candidate.path().as_str())
                 .cloned()
                 .expect("test response for candidate")
+            {
+                Ok(decision) => Ok(test_report(decision)),
+                Err(error) => Err(error),
+            }
         }
+    }
+
+    fn test_report(decision: ReviewDecision) -> ReviewerReport {
+        let reasons = match decision {
+            ReviewDecision::Approve => vec![ReviewReasonCode::PublicTechnicalContent],
+            ReviewDecision::Reject | ReviewDecision::NeedsHumanReview => {
+                vec![ReviewReasonCode::OtherPrivacyRisk]
+            }
+        };
+        ReviewerReport::new(decision, reasons, "test summary").unwrap()
     }
 
     fn path(value: &str) -> ContentPath {
@@ -394,7 +616,70 @@ mod tests {
         let (outcome, calls) = evaluate_one(Ok(ReviewDecision::Approve));
 
         assert_eq!(outcome.decision(), &PublicPolicyDecision::ReviewApproved);
+        assert_eq!(
+            outcome.reviewer_report().unwrap().decision(),
+            ReviewDecision::Approve
+        );
         assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn reviewer_report_json_is_strict_and_semantically_validated() {
+        for valid in [
+            r#"{"decision":"approve","reason_codes":["public_technical_content"],"summary":"公开技术内容。"}"#,
+            r#"{"decision":"reject","reason_codes":["credential_secret"],"summary":"文档包含疑似真实访问凭据。"}"#,
+            r#"{"decision":"needs_human_review","reason_codes":["uncertain_disclosure_authorization"],"summary":"公开授权无法确认。"}"#,
+        ] {
+            assert!(serde_json::from_str::<ReviewerReport>(valid).is_ok());
+        }
+
+        let too_long = "a".repeat(MAX_REVIEW_SUMMARY_CHARS + 1);
+        let invalid = [
+            r#"{"decision":"probably_safe","reason_codes":[],"summary":"unknown decision"}"#.to_owned(),
+            r#"{"decision":"approve","reason_codes":["unknown_reason"],"summary":"unknown reason"}"#.to_owned(),
+            r#"{"decision":"approve","reason_codes":[],"summary":"safe","extra":true}"#.to_owned(),
+            r#"{"decision":"approve","summary":"missing field"}"#.to_owned(),
+            format!(r#"{{"decision":"approve","reason_codes":[],"summary":"{too_long}"}}"#),
+            r#"{"decision":"reject","reason_codes":[],"summary":"missing risk reason"}"#.to_owned(),
+            r#"{"decision":"approve","reason_codes":["credential_secret"],"summary":"contradiction"}"#.to_owned(),
+            r#"{"decision":"needs_human_review","reason_codes":["ordinary_work_experience"],"summary":"no risk reason"}"#.to_owned(),
+            r#"{"decision":"approve","reason_codes":[],"summary":"detected sk-prod-abc123"}"#.to_owned(),
+            r#"{"decision":"approve","reason_codes":[],"summary":"联系电话 13800138000"}"#.to_owned(),
+        ];
+        for json in invalid {
+            assert!(
+                serde_json::from_str::<ReviewerReport>(&json).is_err(),
+                "{json}"
+            );
+        }
+    }
+
+    #[test]
+    fn reviewer_report_schema_exposes_the_strict_core_contract() {
+        let schema = serde_json::to_value(schemars::schema_for!(ReviewerReport)).unwrap();
+        let root = schema.as_object().unwrap();
+        assert_eq!(
+            root.get("additionalProperties"),
+            Some(&serde_json::json!(false))
+        );
+        assert_eq!(
+            root.get("required"),
+            Some(&serde_json::json!(["decision", "reason_codes", "summary"]))
+        );
+        let definitions = root
+            .get("$defs")
+            .and_then(|value| value.as_object())
+            .unwrap();
+        assert_eq!(
+            definitions["ReviewDecision"]["enum"],
+            serde_json::json!(["approve", "reject", "needs_human_review"])
+        );
+        assert!(
+            definitions["ReviewReasonCode"]["enum"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("credential_secret"))
+        );
     }
 
     #[test]
