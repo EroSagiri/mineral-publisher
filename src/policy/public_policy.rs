@@ -44,6 +44,12 @@ pub enum ReviewDecision {
 pub struct ReviewerError {
     kind: ReviewerErrorKind,
     message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    http_status: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider_error_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider_error_message: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -54,6 +60,12 @@ enum ReviewerErrorRepresentation {
         #[serde(default)]
         kind: ReviewerErrorKind,
         message: String,
+        #[serde(default)]
+        http_status: Option<u16>,
+        #[serde(default)]
+        provider_error_code: Option<String>,
+        #[serde(default)]
+        provider_error_message: Option<String>,
     },
 }
 
@@ -65,9 +77,19 @@ impl<'de> Deserialize<'de> for ReviewerError {
         Ok(
             match ReviewerErrorRepresentation::deserialize(deserializer)? {
                 ReviewerErrorRepresentation::Legacy(message) => Self::new(message),
-                ReviewerErrorRepresentation::Structured { kind, message } => {
-                    Self::with_kind(kind, message)
-                }
+                ReviewerErrorRepresentation::Structured {
+                    kind,
+                    message,
+                    http_status,
+                    provider_error_code,
+                    provider_error_message,
+                } => Self {
+                    kind,
+                    message,
+                    http_status,
+                    provider_error_code,
+                    provider_error_message,
+                },
             },
         )
     }
@@ -82,6 +104,41 @@ impl ReviewerError {
         Self {
             kind,
             message: message.into(),
+            http_status: None,
+            provider_error_code: None,
+            provider_error_message: None,
+        }
+    }
+
+    /// Records a status-only provider failure without retaining the response body.
+    pub fn with_http_status(
+        kind: ReviewerErrorKind,
+        status: u16,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+            http_status: Some(status),
+            provider_error_code: None,
+            provider_error_message: None,
+        }
+    }
+
+    /// The provider fields must already be bounded and redacted by the adapter.
+    pub fn with_provider_error(
+        kind: ReviewerErrorKind,
+        status: u16,
+        message: impl Into<String>,
+        provider_error_code: Option<String>,
+        provider_error_message: Option<String>,
+    ) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+            http_status: Some(status),
+            provider_error_code,
+            provider_error_message,
         }
     }
 
@@ -91,6 +148,18 @@ impl ReviewerError {
 
     pub fn message(&self) -> &str {
         &self.message
+    }
+
+    pub fn http_status(&self) -> Option<u16> {
+        self.http_status
+    }
+
+    pub fn provider_error_code(&self) -> Option<&str> {
+        self.provider_error_code.as_deref()
+    }
+
+    pub fn provider_error_message(&self) -> Option<&str> {
+        self.provider_error_message.as_deref()
     }
 }
 
@@ -370,6 +439,24 @@ mod tests {
         assert_eq!(round_trip, typed);
         assert_eq!(legacy.kind(), ReviewerErrorKind::Other);
         assert_eq!(legacy.message(), "provider unavailable");
+    }
+
+    #[test]
+    fn reviewer_error_round_trips_safe_http_status_details() {
+        let error = ReviewerError::with_provider_error(
+            ReviewerErrorKind::HttpStatus,
+            400,
+            "provider returned an HTTP status",
+            Some("invalid_model".to_owned()),
+            Some("The requested model is unavailable.".to_owned()),
+        );
+
+        let round_trip: ReviewerError =
+            serde_json::from_str(&serde_json::to_string(&error).unwrap()).unwrap();
+
+        assert_eq!(round_trip, error);
+        assert_eq!(round_trip.http_status(), Some(400));
+        assert_eq!(round_trip.provider_error_code(), Some("invalid_model"));
     }
 
     #[test]
