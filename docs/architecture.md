@@ -1607,7 +1607,7 @@ Obsidian / R2
 
 所有关键事件必须可追溯。
 
-Review outcome 必须持久关联到具体 Snapshot、Markdown ContentPath 和该 SnapshotFile 的内容身份；同一路径在不同 Snapshot 中属于不同审核对象。
+Review outcome 必须持久关联到具体 Snapshot、Markdown ContentPath 和该 SnapshotFile 的内容身份；同一路径在不同 Snapshot 中属于不同审核对象。Asset review outcome 同样必须持久关联到具体 Snapshot、Asset ContentPath 和该 SnapshotFile 的内容身份。
 
 例如：
 

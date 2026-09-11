@@ -2,6 +2,7 @@ use std::{error::Error, fmt, io::Cursor};
 
 use exif::Context as ExifContext;
 use image::{GenericImageView, ImageDecoder, ImageReader};
+use serde::{Deserialize, Serialize};
 
 use crate::{
     domain::{ContentPath, Sha256, Snapshot, SnapshotFile, SnapshotId},
@@ -11,7 +12,7 @@ use crate::{
 use super::CandidateAssetSet;
 
 /// Deterministic facts inferred from the immutable asset bytes.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum ActualAssetType {
     Image {
         media_type: String,
@@ -45,7 +46,7 @@ impl ActualAssetType {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ImageDimensions {
     width: u32,
     height: u32,
@@ -67,7 +68,7 @@ impl ImageDimensions {
 }
 
 /// A deterministic problem or sanitization signal found for one asset.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum AssetCheckFinding {
     SnapshotFileMissing,
     SnapshotFileIsMarkdown,

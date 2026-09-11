@@ -1,5 +1,7 @@
 use std::{cell::RefCell, collections::BTreeMap, error::Error, fmt};
 
+use serde::{Deserialize, Serialize};
+
 use crate::domain::{ContentPath, Sha256, SnapshotId};
 
 use super::{ActualAssetType, AssetCheckFinding, AssetCheckResult, CheckedAsset, ImageDimensions};
@@ -250,14 +252,15 @@ fn finding_effect(finding: &AssetCheckFinding) -> FindingEffect {
 }
 
 /// Provider-independent semantic review decision.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum AssetReviewDecision {
     Approve,
     Reject,
     NeedsHumanReview,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
 pub struct AssetReviewerError {
     message: String,
 }
@@ -290,20 +293,20 @@ pub trait AssetReviewer {
     ) -> Result<AssetReviewDecision, AssetReviewerError>;
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum AssetHumanReviewReason {
     PolicyFindings,
     ReviewerFailed(AssetReviewerError),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum AssetReviewDisposition {
     Blocked,
     Reviewed(AssetReviewDecision),
     NeedsHumanReview(AssetHumanReviewReason),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AssetReviewOutcome {
     path: ContentPath,
     dependents: Vec<ContentPath>,
@@ -346,6 +349,26 @@ impl AssetReviewOutcome {
 
     pub fn disposition(&self) -> &AssetReviewDisposition {
         &self.disposition
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_parts_for_test(
+        path: ContentPath,
+        dependents: Vec<ContentPath>,
+        sha256: Option<Sha256>,
+        findings: Vec<AssetCheckFinding>,
+        disposition: AssetReviewDisposition,
+    ) -> Self {
+        Self {
+            path,
+            dependents,
+            sha256,
+            actual_type: ActualAssetType::Unknown,
+            size: None,
+            image_dimensions: None,
+            findings,
+            disposition,
+        }
     }
 }
 
