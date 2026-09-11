@@ -9,6 +9,7 @@ mod final_dependency_closure;
 mod human_review;
 mod public_policy_run;
 mod public_projection;
+mod publication_application;
 mod publish_plan;
 
 pub use asset_policy::{
@@ -55,6 +56,11 @@ pub use public_policy_run::{
 pub use public_projection::{
     ManagedRoot, ProjectionEntry, ProjectionEntryKind, ProjectionTargetPath,
     ProjectionTargetPathError, PublicProjection, PublicProjectionError, PublicationFileMode,
+};
+pub use publication_application::{
+    CompletedPublication, ExplicitHumanReviewSelection, PublicationApplication,
+    PublicationApplicationError, PublicationApplicationOutcome, PublicationApplicationRequest,
+    PublicationTrace,
 };
 pub use publish_plan::{
     CurrentTargetEntry, CurrentTargetState, CurrentTargetStateError, PublishOperation, PublishPlan,

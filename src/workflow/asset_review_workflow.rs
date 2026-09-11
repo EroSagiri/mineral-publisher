@@ -7,7 +7,7 @@ use crate::{
 };
 
 use super::{
-    AssetPolicy, AssetProgramCheck, AssetProgramCheckError, AssetReviewDecision,
+    AssetCheckResult, AssetPolicy, AssetProgramCheck, AssetProgramCheckError, AssetReviewDecision,
     AssetReviewDisposition, AssetReviewOutcome, AssetReviewRun, AssetReviewRunError,
     AssetReviewRunId, AssetReviewRunStore, AssetReviewer, CandidateAssetSet,
 };
@@ -86,13 +86,15 @@ impl AssetReviewWorkflowEntry {
 pub struct AssetReviewWorkflowResult {
     snapshot_id: SnapshotId,
     entries: Vec<AssetReviewWorkflowEntry>,
+    checks: AssetCheckResult,
 }
 
 impl AssetReviewWorkflowResult {
-    fn empty(snapshot_id: SnapshotId) -> Self {
+    pub fn empty(snapshot_id: SnapshotId) -> Self {
         Self {
             snapshot_id,
             entries: Vec::new(),
+            checks: AssetCheckResult::empty(snapshot_id),
         }
     }
 
@@ -103,6 +105,10 @@ impl AssetReviewWorkflowResult {
     /// Durably saved outcomes in deterministic `ContentPath` order.
     pub fn entries(&self) -> &[AssetReviewWorkflowEntry] {
         &self.entries
+    }
+
+    pub fn checks(&self) -> &AssetCheckResult {
+        &self.checks
     }
 
     /// A convenience view only; it is not a final asset set or publication decision.
@@ -128,6 +134,7 @@ impl AssetReviewWorkflowResult {
         Self {
             snapshot_id,
             entries,
+            checks: AssetCheckResult::empty(snapshot_id),
         }
     }
 }
@@ -305,6 +312,7 @@ impl AssetReviewWorkflow {
                 partial_result: result.clone(),
                 failure: Box::new(AssetReviewWorkflowFailure::ProgramCheck(source)),
             })?;
+        result.checks = checked.clone();
         let policy_result = AssetPolicy::evaluate(&checked);
 
         for policy_outcome in policy_result.outcomes() {

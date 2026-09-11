@@ -9,7 +9,7 @@ use crate::{
     domain::{ContentPath, SnapshotId},
 };
 
-use super::PublicPolicyRunResult;
+use super::{EffectiveReviewSet, PublicPolicyRunResult};
 
 /// One local asset eligible for the later asset-review stage.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -113,6 +113,55 @@ impl CandidateAssetSet {
         Ok(Self {
             snapshot_id: policy_result.snapshot_id(),
             assets,
+        })
+    }
+
+    /// Selects assets from the explicitly effective Markdown decisions.  This
+    /// is the handoff used after human decisions have been resolved.
+    pub fn select_effective(
+        reviews: &EffectiveReviewSet,
+        graph: &AssetDependencyGraph,
+    ) -> Result<Self, CandidateAssetSelectionError> {
+        if reviews.snapshot_id() != graph.snapshot_id() {
+            return Err(CandidateAssetSelectionError::SnapshotMismatch {
+                policy_snapshot_id: reviews.snapshot_id(),
+                graph_snapshot_id: graph.snapshot_id(),
+            });
+        }
+        let approved = reviews
+            .approved_markdown_paths()
+            .into_iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let unresolved = graph
+            .problems()
+            .iter()
+            .filter(|problem| approved.contains(problem.document_path()))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !unresolved.is_empty() {
+            return Err(
+                CandidateAssetSelectionError::ApprovedDocumentsHaveDependencyProblems(unresolved),
+            );
+        }
+        let mut closure: BTreeMap<ContentPath, BTreeSet<ContentPath>> = BTreeMap::new();
+        for dependency in graph.dependencies() {
+            if approved.contains(dependency.document_path()) {
+                closure
+                    .entry(dependency.asset_path().clone())
+                    .or_default()
+                    .insert(dependency.document_path().clone());
+            }
+        }
+        Ok(Self {
+            snapshot_id: reviews.snapshot_id(),
+            assets: closure
+                .into_iter()
+                .map(|(path, dependents)| CandidateAsset {
+                    path,
+                    dependents: dependents.into_iter().collect(),
+                })
+                .collect(),
         })
     }
 

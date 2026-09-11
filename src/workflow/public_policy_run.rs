@@ -1,7 +1,7 @@
 use std::{error::Error, fmt, time::SystemTime};
 
 use crate::{
-    content::{SnapshotMarkdownAnalysisError, SnapshotMarkdownAnalyzer},
+    content::{AssetDependencyGraph, SnapshotMarkdownAnalysisError, SnapshotMarkdownAnalyzer},
     domain::{ContentPath, Snapshot, SnapshotId},
     policy::{
         InvalidPrivacyDocument, PolicyIdentity, PrivacyFilter, PrivateDocument, PublicPolicy,
@@ -63,6 +63,7 @@ pub struct PublicPolicyRunResult {
     private_documents: Vec<PrivateDocument>,
     invalid_privacy_documents: Vec<InvalidPrivacyDocument>,
     document_outcomes: Vec<ReviewRun>,
+    dependency_graph: Option<Box<AssetDependencyGraph>>,
 }
 
 impl PublicPolicyRunResult {
@@ -72,6 +73,7 @@ impl PublicPolicyRunResult {
             private_documents: Vec::new(),
             invalid_privacy_documents: Vec::new(),
             document_outcomes: Vec::new(),
+            dependency_graph: None,
         }
     }
 
@@ -90,6 +92,12 @@ impl PublicPolicyRunResult {
     /// Review Runs which were durably saved, ordered by `ContentPath`.
     pub fn document_outcomes(&self) -> &[ReviewRun] {
         &self.document_outcomes
+    }
+
+    /// Dependency analysis produced from the same immutable Snapshot as this
+    /// policy result. It is absent only on an unsuccessful partial result.
+    pub fn dependency_graph(&self) -> Option<&AssetDependencyGraph> {
+        self.dependency_graph.as_deref()
     }
 
     /// The Markdown set eligible to contribute edges to candidate asset selection.
@@ -111,6 +119,7 @@ impl PublicPolicyRunResult {
             private_documents: Vec::new(),
             invalid_privacy_documents: Vec::new(),
             document_outcomes,
+            dependency_graph: None,
         }
     }
 
@@ -126,6 +135,7 @@ impl PublicPolicyRunResult {
             private_documents,
             invalid_privacy_documents,
             document_outcomes,
+            dependency_graph: None,
         }
     }
 }
@@ -268,6 +278,10 @@ impl PublicPolicyRun {
             });
         }
 
+        result.dependency_graph = Some(Box::new(AssetDependencyGraph::build(
+            snapshot.id(),
+            &analyses,
+        )));
         let (candidates, private_documents, invalid_privacy_documents) =
             PrivacyFilter::filter(analyses).into_parts();
         result.private_documents = private_documents;

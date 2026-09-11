@@ -171,6 +171,12 @@ pub struct AssetCheckResult {
 }
 
 impl AssetCheckResult {
+    pub fn empty(snapshot_id: SnapshotId) -> Self {
+        Self {
+            snapshot_id,
+            assets: Vec::new(),
+        }
+    }
     #[cfg(test)]
     pub(crate) fn from_assets_for_test(snapshot_id: SnapshotId, assets: Vec<CheckedAsset>) -> Self {
         Self {
