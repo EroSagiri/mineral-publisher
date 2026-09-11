@@ -15,6 +15,6 @@ pub use privacy_filter::{
 pub use program_check::{ProgramCheck, ProgramCheckIssue, ProgramCheckResult};
 pub use public_policy::{
     HumanReviewReason, PublicPolicy, PublicPolicyDecision, PublicPolicyOutcome, ReviewCandidate,
-    ReviewDecision, Reviewer, ReviewerError,
+    ReviewDecision, Reviewer, ReviewerError, ReviewerErrorKind,
 };
 pub use review_run::{PolicyIdentity, ReviewRun, ReviewRunError, ReviewRunId, ReviewRunStore};

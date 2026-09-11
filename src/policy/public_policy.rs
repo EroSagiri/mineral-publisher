@@ -40,17 +40,53 @@ pub enum ReviewDecision {
 ///
 /// Reviewer failures are distinct from review decisions so callers cannot
 /// accidentally treat an unavailable or malformed response as approval.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(transparent)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ReviewerError {
+    kind: ReviewerErrorKind,
     message: String,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ReviewerErrorRepresentation {
+    Legacy(String),
+    Structured {
+        #[serde(default)]
+        kind: ReviewerErrorKind,
+        message: String,
+    },
+}
+
+impl<'de> Deserialize<'de> for ReviewerError {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(
+            match ReviewerErrorRepresentation::deserialize(deserializer)? {
+                ReviewerErrorRepresentation::Legacy(message) => Self::new(message),
+                ReviewerErrorRepresentation::Structured { kind, message } => {
+                    Self::with_kind(kind, message)
+                }
+            },
+        )
+    }
 }
 
 impl ReviewerError {
     pub fn new(message: impl Into<String>) -> Self {
+        Self::with_kind(ReviewerErrorKind::Other, message)
+    }
+
+    pub fn with_kind(kind: ReviewerErrorKind, message: impl Into<String>) -> Self {
         Self {
+            kind,
             message: message.into(),
         }
+    }
+
+    pub fn kind(&self) -> ReviewerErrorKind {
+        self.kind
     }
 
     pub fn message(&self) -> &str {
@@ -65,6 +101,25 @@ impl fmt::Display for ReviewerError {
 }
 
 impl Error for ReviewerError {}
+
+/// Stable failure categories used by reviewer adapters and fail-closed audit records.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewerErrorKind {
+    ContentStore,
+    InvalidUtf8,
+    InputTooLarge,
+    Transport,
+    Timeout,
+    Authentication,
+    HttpStatus,
+    ResponseTooLarge,
+    EmptyResponse,
+    MalformedResponse,
+    TruncatedResponse,
+    #[default]
+    Other,
+}
 
 /// Reviews only documents that crossed the privacy and program-check boundaries.
 ///
@@ -303,6 +358,18 @@ mod tests {
         );
         assert_ne!(outcome.decision(), &PublicPolicyDecision::ReviewApproved);
         assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn reviewer_error_keeps_typed_categories_and_reads_legacy_string_records() {
+        let typed = ReviewerError::with_kind(ReviewerErrorKind::Timeout, "provider timed out");
+        let round_trip: ReviewerError =
+            serde_json::from_str(&serde_json::to_string(&typed).unwrap()).unwrap();
+        let legacy: ReviewerError = serde_json::from_str(r#""provider unavailable""#).unwrap();
+
+        assert_eq!(round_trip, typed);
+        assert_eq!(legacy.kind(), ReviewerErrorKind::Other);
+        assert_eq!(legacy.message(), "provider unavailable");
     }
 
     #[test]
