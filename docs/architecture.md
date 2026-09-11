@@ -1257,6 +1257,10 @@ D attachments/old.jpg
 
 PublishPlan 不应该直接负责执行 Git 命令。
 
+Git 目标的当前状态必须从调用者明确选择的不可变 commit/tree 派生，而不能隐式读取可变的
+working tree 或 index。Git object identifier 只标识 Git 对象，不能替代 Mineral Publisher
+基于 blob 原始 bytes 计算的内容 SHA-256 identity。
+
 ---
 
 # 28. Publisher
