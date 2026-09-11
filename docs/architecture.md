@@ -1484,6 +1484,11 @@ base commit、commit（若非 Noop）、Snapshot、Projection 与明确 target r
 不构成一个事务；进程中断后必须能够从该 intent 恢复，并由后续 reconciliation 判断远端是否
 实际接受了该 commit。PublishRun 本身不表示 remote publication success。
 
+远端发布状态必须来自显式、不可变且绑定对应 PublishRun 与 publication target 的 remote
+observation，而不能通过修改 PublishRun 表达。只有目标 ref 被观察到精确指向本次 publication
+commit 时，才视为 already published；若远端已偏离 PublishRun 绑定的 base，则必须报告冲突并从
+新 base 重新生成发布流程，不能 force overwrite。
+
 ---
 
 # 33. Git 并发和冲突
