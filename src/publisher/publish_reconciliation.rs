@@ -1,18 +1,48 @@
 use std::{error::Error, fmt};
 
 use super::{
-    GitCommitOid, PublishRun, PublishRunPublication, RemoteRefObservation, RemoteRefState,
+    GitCommitOid, PublicationTarget, PublishRun, PublishRunId, PublishRunPublication,
+    RemoteRefObservation, RemoteRefState,
 };
+
+/// A capability produced only by reconciliation for one exact publication intent.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReadyToPush {
+    publish_run_id: PublishRunId,
+    target: PublicationTarget,
+    source_observation_id: super::RemoteObservationId,
+    expected_remote_oid: GitCommitOid,
+    desired_commit_oid: GitCommitOid,
+}
+
+impl ReadyToPush {
+    pub fn publish_run_id(&self) -> PublishRunId {
+        self.publish_run_id
+    }
+
+    pub fn target(&self) -> &PublicationTarget {
+        &self.target
+    }
+
+    pub fn source_observation_id(&self) -> super::RemoteObservationId {
+        self.source_observation_id
+    }
+
+    pub fn expected_remote_oid(&self) -> &GitCommitOid {
+        &self.expected_remote_oid
+    }
+
+    pub fn desired_commit_oid(&self) -> &GitCommitOid {
+        &self.desired_commit_oid
+    }
+}
 
 /// A deterministic decision derived from an immutable intent and one remote fact.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PublishReconciliation {
     NoopSatisfied,
     AlreadyPublished,
-    ReadyToPush {
-        expected_remote_oid: GitCommitOid,
-        desired_commit_oid: GitCommitOid,
-    },
+    ReadyToPush(ReadyToPush),
     RemoteChanged {
         expected_base_oid: GitCommitOid,
         observed_oid: GitCommitOid,
@@ -48,10 +78,13 @@ impl PublishReconciliation {
                 if remote == &desired {
                     Ok(Self::AlreadyPublished)
                 } else if remote == &base {
-                    Ok(Self::ReadyToPush {
+                    Ok(Self::ReadyToPush(ReadyToPush {
+                        publish_run_id: publish_run.id(),
+                        target: publish_run.target().clone(),
+                        source_observation_id: observation.id(),
                         expected_remote_oid: base,
                         desired_commit_oid: desired,
-                    })
+                    }))
                 } else {
                     Ok(Self::RemoteChanged {
                         expected_base_oid: base,
@@ -154,10 +187,13 @@ mod tests {
         );
         assert_eq!(
             PublishReconciliation::derive(&run, &observation(&run, present('a'))).unwrap(),
-            PublishReconciliation::ReadyToPush {
+            PublishReconciliation::ReadyToPush(ReadyToPush {
+                publish_run_id: run.id(),
+                target: run.target().clone(),
+                source_observation_id: RemoteObservationId::new(1).unwrap(),
                 expected_remote_oid: GitCommitOid::new("a".repeat(40)).unwrap(),
                 desired_commit_oid: GitCommitOid::new("c".repeat(40)).unwrap(),
-            }
+            })
         );
         assert_eq!(
             PublishReconciliation::derive(&run, &observation(&run, present('d'))).unwrap(),

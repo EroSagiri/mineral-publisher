@@ -289,7 +289,7 @@ fn looks_like_authentication_or_network_failure(stderr: &[u8]) -> bool {
     .any(|pattern| stderr.contains(pattern))
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GitRemoteObservationError {
     RepositoryUnavailable,
     GitUnavailable,

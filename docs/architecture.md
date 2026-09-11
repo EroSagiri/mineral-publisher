@@ -1389,7 +1389,12 @@ create commit from exact reviewed tree
 git push
 ```
 
-发布服务永远不能：
+发布服务永远不能执行无条件覆盖远端历史的 push。远端 ref 更新必须绑定先前观察到的精确旧
+commit identity，并在更新瞬间执行 compare-and-swap；只有远端 ref 仍精确等于该旧 commit
+时才允许更新。具体 Git 实现可以使用带明确 destination ref 与 expected old OID 的 lease，
+但不得依赖本地 tracking ref 或省略 expected OID。
+
+发布服务不得使用无条件形式，例如：
 
 ```text
 git push --force
@@ -1998,7 +2003,7 @@ Quartz / Cloudflare Pages 集成
 
 18. Reviewed Git Tree SHA 必须等于最终 Commit Tree SHA。
 
-19. Publisher 永远不能 force push 发布分支。
+19. Publisher 永远不能无条件 force overwrite 发布分支；更新必须使用精确 expected-old-OID 的 compare-and-swap。
 
 20. 所有发布结果必须可以追溯回 Snapshot、Policy 和 Review。
 
