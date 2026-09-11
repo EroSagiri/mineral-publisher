@@ -1383,7 +1383,7 @@ review / validate tree
 verify tree unchanged
     │
     ▼
-git commit
+create commit from exact reviewed tree
     │
     ▼
 git push
@@ -1421,22 +1421,12 @@ git write-tree
 reviewed_tree_sha
 ```
 
-真正 commit 前再次：
-
-```bash
-git write-tree
-```
-
-得到：
+一旦得到经过完整验证的精确 Git tree object，commit 创建必须直接引用这个不可变 tree identity，
+不得通过 working tree、用户 index 或再次 `write-tree` 重新生成待提交内容。创建 commit object 后，
+必须从 commit 本身重新读取 tree identity，并满足：
 
 ```text
-current_tree_sha
-```
-
-必须：
-
-```text
-reviewed_tree_sha == current_tree_sha
+reviewed_tree_sha == committed_tree_sha
 ```
 
 否则：
@@ -1488,6 +1478,11 @@ policy_version
 review_id
 publish_target
 ```
+
+在任何远端 Git 副作用之前，必须持久化一次不可变 PublishRun：它绑定精确的 reviewed tree、
+base commit、commit（若非 Noop）、Snapshot、Projection 与明确 target ref。SQLite 与远端 Git
+不构成一个事务；进程中断后必须能够从该 intent 恢复，并由后续 reconciliation 判断远端是否
+实际接受了该 commit。PublishRun 本身不表示 remote publication success。
 
 ---
 
