@@ -1,0 +1,6 @@
+acceptable_decisions: [approve]
+expected_reason_codes: [ordinary_personal_content]
+forbidden_reason_codes:
+  - credential_secret
+  - private_contact_information
+  - internal_work_information

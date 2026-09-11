@@ -21,7 +21,7 @@ use mineral_publisher::{
 };
 
 const API_BASE_URL: &str = "https://api.deepseek.com";
-const MODEL: &str = "deepseek-v4-flash";
+const MODEL: &str = "deepseek-flash";
 const TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_INPUT_BYTES: usize = 256 * 1024;
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
@@ -76,6 +76,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("provider: DeepSeek");
     println!("base_url: {API_BASE_URL}");
     println!("model: {MODEL}");
+    println!("thinking: enabled (high)");
     println!("timeout: {}s", TIMEOUT.as_secs());
     println!("max_input_bytes: {MAX_INPUT_BYTES}");
     if !result.private_documents().is_empty() {

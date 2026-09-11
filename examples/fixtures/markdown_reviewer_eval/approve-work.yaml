@@ -1,0 +1,5 @@
+acceptable_decisions: [approve]
+expected_reason_codes: [ordinary_work_experience]
+forbidden_reason_codes:
+  - confidential_work_material
+  - uncertain_disclosure_authorization

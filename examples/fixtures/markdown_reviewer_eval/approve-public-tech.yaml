@@ -1,0 +1,5 @@
+acceptable_decisions: [approve]
+expected_reason_codes: [public_technical_content]
+forbidden_reason_codes:
+  - credential_secret
+  - internal_work_information

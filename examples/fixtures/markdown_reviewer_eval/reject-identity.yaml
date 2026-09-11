@@ -1,0 +1,3 @@
+acceptable_decisions: [reject]
+expected_reason_codes: [private_identity_information]
+forbidden_reason_codes: [ordinary_personal_content]

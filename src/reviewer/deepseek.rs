@@ -601,7 +601,7 @@ summary 只提供一到两句简短判定依据，不输出详细推理过程，
 
 const MAX_PROVIDER_ERROR_BYTES: usize = 8 * 1024;
 const MAX_PROVIDER_ERROR_MESSAGE_CHARS: usize = 512;
-const MAX_OUTPUT_TOKENS: u16 = 256;
+const MAX_OUTPUT_TOKENS: u16 = 4_096;
 
 fn output_contract_instruction() -> String {
     let schema = schemars::schema_for!(ReviewerReport);
@@ -942,8 +942,9 @@ impl DeepSeekMarkdownReviewer {
             stream: false,
             tool_choice: "none",
             thinking: Thinking {
-                thinking_type: "disabled",
+                thinking_type: "enabled",
             },
+            reasoning_effort: "high",
         };
 
         let response = self
@@ -1162,6 +1163,7 @@ struct ChatCompletionRequest<'a> {
     stream: bool,
     tool_choice: &'static str,
     thinking: Thinking,
+    reasoning_effort: &'static str,
 }
 
 #[derive(Serialize)]
@@ -1484,7 +1486,7 @@ mod tests {
     ) -> DeepSeekMarkdownReviewer {
         let config = DeepSeekMarkdownReviewerConfig::new(
             &server.base_url,
-            "deepseek-v4-flash",
+            "deepseek-flash",
             DeepSeekApiKey::new("super-secret-key").unwrap(),
             timeout,
             max_input_bytes,
@@ -1775,6 +1777,9 @@ mod tests {
         assert_eq!(document, json!({"document": markdown}));
         assert_eq!(request["response_format"], json!({"type": "json_object"}));
         assert_eq!(request["tool_choice"], "none");
+        assert_eq!(request["thinking"], json!({"type": "enabled"}));
+        assert_eq!(request["reasoning_effort"], "high");
+        assert_eq!(request["max_tokens"], 4096);
     }
 
     #[test]
@@ -1785,7 +1790,7 @@ mod tests {
         let server = FakeServer::start(completion(r#"{"decision":"approve"}"#));
         let config = DeepSeekMarkdownReviewerConfig::new(
             &server.base_url,
-            "deepseek-v4-flash",
+            "deepseek-flash",
             DeepSeekApiKey::new("test-key").unwrap(),
             Duration::from_secs(1),
             1024,
@@ -1901,7 +1906,7 @@ mod tests {
         let server = FakeServer::start(FakeResponse::raw(401, b"unauthorized"));
         let config = DeepSeekMarkdownReviewerConfig::new(
             &server.base_url,
-            "deepseek-v4-flash",
+            "deepseek-flash",
             DeepSeekApiKey::new("super-secret-key").unwrap(),
             Duration::from_secs(1),
             1024,

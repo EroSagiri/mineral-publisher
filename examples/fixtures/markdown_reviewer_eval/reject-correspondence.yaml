@@ -1,0 +1,5 @@
+acceptable_decisions: [reject]
+expected_reason_codes:
+  - private_correspondence
+  - third_party_private_information
+forbidden_reason_codes: [ordinary_work_experience]

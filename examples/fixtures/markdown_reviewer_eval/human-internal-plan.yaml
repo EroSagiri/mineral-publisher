@@ -1,0 +1,5 @@
+acceptable_decisions: [needs_human_review, reject]
+expected_reason_codes:
+  - unpublished_product_or_technical_plan
+  - uncertain_disclosure_authorization
+forbidden_reason_codes: [credential_secret]

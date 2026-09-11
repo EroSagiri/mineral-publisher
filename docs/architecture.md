@@ -763,6 +763,8 @@ ReviewerReport
 权限仍然只由既有 `decision` 决定；解释元数据不能改变或提升 AI 的发布权限，也不得复制 Secret、
 敏感原值或大段 Source 内容。
 
+Reviewer 行为应使用具有人工作为基准标注的代表性发布案例进行校准。
+
 AI 没有最终发布权限。
 
 AI 只能：
