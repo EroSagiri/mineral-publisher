@@ -1,14 +1,57 @@
 use std::{error::Error, fmt, time::SystemTime};
 
+use super::bounded::bounded_map;
 use crate::{
     content::{AssetDependencyGraph, SnapshotMarkdownAnalysisError, SnapshotMarkdownAnalyzer},
     domain::{ContentPath, Snapshot, SnapshotId},
     policy::{
-        InvalidPrivacyDocument, PolicyIdentity, PrivacyFilter, PrivateDocument, PublicPolicy,
-        PublicPolicyDecision, ReviewRun, ReviewRunError, ReviewRunId, ReviewRunStore, Reviewer,
+        InvalidPrivacyDocument, PolicyIdentity, PrivacyFilter, PrivateDocument, ProgramCheck,
+        ProgramCheckIssue, PublicPolicy, PublicPolicyDecision, ReviewRun, ReviewRunError,
+        ReviewRunId, ReviewRunStore, Reviewer,
     },
     storage::LocalContentStore,
 };
+
+trait MarkdownReviewEvaluator<R: Reviewer + ?Sized> {
+    fn is_bounded(&self) -> bool;
+    fn evaluate(
+        &self,
+        candidates: Vec<crate::policy::PublicCandidateMarkdown>,
+        reviewer: &R,
+    ) -> Vec<crate::policy::PublicPolicyOutcome>;
+}
+
+struct SequentialMarkdownReviews;
+impl<R: Reviewer + ?Sized> MarkdownReviewEvaluator<R> for SequentialMarkdownReviews {
+    fn is_bounded(&self) -> bool {
+        false
+    }
+    fn evaluate(
+        &self,
+        candidates: Vec<crate::policy::PublicCandidateMarkdown>,
+        reviewer: &R,
+    ) -> Vec<crate::policy::PublicPolicyOutcome> {
+        PublicPolicy::evaluate(candidates, reviewer)
+    }
+}
+
+struct BoundedMarkdownReviews(usize);
+impl<R: Reviewer + Sync + ?Sized> MarkdownReviewEvaluator<R> for BoundedMarkdownReviews {
+    fn is_bounded(&self) -> bool {
+        true
+    }
+    fn evaluate(
+        &self,
+        candidates: Vec<crate::policy::PublicCandidateMarkdown>,
+        reviewer: &R,
+    ) -> Vec<crate::policy::PublicPolicyOutcome> {
+        bounded_map(candidates, self.0, &|candidate| {
+            PublicPolicy::evaluate(vec![candidate], reviewer)
+                .pop()
+                .expect("one candidate produces one policy outcome")
+        })
+    }
+}
 
 /// Allocates the identity of an audit attempt at the orchestration boundary.
 pub trait ReviewRunIdGenerator {
@@ -62,6 +105,7 @@ pub struct PublicPolicyRunResult {
     snapshot_id: SnapshotId,
     private_documents: Vec<PrivateDocument>,
     invalid_privacy_documents: Vec<InvalidPrivacyDocument>,
+    warnings: Vec<ProgramCheckIssue>,
     document_outcomes: Vec<ReviewRun>,
     dependency_graph: Option<Box<AssetDependencyGraph>>,
 }
@@ -72,6 +116,7 @@ impl PublicPolicyRunResult {
             snapshot_id,
             private_documents: Vec::new(),
             invalid_privacy_documents: Vec::new(),
+            warnings: Vec::new(),
             document_outcomes: Vec::new(),
             dependency_graph: None,
         }
@@ -87,6 +132,10 @@ impl PublicPolicyRunResult {
 
     pub fn invalid_privacy_documents(&self) -> &[InvalidPrivacyDocument] {
         &self.invalid_privacy_documents
+    }
+
+    pub fn warnings(&self) -> &[ProgramCheckIssue] {
+        &self.warnings
     }
 
     /// Review Runs which were durably saved, ordered by `ContentPath`.
@@ -118,6 +167,7 @@ impl PublicPolicyRunResult {
             snapshot_id,
             private_documents: Vec::new(),
             invalid_privacy_documents: Vec::new(),
+            warnings: Vec::new(),
             document_outcomes,
             dependency_graph: None,
         }
@@ -134,6 +184,7 @@ impl PublicPolicyRunResult {
             snapshot_id,
             private_documents,
             invalid_privacy_documents,
+            warnings: Vec::new(),
             document_outcomes,
             dependency_graph: None,
         }
@@ -144,6 +195,7 @@ impl PublicPolicyRunResult {
 #[derive(Debug)]
 pub enum PublicPolicyRunFailure<StoreError, IdError> {
     MarkdownAnalysis(Vec<SnapshotMarkdownAnalysisError>),
+    ReviewCacheLookup(StoreError),
     ReviewRunId {
         path: ContentPath,
         source: IdError,
@@ -186,6 +238,12 @@ impl<StoreError: fmt::Display, IdError: fmt::Display> fmt::Display
                 "public policy run failed to analyze {} Markdown document(s)",
                 failures.len()
             ),
+            PublicPolicyRunFailure::ReviewCacheLookup(source) => {
+                write!(
+                    formatter,
+                    "could not look up reusable ReviewResults: {source}"
+                )
+            }
             PublicPolicyRunFailure::ReviewRunId { path, source } => {
                 write!(
                     formatter,
@@ -240,6 +298,32 @@ impl PublicPolicyRun {
         )
     }
 
+    pub fn execute_bounded<R, S, I>(
+        snapshot: &Snapshot,
+        content_store: &LocalContentStore,
+        reviewer: &R,
+        review_run_store: &S,
+        policy: &PolicyIdentity,
+        id_generator: &mut I,
+        concurrency: usize,
+    ) -> Result<PublicPolicyRunResult, PublicPolicyRunError<S::Error, I::Error>>
+    where
+        R: Reviewer + Sync + ?Sized,
+        S: ReviewRunStore + ?Sized,
+        I: ReviewRunIdGenerator + ?Sized,
+    {
+        Self::execute_with_clock_and_evaluator(
+            snapshot,
+            content_store,
+            reviewer,
+            review_run_store,
+            policy,
+            id_generator,
+            SystemTime::now,
+            BoundedMarkdownReviews(concurrency),
+        )
+    }
+
     fn execute_with_clock<R, S, I, C>(
         snapshot: &Snapshot,
         content_store: &LocalContentStore,
@@ -247,13 +331,43 @@ impl PublicPolicyRun {
         review_run_store: &S,
         policy: &PolicyIdentity,
         id_generator: &mut I,
-        mut clock: C,
+        clock: C,
     ) -> Result<PublicPolicyRunResult, PublicPolicyRunError<S::Error, I::Error>>
     where
         R: Reviewer + ?Sized,
         S: ReviewRunStore + ?Sized,
         I: ReviewRunIdGenerator + ?Sized,
         C: FnMut() -> SystemTime,
+    {
+        Self::execute_with_clock_and_evaluator(
+            snapshot,
+            content_store,
+            reviewer,
+            review_run_store,
+            policy,
+            id_generator,
+            clock,
+            SequentialMarkdownReviews,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_with_clock_and_evaluator<R, S, I, C, E>(
+        snapshot: &Snapshot,
+        content_store: &LocalContentStore,
+        reviewer: &R,
+        review_run_store: &S,
+        policy: &PolicyIdentity,
+        id_generator: &mut I,
+        mut clock: C,
+        evaluator: E,
+    ) -> Result<PublicPolicyRunResult, PublicPolicyRunError<S::Error, I::Error>>
+    where
+        R: Reviewer + ?Sized,
+        S: ReviewRunStore + ?Sized,
+        I: ReviewRunIdGenerator + ?Sized,
+        C: FnMut() -> SystemTime,
+        E: MarkdownReviewEvaluator<R>,
     {
         let mut result = PublicPolicyRunResult::empty(snapshot.id());
         let analyzer = SnapshotMarkdownAnalyzer::new(content_store.clone());
@@ -287,11 +401,107 @@ impl PublicPolicyRun {
         result.private_documents = private_documents;
         result.invalid_privacy_documents = invalid_privacy_documents;
 
+        let reusable = review_run_store
+            .list_by_snapshot(snapshot.id())
+            .map_err(|source| PublicPolicyRunError {
+                partial_result: result.clone(),
+                failure: Box::new(PublicPolicyRunFailure::ReviewCacheLookup(source)),
+            })?;
+
+        if !evaluator.is_bounded() {
+            for candidate in candidates {
+                let check = ProgramCheck::check(std::slice::from_ref(&candidate));
+                result.warnings.extend_from_slice(check.warnings());
+                if check.is_pass()
+                    && let Some(previous) = reusable.iter().find(|run| {
+                        run.content_path() == candidate.path()
+                            && run.content_sha256() == candidate.analysis().file().sha256()
+                            && run.policy() == policy
+                            && run.reviewer_report().is_some()
+                    })
+                {
+                    result.document_outcomes.push(previous.clone());
+                    continue;
+                }
+                let outcome = PublicPolicy::evaluate(vec![candidate], reviewer)
+                    .pop()
+                    .expect("one public candidate always produces one policy outcome");
+                let path = outcome.path().clone();
+                let id = id_generator
+                    .next_id()
+                    .map_err(|source| PublicPolicyRunError {
+                        partial_result: result.clone(),
+                        failure: Box::new(PublicPolicyRunFailure::ReviewRunId {
+                            path: path.clone(),
+                            source,
+                        }),
+                    })?;
+                let review_run =
+                    ReviewRun::from_policy_outcome(id, snapshot, &outcome, policy.clone(), clock())
+                        .map_err(|source| PublicPolicyRunError {
+                            partial_result: result.clone(),
+                            failure: Box::new(PublicPolicyRunFailure::ReviewRun {
+                                path: path.clone(),
+                                source,
+                            }),
+                        })?;
+                review_run_store
+                    .save(&review_run)
+                    .map_err(|source| PublicPolicyRunError {
+                        partial_result: result.clone(),
+                        failure: Box::new(PublicPolicyRunFailure::Persistence {
+                            path,
+                            review_run_id: id,
+                            source,
+                        }),
+                    })?;
+                result.document_outcomes.push(review_run);
+            }
+            return Ok(result);
+        }
+
+        let mut reused = std::collections::BTreeMap::new();
+        let mut pending = Vec::new();
         for candidate in candidates {
-            let mut outcomes = PublicPolicy::evaluate(vec![candidate], reviewer);
-            let outcome = outcomes
-                .pop()
-                .expect("one public candidate always produces one policy outcome");
+            // Deterministic checks always run for the current Snapshot. Only a
+            // successfully validated semantic result is reusable.
+            let check = ProgramCheck::check(std::slice::from_ref(&candidate));
+            result.warnings.extend_from_slice(check.warnings());
+            let checks_pass = check.is_pass();
+            if checks_pass
+                && let Some(previous) = reusable.iter().find(|run| {
+                    run.content_path() == candidate.path()
+                        && run.content_sha256() == candidate.analysis().file().sha256()
+                        && run.policy() == policy
+                        && run.reviewer_report().is_some()
+                })
+            {
+                reused.insert(candidate.path().clone(), previous.clone());
+            } else {
+                pending.push(candidate);
+            }
+        }
+
+        let mut reviewed = evaluator
+            .evaluate(pending, reviewer)
+            .into_iter()
+            .map(|outcome| (outcome.path().clone(), outcome))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let mut paths = reused
+            .keys()
+            .chain(reviewed.keys())
+            .cloned()
+            .collect::<Vec<_>>();
+        paths.sort();
+
+        for path in paths {
+            if let Some(previous) = reused.remove(&path) {
+                result.document_outcomes.push(previous);
+                continue;
+            }
+            let outcome = reviewed
+                .remove(&path)
+                .expect("reviewed path came from the stable path set");
             let path = outcome.path().clone();
             let id = id_generator
                 .next_id()
@@ -683,6 +893,41 @@ mod tests {
         assert_eq!(
             review_store.list_by_snapshot(snapshot.id()).unwrap(),
             result.document_outcomes()
+        );
+    }
+
+    #[test]
+    fn validated_semantic_result_is_reused_for_the_same_snapshot_and_contract() {
+        let directory = TestDirectory::new();
+        let content_store = directory.store();
+        let snapshot = snapshot_with_content(&content_store, [("article.md", b"body" as &[u8])]);
+        let review_store = SqliteReviewRunStore::open(directory.database()).unwrap();
+        let first_reviewer = RecordingReviewer::approving(["article.md"]);
+        let first = execute_with_fixed_clock(
+            &snapshot,
+            &content_store,
+            &first_reviewer,
+            &review_store,
+            40,
+        )
+        .unwrap();
+        assert_eq!(first_reviewer.calls(), ["article.md"]);
+
+        let second_reviewer = RecordingReviewer::with_responses([]);
+        let second = execute_with_fixed_clock(
+            &snapshot,
+            &content_store,
+            &second_reviewer,
+            &review_store,
+            41,
+        )
+        .unwrap();
+
+        assert!(second_reviewer.calls().is_empty());
+        assert_eq!(second.document_outcomes(), first.document_outcomes());
+        assert_eq!(
+            review_store.list_by_snapshot(snapshot.id()).unwrap().len(),
+            1
         );
     }
 

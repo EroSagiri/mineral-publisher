@@ -6,7 +6,7 @@ mod reference_resolver;
 pub(crate) use asset_dependency::dependency_problems;
 pub use asset_dependency::{
     AssetDependency, AssetDependencyGraph, DependencyProblem, DependencyProblemKind,
-    ReferenceOrigin,
+    ReferenceOrigin, is_navigation_warning,
 };
 pub use markdown_analysis::{
     AnalyzedMarkdown, ResolvedReference, SnapshotMarkdownAnalysisError, SnapshotMarkdownAnalyzer,

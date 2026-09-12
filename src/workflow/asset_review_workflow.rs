@@ -6,11 +6,52 @@ use crate::{
     storage::LocalContentStore,
 };
 
+use super::bounded::bounded_map;
 use super::{
     AssetCheckResult, AssetPolicy, AssetProgramCheck, AssetProgramCheckError, AssetReviewDecision,
     AssetReviewDisposition, AssetReviewOutcome, AssetReviewRun, AssetReviewRunError,
     AssetReviewRunId, AssetReviewRunStore, AssetReviewer, CandidateAssetSet,
 };
+
+trait AssetReviewEvaluator<R: AssetReviewer + ?Sized> {
+    fn is_bounded(&self) -> bool;
+    fn evaluate(
+        &self,
+        outcomes: Vec<super::AssetPolicyOutcome>,
+        reviewer: &R,
+    ) -> Vec<AssetReviewOutcome>;
+}
+
+struct SequentialAssetReviews;
+impl<R: AssetReviewer + ?Sized> AssetReviewEvaluator<R> for SequentialAssetReviews {
+    fn is_bounded(&self) -> bool {
+        false
+    }
+    fn evaluate(
+        &self,
+        outcomes: Vec<super::AssetPolicyOutcome>,
+        reviewer: &R,
+    ) -> Vec<AssetReviewOutcome> {
+        outcomes
+            .into_iter()
+            .map(|outcome| outcome.review(reviewer))
+            .collect()
+    }
+}
+
+struct BoundedAssetReviews(usize);
+impl<R: AssetReviewer + Sync + ?Sized> AssetReviewEvaluator<R> for BoundedAssetReviews {
+    fn is_bounded(&self) -> bool {
+        true
+    }
+    fn evaluate(
+        &self,
+        outcomes: Vec<super::AssetPolicyOutcome>,
+        reviewer: &R,
+    ) -> Vec<AssetReviewOutcome> {
+        bounded_map(outcomes, self.0, &|outcome| outcome.review(reviewer))
+    }
+}
 
 /// Allocates immutable asset-review audit identities at the workflow boundary.
 pub trait AssetReviewRunIdGenerator {
@@ -162,6 +203,7 @@ pub enum AssetReviewWorkflowFailure<StoreError, IdError> {
         snapshot_id: SnapshotId,
     },
     ProgramCheck(AssetProgramCheckError),
+    ReviewCacheLookup(StoreError),
     ReviewRunId {
         path: ContentPath,
         source: IdError,
@@ -204,6 +246,12 @@ impl<StoreError: fmt::Display, IdError: fmt::Display> fmt::Display
             }
             AssetReviewWorkflowFailure::ProgramCheck(source) => {
                 write!(formatter, "asset program check failed: {source}")
+            }
+            AssetReviewWorkflowFailure::ReviewCacheLookup(source) => {
+                write!(
+                    formatter,
+                    "could not look up reusable Asset ReviewResults: {source}"
+                )
             }
             AssetReviewWorkflowFailure::ReviewRunId { path, source } => {
                 write!(
@@ -282,18 +330,65 @@ impl AssetReviewWorkflow {
         )
     }
 
+    pub fn execute_bounded<R, S, I>(
+        input: AssetReviewWorkflowInput<'_>,
+        reviewer: &R,
+        review_run_store: &S,
+        id_generator: &mut I,
+        concurrency: usize,
+    ) -> Result<AssetReviewWorkflowResult, AssetReviewWorkflowError<S::Error, I::Error>>
+    where
+        R: AssetReviewer + Sync + ?Sized,
+        S: AssetReviewRunStore + ?Sized,
+        I: AssetReviewRunIdGenerator + ?Sized,
+    {
+        Self::execute_with_clock_and_evaluator(
+            input,
+            reviewer,
+            review_run_store,
+            id_generator,
+            SystemTime::now,
+            BoundedAssetReviews(concurrency),
+        )
+    }
+
     fn execute_with_clock<R, S, I, C>(
         input: AssetReviewWorkflowInput<'_>,
         reviewer: &R,
         review_run_store: &S,
         id_generator: &mut I,
-        mut clock: C,
+        clock: C,
     ) -> Result<AssetReviewWorkflowResult, AssetReviewWorkflowError<S::Error, I::Error>>
     where
         R: AssetReviewer + ?Sized,
         S: AssetReviewRunStore + ?Sized,
         I: AssetReviewRunIdGenerator + ?Sized,
         C: FnMut() -> SystemTime,
+    {
+        Self::execute_with_clock_and_evaluator(
+            input,
+            reviewer,
+            review_run_store,
+            id_generator,
+            clock,
+            SequentialAssetReviews,
+        )
+    }
+
+    fn execute_with_clock_and_evaluator<R, S, I, C, E>(
+        input: AssetReviewWorkflowInput<'_>,
+        reviewer: &R,
+        review_run_store: &S,
+        id_generator: &mut I,
+        mut clock: C,
+        evaluator: E,
+    ) -> Result<AssetReviewWorkflowResult, AssetReviewWorkflowError<S::Error, I::Error>>
+    where
+        R: AssetReviewer + ?Sized,
+        S: AssetReviewRunStore + ?Sized,
+        I: AssetReviewRunIdGenerator + ?Sized,
+        C: FnMut() -> SystemTime,
+        E: AssetReviewEvaluator<R>,
     {
         let mut result = AssetReviewWorkflowResult::empty(input.snapshot.id());
         if input.candidates.snapshot_id() != input.snapshot.id() {
@@ -314,9 +409,123 @@ impl AssetReviewWorkflow {
             })?;
         result.checks = checked.clone();
         let policy_result = AssetPolicy::evaluate(&checked);
+        let reusable = review_run_store
+            .list_by_snapshot(input.snapshot.id())
+            .map_err(|source| AssetReviewWorkflowError {
+                partial_result: result.clone(),
+                failure: Box::new(AssetReviewWorkflowFailure::ReviewCacheLookup(source)),
+            })?;
 
+        if !evaluator.is_bounded() {
+            for policy_outcome in policy_result.outcomes() {
+                let current_sha256 = input
+                    .snapshot
+                    .files()
+                    .iter()
+                    .find(|file| file.path() == policy_outcome.path())
+                    .map(|file| file.sha256());
+                if let Some(previous) = reusable.iter().find(|run| {
+                    run.content_path() == policy_outcome.path()
+                        && current_sha256.is_some_and(|sha| sha == run.content_sha256())
+                        && run.policy() == input.policy
+                        && (!run.reviewer_was_called() || run.outcome().reviewer_report().is_some())
+                }) {
+                    result.entries.push(AssetReviewWorkflowEntry {
+                        content_path: previous.content_path().clone(),
+                        review_run_id: previous.id(),
+                        outcome: previous.outcome().clone(),
+                    });
+                    continue;
+                }
+                let outcome = policy_outcome.review(reviewer);
+                let path = outcome.path().clone();
+                let id = id_generator
+                    .next_id()
+                    .map_err(|source| AssetReviewWorkflowError {
+                        partial_result: result.clone(),
+                        failure: Box::new(AssetReviewWorkflowFailure::ReviewRunId {
+                            path: path.clone(),
+                            source,
+                        }),
+                    })?;
+                let run = AssetReviewRun::from_review_outcome(
+                    id,
+                    input.snapshot,
+                    outcome.clone(),
+                    input.policy.clone(),
+                    clock(),
+                )
+                .map_err(|source| AssetReviewWorkflowError {
+                    partial_result: result.clone(),
+                    failure: Box::new(AssetReviewWorkflowFailure::ReviewRun {
+                        path: path.clone(),
+                        source,
+                    }),
+                })?;
+                review_run_store
+                    .save(&run)
+                    .map_err(|source| AssetReviewWorkflowError {
+                        partial_result: result.clone(),
+                        failure: Box::new(AssetReviewWorkflowFailure::Persistence {
+                            path: path.clone(),
+                            review_run_id: id,
+                            source,
+                        }),
+                    })?;
+                result.entries.push(AssetReviewWorkflowEntry {
+                    content_path: path,
+                    review_run_id: id,
+                    outcome,
+                });
+            }
+            return Ok(result);
+        }
+
+        let mut reused = std::collections::BTreeMap::new();
+        let mut pending = Vec::new();
         for policy_outcome in policy_result.outcomes() {
-            let outcome = policy_outcome.review(reviewer);
+            let current_sha256 = input
+                .snapshot
+                .files()
+                .iter()
+                .find(|file| file.path() == policy_outcome.path())
+                .map(|file| file.sha256());
+            if let Some(previous) = reusable.iter().find(|run| {
+                run.content_path() == policy_outcome.path()
+                    && current_sha256.is_some_and(|sha| sha == run.content_sha256())
+                    && run.policy() == input.policy
+                    && (!run.reviewer_was_called() || run.outcome().reviewer_report().is_some())
+            }) {
+                reused.insert(policy_outcome.path().clone(), previous.clone());
+            } else {
+                pending.push(policy_outcome.clone());
+            }
+        }
+
+        let mut reviewed = evaluator
+            .evaluate(pending, reviewer)
+            .into_iter()
+            .map(|outcome| (outcome.path().clone(), outcome))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let mut paths = reused
+            .keys()
+            .chain(reviewed.keys())
+            .cloned()
+            .collect::<Vec<_>>();
+        paths.sort();
+
+        for path in paths {
+            if let Some(previous) = reused.remove(&path) {
+                result.entries.push(AssetReviewWorkflowEntry {
+                    content_path: previous.content_path().clone(),
+                    review_run_id: previous.id(),
+                    outcome: previous.outcome().clone(),
+                });
+                continue;
+            }
+            let outcome = reviewed
+                .remove(&path)
+                .expect("reviewed path came from the stable path set");
             let path = outcome.path().clone();
             let id = id_generator
                 .next_id()

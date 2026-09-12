@@ -51,6 +51,8 @@ pub struct PublicationApplicationRequest<'a> {
     pub target: PublicationTarget,
     pub commit_metadata: &'a GitCommitMetadata,
     pub human_reviews: ExplicitHumanReviewSelection,
+    pub markdown_review_concurrency: usize,
+    pub asset_review_concurrency: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -166,8 +168,8 @@ impl PublicationApplication {
         observation_ids: &mut OI,
     ) -> Result<PublicationApplicationOutcome, PublicationApplicationError>
     where
-        R: Reviewer + ?Sized,
-        AR: AssetReviewer + ?Sized,
+        R: Reviewer + Sync + ?Sized,
+        AR: AssetReviewer + Sync + ?Sized,
         D: ReviewRunStore + ?Sized,
         A: AssetReviewRunStore + ?Sized,
         H: HumanReviewStore + ?Sized,
@@ -187,13 +189,14 @@ impl PublicationApplication {
         PI::Error: 'static,
         OI::Error: 'static,
     {
-        let documents = PublicPolicyRun::execute(
+        let documents = PublicPolicyRun::execute_bounded(
             request.snapshot,
             content_store,
             markdown_reviewer,
             document_runs,
             request.markdown_policy,
             document_ids,
+            request.markdown_review_concurrency,
         )
         .map_err(|e| stage("markdown review", e))?;
         let selected =
@@ -218,7 +221,7 @@ impl PublicationApplication {
             .ok_or(PublicationApplicationError::MissingDependencyGraph)?;
         let candidates = CandidateAssetSet::select_effective(&document_effective, &graph)
             .map_err(|e| stage("candidate asset selection", e))?;
-        let assets = AssetReviewWorkflow::execute(
+        let assets = AssetReviewWorkflow::execute_bounded(
             AssetReviewWorkflowInput::new(
                 &candidates,
                 request.snapshot,
@@ -228,6 +231,7 @@ impl PublicationApplication {
             asset_reviewer,
             asset_runs,
             asset_ids,
+            request.asset_review_concurrency,
         )
         .map_err(|e| stage("asset review", e))?;
         let selected = SelectedReviews::validate(
@@ -317,6 +321,18 @@ impl SelectedReviews {
             }))
             .collect::<BTreeSet<_>>();
         let mut records = BTreeMap::new();
+        // Durable human resolutions are keyed by the exact automatic review
+        // subject, so discovering them is safe and is the normal CLI path.
+        // Explicit selections remain supported for callers that want an
+        // additional assertion about which records are being used.
+        for subject in &valid {
+            if let Some(record) = store
+                .get_for_subject(*subject)
+                .map_err(|e| stage("human review lookup", e))?
+            {
+                records.insert(*subject, record);
+            }
+        }
         for record in selection.records() {
             let subject = record.subject();
             if !valid.contains(&subject) {
@@ -324,10 +340,14 @@ impl SelectedReviews {
                     subject,
                 ));
             }
-            if records.insert(subject, record.clone()).is_some() {
-                return Err(PublicationApplicationError::DuplicateHumanReviewSelection(
-                    subject,
-                ));
+            if let Some(existing) = records.get(&subject) {
+                if existing != record {
+                    return Err(PublicationApplicationError::DuplicateHumanReviewSelection(
+                        subject,
+                    ));
+                }
+            } else {
+                records.insert(subject, record.clone());
             }
             match store
                 .get(record.id())

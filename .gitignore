@@ -1,3 +1,5 @@
 /target
-.env
+/.env
+/.mineral
+/mineral.yaml
 examples/fixtures/deepseek_markdown_reviewer_smoke

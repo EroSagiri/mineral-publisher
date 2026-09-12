@@ -5,7 +5,7 @@ use std::{
 };
 
 use crate::{
-    content::{AssetDependencyGraph, DependencyProblem},
+    content::{AssetDependencyGraph, DependencyProblem, is_navigation_warning},
     domain::{ContentPath, Sha256, Snapshot, SnapshotFile, SnapshotId},
 };
 
@@ -99,7 +99,10 @@ impl FinalPublicationSet {
         let problems = graph
             .problems()
             .iter()
-            .filter(|problem| approved_markdown.contains(problem.document_path()))
+            .filter(|problem| {
+                approved_markdown.contains(problem.document_path())
+                    && !is_navigation_warning(problem)
+            })
             .cloned()
             .collect::<Vec<_>>();
         if !problems.is_empty() {

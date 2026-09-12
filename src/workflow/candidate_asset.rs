@@ -5,7 +5,7 @@ use std::{
 };
 
 use crate::{
-    content::{AssetDependencyGraph, DependencyProblem},
+    content::{AssetDependencyGraph, DependencyProblem, is_navigation_warning},
     domain::{ContentPath, SnapshotId},
 };
 
@@ -83,7 +83,9 @@ impl CandidateAssetSet {
         let unresolved = graph
             .problems()
             .iter()
-            .filter(|problem| approved.contains(problem.document_path()))
+            .filter(|problem| {
+                approved.contains(problem.document_path()) && !is_navigation_warning(problem)
+            })
             .cloned()
             .collect::<Vec<_>>();
         if !unresolved.is_empty() {
@@ -136,7 +138,9 @@ impl CandidateAssetSet {
         let unresolved = graph
             .problems()
             .iter()
-            .filter(|problem| approved.contains(problem.document_path()))
+            .filter(|problem| {
+                approved.contains(problem.document_path()) && !is_navigation_warning(problem)
+            })
             .cloned()
             .collect::<Vec<_>>();
         if !unresolved.is_empty() {

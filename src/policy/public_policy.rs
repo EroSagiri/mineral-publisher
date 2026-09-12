@@ -415,7 +415,7 @@ impl PublicPolicy {
                         ProgramCheckResult::Issues(issues) => {
                             (PublicPolicyDecision::ProgramIssues(issues), None)
                         }
-                        ProgramCheckResult::Pass => {
+                        ProgramCheckResult::Pass | ProgramCheckResult::PassWithWarnings(_) => {
                             let candidate = ReviewCandidate(document);
                             match reviewer.review(&candidate) {
                                 Ok(report) => {

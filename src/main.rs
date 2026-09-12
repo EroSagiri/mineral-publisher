@@ -1,3 +1,8 @@
+mod cli;
+
 fn main() {
-    println!("Mineral Publisher");
+    if let Err(error) = cli::run() {
+        eprintln!("error: {error}");
+        std::process::exit(1);
+    }
 }

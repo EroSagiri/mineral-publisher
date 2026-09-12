@@ -1,5 +1,8 @@
 use crate::{
-    content::{DependencyProblem, DependencyProblemKind, ReferenceOrigin, dependency_problems},
+    content::{
+        DependencyProblem, DependencyProblemKind, ReferenceOrigin, dependency_problems,
+        is_navigation_warning,
+    },
     domain::ContentPath,
 };
 
@@ -33,12 +36,13 @@ impl ProgramCheckIssue {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProgramCheckResult {
     Pass,
+    PassWithWarnings(Vec<ProgramCheckIssue>),
     Issues(Vec<ProgramCheckIssue>),
 }
 
 impl ProgramCheckResult {
     pub fn is_pass(&self) -> bool {
-        matches!(self, Self::Pass)
+        matches!(self, Self::Pass | Self::PassWithWarnings(_))
     }
 
     pub fn has_issues(&self) -> bool {
@@ -47,8 +51,15 @@ impl ProgramCheckResult {
 
     pub fn issues(&self) -> &[ProgramCheckIssue] {
         match self {
-            Self::Pass => &[],
+            Self::Pass | Self::PassWithWarnings(_) => &[],
             Self::Issues(issues) => issues,
+        }
+    }
+
+    pub fn warnings(&self) -> &[ProgramCheckIssue] {
+        match self {
+            Self::PassWithWarnings(warnings) => warnings,
+            Self::Pass | Self::Issues(_) => &[],
         }
     }
 }
@@ -68,13 +79,24 @@ impl ProgramCheck {
             .iter()
             .map(|document| document.analysis().clone())
             .collect::<Vec<_>>();
-        let issues = dependency_problems(&analyses)
+        let (warnings, issues): (Vec<_>, Vec<_>) = dependency_problems(&analyses)
+            .into_iter()
+            .partition(is_navigation_warning);
+        let warnings = warnings
+            .into_iter()
+            .map(ProgramCheckIssue)
+            .collect::<Vec<_>>();
+        let issues = issues
             .into_iter()
             .map(ProgramCheckIssue)
             .collect::<Vec<_>>();
 
         if issues.is_empty() {
-            ProgramCheckResult::Pass
+            if warnings.is_empty() {
+                ProgramCheckResult::Pass
+            } else {
+                ProgramCheckResult::PassWithWarnings(warnings)
+            }
         } else {
             ProgramCheckResult::Issues(issues)
         }
@@ -180,6 +202,68 @@ mod tests {
         assert_eq!(result.issues()[0].origin().kind(), ReferenceKind::WikiEmbed);
         assert_eq!(result.issues()[0].origin().target(), "missing.png");
         assert_eq!(result.issues()[0].origin().span(), 0..16);
+    }
+
+    #[test]
+    fn missing_extensionless_wiki_note_navigation_is_warning_only() {
+        let markdown = "[[foo]] [[foo#heading]] [[daily/2026-01-01]]";
+        let documents = public_candidates(vec![analyzed(
+            "article.md",
+            markdown,
+            vec![
+                Resolution::Missing {
+                    target: "foo".to_owned(),
+                },
+                Resolution::Missing {
+                    target: "foo#heading".to_owned(),
+                },
+                Resolution::Missing {
+                    target: "daily/2026-01-01".to_owned(),
+                },
+            ],
+        )]);
+
+        let result = ProgramCheck::check(&documents);
+
+        assert!(result.is_pass());
+        assert!(result.issues().is_empty());
+        assert_eq!(result.warnings().len(), 3);
+        assert!(
+            result
+                .warnings()
+                .iter()
+                .all(|warning| warning.origin().kind() == ReferenceKind::WikiLink)
+        );
+    }
+
+    #[test]
+    fn explicit_file_links_and_embeds_remain_blocking() {
+        let markdown =
+            "[[foo.md]] [[foo.pdf]] ![[foo.png]] ![](foo.png) [x](foo.pdf) [x](./foo/bar.png)";
+        let targets = [
+            "foo.md",
+            "foo.pdf",
+            "foo.png",
+            "foo.png",
+            "foo.pdf",
+            "./foo/bar.png",
+        ];
+        let documents = public_candidates(vec![analyzed(
+            "article.md",
+            markdown,
+            targets
+                .into_iter()
+                .map(|target| Resolution::Missing {
+                    target: target.to_owned(),
+                })
+                .collect(),
+        )]);
+
+        let result = ProgramCheck::check(&documents);
+
+        assert!(result.has_issues());
+        assert_eq!(result.issues().len(), 6);
+        assert!(result.warnings().is_empty());
     }
 
     #[test]

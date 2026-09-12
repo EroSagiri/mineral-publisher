@@ -724,6 +724,13 @@ Block
 
 不能被 AI 自动覆盖。
 
+缺失或歧义的无扩展名 `WikiLink`（例如 `[[foo]]`、`[[foo#heading]]`、
+`[[daily/2026-01-01]]`）属于 navigation warning：保留 path、target、kind 与 span，
+但仍允许 Markdown 进入语义审核。显式文件链接（如 `[[foo.md]]`、`[[foo.pdf]]`）、
+Wiki embed、Markdown 图片、Markdown 本地文件链接以及无效相对路径属于 publication
+dependency 问题，必须 blocking。Navigation warning 不参与 Asset dependency closure，也不传播
+任何发布权限。
+
 ---
 
 # 16. AI Review

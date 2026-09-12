@@ -3,6 +3,7 @@ mod asset_program_check;
 mod asset_review_run;
 mod asset_review_workflow;
 mod asset_sanitization;
+mod bounded;
 mod candidate_asset;
 mod effective_review_set;
 mod final_dependency_closure;

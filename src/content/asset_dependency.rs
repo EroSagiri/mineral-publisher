@@ -139,6 +139,31 @@ pub(crate) fn dependency_problems(documents: &[AnalyzedMarkdown]) -> Vec<Depende
     analyze_documents(documents).1
 }
 
+/// Missing or ambiguous extensionless WikiLinks are navigation diagnostics,
+/// not publication dependencies. Obsidian commonly uses links to notes that
+/// may not exist yet (including daily-note paths and heading links). Explicit
+/// file extensions, embeds, Markdown links/images, and invalid paths remain
+/// blocking because they can denote required publication files.
+pub fn is_navigation_warning(problem: &DependencyProblem) -> bool {
+    if problem.origin().kind() != ReferenceKind::WikiLink {
+        return false;
+    }
+    if !matches!(
+        problem.kind(),
+        DependencyProblemKind::Missing { .. } | DependencyProblemKind::Ambiguous { .. }
+    ) {
+        return false;
+    }
+    let target = problem
+        .origin()
+        .target()
+        .split('#')
+        .next()
+        .unwrap_or_default();
+    let final_segment = target.rsplit('/').next().unwrap_or(target);
+    !final_segment.contains('.')
+}
+
 fn analyze_documents(
     documents: &[AnalyzedMarkdown],
 ) -> (Vec<AssetDependency>, Vec<DependencyProblem>) {
