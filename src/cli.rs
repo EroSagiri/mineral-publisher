@@ -36,7 +36,7 @@ use mineral_publisher::{
         AssetReviewCandidate, AssetReviewRunId, AssetReviewRunIdGenerator, AssetReviewRunStore,
         AssetReviewer, AssetReviewerError, AssetReviewerReport, ExplicitHumanReviewSelection,
         HumanReviewDecision, HumanReviewId, HumanReviewRecordError, HumanReviewResolution,
-        HumanReviewStore, HumanReviewSubject, ManagedRoot, PublicationApplication,
+        HumanReviewStore, HumanReviewSubject, PublicationApplication,
         PublicationApplicationOutcome, PublicationApplicationRequest, ReviewRunIdGenerator,
     },
 };
@@ -52,7 +52,6 @@ git:
   repository: ./publication
   remote: origin
   reference: refs/heads/main
-  managed_root: content
   author_name: Mineral Publisher
   author_email: publisher@example.invalid
   message: Publish Mineral content
@@ -92,7 +91,6 @@ struct GitConfig {
     repository: PathBuf,
     remote: String,
     reference: String,
-    managed_root: String,
     author_name: String,
     author_email: String,
     message: String,
@@ -300,7 +298,6 @@ fn publish(workspace: Workspace) -> Result<(), Box<dyn Error>> {
         snapshot: &snapshot,
         markdown_policy: &markdown_policy,
         asset_policy: &asset_policy,
-        managed_root: ManagedRoot::new(workspace.config.git.managed_root.clone())?,
         repository: &workspace.config.git.repository,
         target: PublicationTarget::new(
             &workspace.config.git.remote,
@@ -807,7 +804,19 @@ fn sqlite_positive_id(value: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::sqlite_positive_id;
+    use super::{Config, DEFAULT_CONFIG, sqlite_positive_id};
+
+    #[test]
+    fn default_config_has_no_managed_root_and_legacy_override_is_rejected() {
+        serde_yaml_ng::from_str::<Config>(DEFAULT_CONFIG).unwrap();
+        let legacy = DEFAULT_CONFIG.replace(
+            "  reference: refs/heads/main\n",
+            "  reference: refs/heads/main\n  managed_root: content\n",
+        );
+
+        let error = serde_yaml_ng::from_str::<Config>(&legacy).unwrap_err();
+        assert!(error.to_string().contains("unknown field `managed_root`"));
+    }
 
     #[test]
     fn generated_ids_always_fit_positive_sqlite_integer_range() {

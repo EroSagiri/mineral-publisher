@@ -1339,35 +1339,10 @@ PublicProjection
 
 Git 是推荐的公开发布历史载体。
 
-如果目标是 Quartz 网站，推荐：
-
-```text
-site-repo/
-├── content/          ← Mineral Publisher 管理
-│   ├── notes/
-│   └── attachments/
-│
-├── quartz/
-├── quartz.config.ts
-├── quartz.layout.ts
-└── package.json
-```
-
-Mineral Publisher 只允许修改：
-
-```text
-content/**
-```
-
-如果 PublishPlan 尝试修改：
-
-```text
-package.json
-quartz.config.ts
-.github/**
-```
-
-应该直接拒绝。
+当前生产入口固定将 Git 仓库根目录作为完整受管理目标空间，不提供 `managed_root` 配置。
+因此目标 commit 的完整 tree 必须与 PublicProjection 精确一致；Projection 中不存在的既有
+Git 文件会被删除。发布仓库应只存放 Mineral 允许公开的内容，静态网站工具链应放在其他仓库
+或由下游构建环境提供。
 
 ---
 
@@ -1387,7 +1362,7 @@ create temporary worktree
 generate complete Projection
     │
     ▼
-write managed directory
+write repository root
     │
     ▼
 git add -A
@@ -1431,9 +1406,9 @@ git push --force
 > 被审核的 Git Tree 与最终 commit 的 Git Tree 完全相同。
 
 PublicProjection materialization 必须绑定调用方明确选择的 base commit，并生成一个 Git tree：
-managed subtree 的 target path、最终 blob 原始 bytes identity 和规范 file mode 必须与完整
-Projection 精确一致；managed root 外必须与 base commit tree 完全一致。用户可变的 working
-tree 与 index 不是 publication input，materialization 不得读取或修改它们。
+仓库根目录下的 target path、最终 blob 原始 bytes identity 和规范 file mode 必须与完整
+Projection 精确一致。用户可变的 working tree 与 index 不是 publication input，materialization
+不得读取或修改它们。
 
 审核前：
 

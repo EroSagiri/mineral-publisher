@@ -228,6 +228,9 @@ impl PublishPlan {
 }
 
 fn is_within_managed_root(root: &ManagedRoot, path: &ProjectionTargetPath) -> bool {
+    if root.is_repository_root() {
+        return true;
+    }
     path.as_str()
         .strip_prefix(root.as_str())
         .is_some_and(|suffix| suffix.starts_with('/'))

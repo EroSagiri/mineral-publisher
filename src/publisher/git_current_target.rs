@@ -58,33 +58,43 @@ impl GitCurrentTargetAdapter {
         treeish: &str,
         managed_root: ManagedRoot,
     ) -> Result<CurrentTargetState, GitCurrentTargetError> {
-        let root_entry = read_root_entry(repository, treeish, &managed_root)?;
+        if !managed_root.is_repository_root() {
+            let root_entry = read_root_entry(repository, treeish, &managed_root)?;
 
-        let Some(root_entry) = root_entry else {
-            return CurrentTargetState::new(managed_root, Vec::new())
-                .map_err(GitCurrentTargetError::CurrentTargetState);
-        };
-        if root_entry.mode != b"040000" || root_entry.kind != b"tree" {
-            return Err(GitCurrentTargetError::ManagedRootNotTree {
-                path: root_entry.path,
-                mode: bytes_for_context(root_entry.mode),
-                kind: bytes_for_context(root_entry.kind),
-            });
+            let Some(root_entry) = root_entry else {
+                return CurrentTargetState::new(managed_root, Vec::new())
+                    .map_err(GitCurrentTargetError::CurrentTargetState);
+            };
+            if root_entry.mode != b"040000" || root_entry.kind != b"tree" {
+                return Err(GitCurrentTargetError::ManagedRootNotTree {
+                    path: root_entry.path,
+                    mode: bytes_for_context(root_entry.mode),
+                    kind: bytes_for_context(root_entry.kind),
+                });
+            }
         }
 
-        let output = git_output(
-            repository,
-            "enumerate managed Git subtree",
-            [
-                "ls-tree",
-                "-r",
-                "-z",
-                "--full-tree",
-                treeish,
-                "--",
-                &literal_pathspec(&managed_root),
-            ],
-        )?;
+        let output = if managed_root.is_repository_root() {
+            git_output(
+                repository,
+                "enumerate managed Git tree",
+                ["ls-tree", "-r", "-z", "--full-tree", treeish],
+            )?
+        } else {
+            git_output(
+                repository,
+                "enumerate managed Git subtree",
+                [
+                    "ls-tree",
+                    "-r",
+                    "-z",
+                    "--full-tree",
+                    treeish,
+                    "--",
+                    &literal_pathspec(&managed_root),
+                ],
+            )?
+        };
         let tree_entries = parse_tree_entries(&output.stdout)?;
         let mut entries = Vec::with_capacity(tree_entries.len());
         for tree_entry in tree_entries {
@@ -630,6 +640,31 @@ mod tests {
             target.state().entries()[1].blob_sha256(),
             Sha256::digest(&[0, 1, 2, 255])
         );
+    }
+
+    #[test]
+    fn repository_root_reads_the_complete_git_tree() {
+        let Some(repository) = TestRepository::new() else {
+            return;
+        };
+        repository.write("README.md", b"root");
+        repository.write("notes/a.md", b"A");
+        let commit = repository.commit_all("complete tree");
+
+        let target = GitCurrentTargetAdapter::read(
+            &repository.path,
+            &commit,
+            ManagedRoot::repository_root(),
+        )
+        .unwrap();
+        let paths = target
+            .state()
+            .entries()
+            .iter()
+            .map(|entry| entry.target_path().as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(paths, ["README.md", "notes/a.md"]);
     }
 
     #[test]

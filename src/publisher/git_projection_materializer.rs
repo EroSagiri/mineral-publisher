@@ -137,18 +137,28 @@ fn materialize_with_index(
         None,
     )?;
 
-    let tracked = git_with_index(
-        repository,
-        index_path,
-        "enumerate managed index entries",
-        [
-            "ls-files",
-            "-z",
-            "--",
-            &literal_pathspec(projection.managed_root()),
-        ],
-        None,
-    )?;
+    let tracked = if projection.managed_root().is_repository_root() {
+        git_with_index(
+            repository,
+            index_path,
+            "enumerate managed index entries",
+            ["ls-files", "-z"],
+            None,
+        )?
+    } else {
+        git_with_index(
+            repository,
+            index_path,
+            "enumerate managed index entries",
+            [
+                "ls-files",
+                "-z",
+                "--",
+                &literal_pathspec(projection.managed_root()),
+            ],
+            None,
+        )?
+    };
     if !tracked.stdout.is_empty() {
         git_with_index(
             repository,
@@ -250,6 +260,9 @@ fn verify_outside_managed_root(
     candidate_tree_oid: &str,
     managed_root: &ManagedRoot,
 ) -> Result<(), GitProjectionMaterializationError> {
+    if managed_root.is_repository_root() {
+        return Ok(());
+    }
     let output = git_output(
         repository,
         "compare base and candidate trees",
@@ -690,6 +703,14 @@ mod tests {
     }
 
     fn projection(repository: &TestRepository, entries: &[(&str, &[u8])]) -> PublicProjection {
+        projection_at(repository, entries, root())
+    }
+
+    fn projection_at(
+        repository: &TestRepository,
+        entries: &[(&str, &[u8])],
+        managed_root: ManagedRoot,
+    ) -> PublicProjection {
         let files = entries
             .iter()
             .map(|(path, bytes)| {
@@ -717,7 +738,7 @@ mod tests {
                 .collect(),
             vec![],
         );
-        PublicProjection::build(&set, &snapshot, root()).unwrap()
+        PublicProjection::build(&set, &snapshot, managed_root).unwrap()
     }
 
     fn materialize(
@@ -795,6 +816,30 @@ mod tests {
                 .git(["ls-tree", reviewed.tree_oid(), "--", "content"])
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn repository_root_projection_replaces_the_complete_git_tree() {
+        let Some(repository) = TestRepository::new() else {
+            return;
+        };
+        repository.write("README.md", b"not published");
+        repository.write("old.md", b"OLD");
+        let base = repository.commit_all("base");
+        let desired = projection_at(
+            &repository,
+            &[("notes/a.md", b"A")],
+            ManagedRoot::repository_root(),
+        );
+
+        let reviewed = materialize(&repository, &base, &desired);
+
+        assert_eq!(
+            repository.tree_file(reviewed.tree_oid(), "notes/a.md"),
+            b"A"
+        );
+        let paths = repository.git(["ls-tree", "-r", "--name-only", reviewed.tree_oid()]);
+        assert_eq!(paths, b"notes/a.md\n");
     }
 
     #[test]

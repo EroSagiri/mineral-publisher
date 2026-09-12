@@ -46,7 +46,6 @@ pub struct PublicationApplicationRequest<'a> {
     pub snapshot: &'a Snapshot,
     pub markdown_policy: &'a PolicyIdentity,
     pub asset_policy: &'a PolicyIdentity,
-    pub managed_root: ManagedRoot,
     pub repository: &'a Path,
     pub target: PublicationTarget,
     pub commit_metadata: &'a GitCommitMetadata,
@@ -266,9 +265,12 @@ impl PublicationApplication {
             request.snapshot,
         )
         .map_err(|e| stage("final dependency closure", e))?;
-        let projection =
-            PublicProjection::build(&publication_set, request.snapshot, request.managed_root)
-                .map_err(|e| stage("public projection", e))?;
+        let projection = PublicProjection::build(
+            &publication_set,
+            request.snapshot,
+            ManagedRoot::repository_root(),
+        )
+        .map_err(|e| stage("public projection", e))?;
         let publication = GitPublicationApplication::prepare_and_publish(
             &projection,
             request.repository,

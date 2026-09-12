@@ -27,24 +27,42 @@ impl fmt::Display for ProjectionTargetPath {
     }
 }
 
-/// The target subtree a Publisher authorizes Mineral Publisher to control.
+/// The target tree a Publisher authorizes Mineral Publisher to control.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ManagedRoot(ProjectionTargetPath);
+pub struct ManagedRoot(Option<ProjectionTargetPath>);
 
 impl ManagedRoot {
     pub fn new(path: impl Into<String>) -> Result<Self, ProjectionTargetPathError> {
-        ProjectionTargetPath::new(path).map(Self)
+        let path = path.into();
+        if path == "." {
+            Ok(Self::repository_root())
+        } else {
+            ProjectionTargetPath::new(path).map(|path| Self(Some(path)))
+        }
+    }
+
+    pub fn repository_root() -> Self {
+        Self(None)
     }
 
     pub fn as_str(&self) -> &str {
-        self.0.as_str()
+        self.0.as_ref().map_or(".", ProjectionTargetPath::as_str)
+    }
+
+    pub fn is_repository_root(&self) -> bool {
+        self.0.is_none()
     }
 
     fn target_for(
         &self,
         source_path: &ContentPath,
     ) -> Result<ProjectionTargetPath, ProjectionTargetPathError> {
-        ProjectionTargetPath::new(format!("{}/{}", self.as_str(), source_path.as_str()))
+        match &self.0 {
+            Some(root) => {
+                ProjectionTargetPath::new(format!("{}/{}", root.as_str(), source_path.as_str()))
+            }
+            None => ProjectionTargetPath::new(source_path.as_str()),
+        }
     }
 }
 
@@ -392,7 +410,7 @@ mod tests {
     }
 
     fn root() -> ManagedRoot {
-        ManagedRoot::new("content").unwrap()
+        ManagedRoot::repository_root()
     }
 
     #[test]
@@ -405,7 +423,7 @@ mod tests {
 
         assert_eq!(projection.entries().len(), 1);
         let entry = &projection.entries()[0];
-        assert_eq!(entry.target_path().as_str(), "content/notes/a.md");
+        assert_eq!(entry.target_path().as_str(), "notes/a.md");
         assert_eq!(entry.blob_sha256(), markdown_sha);
         assert_eq!(entry.source_sha256(), markdown_sha);
         assert_eq!(entry.kind(), ProjectionEntryKind::Markdown);
@@ -421,7 +439,7 @@ mod tests {
         let projection = PublicProjection::build(&set, &snapshot, root()).unwrap();
         let entry = &projection.entries()[0];
 
-        assert_eq!(entry.target_path().as_str(), "content/attachments/a.png");
+        assert_eq!(entry.target_path().as_str(), "attachments/a.png");
         assert_eq!(entry.blob_sha256(), published);
         assert_eq!(entry.source_sha256(), source);
         assert_eq!(entry.kind(), ProjectionEntryKind::Asset);
@@ -469,10 +487,10 @@ mod tests {
         assert_eq!(
             paths,
             [
-                "content/a.md",
-                "content/attachments/diagram.png",
-                "content/attachments/image.png",
-                "content/z.md",
+                "a.md",
+                "attachments/diagram.png",
+                "attachments/image.png",
+                "z.md",
             ]
         );
     }
@@ -533,6 +551,19 @@ mod tests {
             );
             assert!(ManagedRoot::new(invalid).is_err(), "accepted {invalid:?}");
         }
+    }
+
+    #[test]
+    fn repository_root_preserves_source_relative_paths() {
+        let root = ManagedRoot::repository_root();
+
+        assert_eq!(root.as_str(), ".");
+        assert!(root.is_repository_root());
+        assert_eq!(
+            root.target_for(&path("notes/a.md")).unwrap().as_str(),
+            "notes/a.md"
+        );
+        assert_eq!(ManagedRoot::new(".").unwrap(), root);
     }
 
     #[test]
