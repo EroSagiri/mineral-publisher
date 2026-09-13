@@ -17,7 +17,9 @@ use mineral_publisher::{
     reviewer::{DeepSeekApiKey, DeepSeekMarkdownReviewer, DeepSeekMarkdownReviewerConfig},
     source::LocalSource,
     storage::{LocalContentStore, SqliteReviewRunStore},
-    workflow::{PublicPolicyRun, SequentialMarkdownReviews, SequentialReviewRunIdGenerator},
+    workflow::{
+        NoHumanReviews, PublicPolicyRun, SequentialMarkdownReviews, SequentialReviewRunIdGenerator,
+    },
 };
 
 const API_BASE_URL: &str = "https://api.deepseek.com";
@@ -68,6 +70,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         &content_store,
         &reviewer,
         &review_store,
+        &NoHumanReviews,
         &policy,
         &mut review_ids,
         SystemTime::now(),

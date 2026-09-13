@@ -1246,7 +1246,10 @@ mod tests {
         },
         source::LocalSource,
         storage::{LocalContentStore, SqliteReviewRunStore},
-        workflow::{PublicPolicyRun, SequentialMarkdownReviews, SequentialReviewRunIdGenerator},
+        workflow::{
+            NoHumanReviews, PublicPolicyRun, SequentialMarkdownReviews,
+            SequentialReviewRunIdGenerator,
+        },
     };
 
     use super::*;
@@ -1521,6 +1524,7 @@ mod tests {
             &directory.content_store(),
             reviewer,
             &store,
+            &NoHumanReviews,
             &policy,
             &mut ids,
             SystemTime::now(),

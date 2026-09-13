@@ -7,8 +7,7 @@ use crate::{
 
 use super::{
     AssetReviewRunId, AssetReviewRunStore, AssetReviewWorkflowResult, EffectiveReviewDecision,
-    EffectiveReviewDecisionError, HumanReviewResolution, HumanReviewStore, HumanReviewSubject,
-    PublicPolicyRunResult,
+    EffectiveReviewDecisionError, HumanReviewResolution, HumanReviewStore, PublicPolicyRunResult,
 };
 
 /// A Snapshot-bound view derived only from workflow-selected automatic review attempts.
@@ -105,8 +104,7 @@ impl EffectiveReviewSet {
                     actual_snapshot_id: run.snapshot_id(),
                 });
             }
-            let resolution = human_reviews
-                .get_for_subject(HumanReviewSubject::Document(run.id()))
+            let resolution = HumanReviewResolution::document_resolution(&run, human_reviews)
                 .map_err(EffectiveReviewSetError::HumanStore)?;
             let decision = HumanReviewResolution::effective_document(&run, resolution.as_ref())
                 .map_err(EffectiveReviewSetError::DocumentHumanSubjectMismatch)?;
@@ -138,8 +136,7 @@ impl EffectiveReviewSet {
                     actual_snapshot_id: run.snapshot_id(),
                 });
             }
-            let resolution = human_reviews
-                .get_for_subject(HumanReviewSubject::Asset(run.id()))
+            let resolution = HumanReviewResolution::asset_resolution(&run, human_reviews)
                 .map_err(EffectiveReviewSetError::HumanStore)?;
             let decision = HumanReviewResolution::effective_asset(&run, resolution.as_ref())
                 .map_err(EffectiveReviewSetError::AssetHumanSubjectMismatch)?;

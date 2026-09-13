@@ -17,7 +17,10 @@ mod tests {
             HumanReviewReason, PolicyIdentity, PrivateDocument, PrivateReason,
             PublicPolicyDecision, ReviewRun,
         },
-        storage::{SqliteAssetReviewRunStore, SqliteHumanReviewStore, SqliteReviewRunStore},
+        storage::{
+            SqliteAssetReviewRunStore, SqliteHumanReviewStore, SqliteHumanReviewStoreError,
+            SqliteReviewRunStore,
+        },
     };
 
     use super::*;
@@ -88,20 +91,48 @@ mod tests {
                 .collect(),
         )
     }
+    /// A current decision: bound to the subject, raised by the attempt.
     fn resolution(
         id: u64,
         subject: HumanReviewSubject,
+        attempt: HumanReviewAttempt,
         decision: HumanReviewDecision,
     ) -> HumanReviewRecord {
         HumanReviewRecord::rehydrate(
             HumanReviewId::new(id).unwrap(),
-            subject,
+            HumanReviewBinding::Subject { subject, attempt },
             decision,
             id,
             None,
             None,
         )
         .unwrap()
+    }
+
+    fn document_decision(
+        id: u64,
+        run: &ReviewRun,
+        decision: HumanReviewDecision,
+    ) -> HumanReviewRecord {
+        resolution(
+            id,
+            HumanReviewSubject::document(run),
+            HumanReviewAttempt::Document(run.id()),
+            decision,
+        )
+    }
+
+    fn asset_decision(
+        id: u64,
+        run: &AssetReviewRun,
+        decision: HumanReviewDecision,
+    ) -> HumanReviewRecord {
+        resolution(
+            id,
+            HumanReviewSubject::asset(run),
+            HumanReviewAttempt::Asset(run.id()),
+            decision,
+        )
     }
 
     #[test]
@@ -144,23 +175,19 @@ mod tests {
             documents.save(run).unwrap();
         }
         human
-            .save(&resolution(
+            .save(&document_decision(
                 1,
-                HumanReviewSubject::Document(runs[4].id()),
+                &runs[4],
                 HumanReviewDecision::Approve,
             ))
             .unwrap();
         human
-            .save(&resolution(
-                2,
-                HumanReviewSubject::Document(runs[5].id()),
-                HumanReviewDecision::Reject,
-            ))
+            .save(&document_decision(2, &runs[5], HumanReviewDecision::Reject))
             .unwrap();
         human
-            .save(&resolution(
+            .save(&document_decision(
                 3,
-                HumanReviewSubject::Document(runs[6].id()),
+                &runs[6],
                 HumanReviewDecision::Approve,
             ))
             .unwrap();
@@ -283,25 +310,13 @@ mod tests {
             assets.save(run).unwrap();
         }
         human
-            .save(&resolution(
-                1,
-                HumanReviewSubject::Asset(runs[4].id()),
-                HumanReviewDecision::Approve,
-            ))
+            .save(&asset_decision(1, &runs[4], HumanReviewDecision::Approve))
             .unwrap();
         human
-            .save(&resolution(
-                2,
-                HumanReviewSubject::Asset(runs[5].id()),
-                HumanReviewDecision::Reject,
-            ))
+            .save(&asset_decision(2, &runs[5], HumanReviewDecision::Reject))
             .unwrap();
         human
-            .save(&resolution(
-                3,
-                HumanReviewSubject::Asset(runs[6].id()),
-                HumanReviewDecision::Approve,
-            ))
+            .save(&asset_decision(3, &runs[6], HumanReviewDecision::Approve))
             .unwrap();
         let set = EffectiveReviewSet::build(
             &document_result(Vec::new()),
@@ -330,74 +345,79 @@ mod tests {
         );
     }
 
+    /// S6.5: a decision belongs to the reviewed content and the policy, so it
+    /// answers every later attempt of that subject, and one subject never holds
+    /// two answers.
     #[test]
-    fn selected_attempts_win_over_newer_attempts_for_documents_and_assets() {
+    fn one_decision_answers_every_attempt_of_its_subject() {
         let documents = SqliteReviewRunStore::open(":memory:").unwrap();
         let assets = SqliteAssetReviewRunStore::open(":memory:").unwrap();
         let human = SqliteHumanReviewStore::open(":memory:").unwrap();
-        let old_document = document(
-            1,
-            "a.md",
-            PublicPolicyDecision::NeedsHumanReview(HumanReviewReason::ReviewerRequested),
+
+        // Two attempts of the same reviewed content under the same policy: only the
+        // attempt identity differs.
+        let content = Sha256::new([9; 32]);
+        let document_attempt = |id: u64| {
+            ReviewRun::rehydrate(
+                ReviewRunId::new(id).unwrap(),
+                snapshot(),
+                path("a.md"),
+                content,
+                policy(),
+                (
+                    PublicPolicyDecision::NeedsHumanReview(HumanReviewReason::ReviewerRequested),
+                    None,
+                ),
+                id,
+            )
+        };
+        let first_document = document_attempt(1);
+        let second_document = document_attempt(2);
+        documents.save(&first_document).unwrap();
+        documents.save(&second_document).unwrap();
+
+        let asset_outcome = asset_outcome(
+            "a.png",
+            &["a.md"],
+            AssetReviewDisposition::NeedsHumanReview(AssetHumanReviewReason::PolicyFindings),
         );
-        let new_document = document(
-            2,
-            "a.md",
-            PublicPolicyDecision::NeedsHumanReview(HumanReviewReason::ReviewerRequested),
-        );
-        let old_asset = asset(
-            1,
-            asset_outcome(
-                "a.png",
-                &["a.md"],
-                AssetReviewDisposition::NeedsHumanReview(AssetHumanReviewReason::PolicyFindings),
-            ),
-        );
-        let new_asset = asset(
-            2,
-            asset_outcome(
-                "a.png",
-                &["a.md"],
-                AssetReviewDisposition::NeedsHumanReview(AssetHumanReviewReason::PolicyFindings),
-            ),
-        );
-        for run in [&old_document, &new_document] {
-            documents.save(run).unwrap();
-        }
-        for run in [&old_asset, &new_asset] {
-            assets.save(run).unwrap();
-        }
+        let asset_attempt = |id: u64| {
+            AssetReviewRun::rehydrate(
+                AssetReviewRunId::new(id).unwrap(),
+                snapshot(),
+                path("a.png"),
+                Sha256::new([3; 32]),
+                policy(),
+                asset_outcome.clone(),
+                id,
+            )
+        };
+        let first_asset = asset_attempt(1);
+        let second_asset = asset_attempt(2);
+        assets.save(&first_asset).unwrap();
+        assets.save(&second_asset).unwrap();
+
+        // The operator answers the attempt that raised the question.
         human
-            .save(&resolution(
+            .save(&document_decision(
                 1,
-                HumanReviewSubject::Document(old_document.id()),
-                HumanReviewDecision::Reject,
-            ))
-            .unwrap();
-        human
-            .save(&resolution(
-                2,
-                HumanReviewSubject::Document(new_document.id()),
+                &first_document,
                 HumanReviewDecision::Approve,
             ))
             .unwrap();
         human
-            .save(&resolution(
+            .save(&asset_decision(
                 3,
-                HumanReviewSubject::Asset(old_asset.id()),
+                &first_asset,
                 HumanReviewDecision::Reject,
             ))
             .unwrap();
-        human
-            .save(&resolution(
-                4,
-                HumanReviewSubject::Asset(new_asset.id()),
-                HumanReviewDecision::Approve,
-            ))
-            .unwrap();
+
+        // A later attempt of the same subject reuses the decision: the provider is
+        // never asked again, and the delivery is not blocked.
         let set = EffectiveReviewSet::build(
-            &document_result(vec![old_document]),
-            &asset_result(&[old_asset]),
+            &document_result(vec![second_document.clone()]),
+            &asset_result(std::slice::from_ref(&second_asset)),
             &documents,
             &assets,
             &human,
@@ -405,11 +425,55 @@ mod tests {
         .unwrap();
         assert_eq!(
             set.documents()[0].decision(),
-            EffectiveDocumentDecision::Rejected
+            EffectiveDocumentDecision::Approved
+        );
+        assert_eq!(
+            set.documents()[0].review_run_id(),
+            Some(second_document.id())
         );
         assert_eq!(
             set.assets()[0].decision(),
             EffectiveReviewDecision::Rejected
+        );
+        assert_eq!(set.assets()[0].review_run_id(), second_asset.id());
+
+        // One subject, one answer: a second decision about the same content and
+        // policy is refused rather than silently overriding the first.
+        assert!(matches!(
+            human.save(&document_decision(
+                2,
+                &second_document,
+                HumanReviewDecision::Reject
+            )),
+            Err(SqliteHumanReviewStoreError::SubjectAlreadyResolved(_))
+        ));
+
+        // Different content is a different subject, and the decision does not
+        // follow it.
+        let changed = ReviewRun::rehydrate(
+            ReviewRunId::new(3).unwrap(),
+            snapshot(),
+            path("a.md"),
+            Sha256::new([8; 32]),
+            policy(),
+            (
+                PublicPolicyDecision::NeedsHumanReview(HumanReviewReason::ReviewerRequested),
+                None,
+            ),
+            3,
+        );
+        documents.save(&changed).unwrap();
+        let set = EffectiveReviewSet::build(
+            &document_result(vec![changed]),
+            &asset_result(&[]),
+            &documents,
+            &assets,
+            &human,
+        )
+        .unwrap();
+        assert_eq!(
+            set.documents()[0].decision(),
+            EffectiveDocumentDecision::PendingHumanReview
         );
     }
 
@@ -489,9 +553,15 @@ mod tests {
         }
         fn get_for_subject(
             &self,
-            _: HumanReviewSubject,
+            _: &HumanReviewSubject,
         ) -> Result<Option<HumanReviewRecord>, Self::Error> {
             Ok(Some(self.0.clone()))
+        }
+        fn get_for_attempt(
+            &self,
+            _: HumanReviewAttempt,
+        ) -> Result<Option<HumanReviewRecord>, Self::Error> {
+            Ok(None)
         }
         fn list(&self) -> Result<Vec<HumanReviewRecord>, Self::Error> {
             Ok(Vec::new())
@@ -510,7 +580,13 @@ mod tests {
         documents.save(&run).unwrap();
         let human = WrongSubjectStore(resolution(
             1,
-            HumanReviewSubject::Asset(AssetReviewRunId::new(1).unwrap()),
+            HumanReviewSubject::for_path(
+                HumanReviewKind::Asset,
+                path("a.md"),
+                Sha256::new([9; 32]),
+                policy(),
+            ),
+            HumanReviewAttempt::Document(run.id()),
             HumanReviewDecision::Approve,
         ));
         assert!(matches!(

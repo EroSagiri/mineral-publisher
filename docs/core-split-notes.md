@@ -114,6 +114,16 @@ filename 会得到不同 object key，换掉物理去重换取 "URL path == obje
 不理解 V1/V2。Durable 侧 `DeliveryProjectionWire` 现在写 V2、仍读 V1：V1 的历史
 filename-less key 保持原样可恢复，并且 decode 后的 V1 会原样 re-encode，不做隐式升级。
 
+S6.5 把 human decision 的复用键从"随机 review attempt id"改成
+`(content_path, content_sha256, policy_identity)`。review attempt 每次失败重跑都会
+生成新的随机 id，所以绑定 attempt 的决议永远追不上下一次尝试——provider 挂掉时
+approve 之后再 publish 仍会再次调用 provider。现在：人工决议绑定被审查的内容 + policy，
+review workflow 在调用 provider 之前先查该 subject 是否已有人工决议（是则直接复用
+已有 attempt，**provider 调用为 0**），effective review set 也按 subject 查找。
+`human-reviews.sqlite3` schema v1→v2 增加 identity 列；**历史行保持原样**（identity 列为
+NULL，语义仍是"只对当时那一次 attempt 生效"，不迁移、不放大），新决议同时记录
+identity 与引发它的 attempt。
+
 ### 2.3 已批准的 schema 变更
 
 `publish-runs.sqlite3`：`user_version 1 → 2`

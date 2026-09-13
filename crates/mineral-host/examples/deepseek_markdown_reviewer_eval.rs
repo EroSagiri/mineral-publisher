@@ -24,7 +24,9 @@ use mineral_publisher::{
     },
     source::LocalSource,
     storage::{LocalContentStore, SqliteReviewRunStore},
-    workflow::{PublicPolicyRun, SequentialMarkdownReviews, SequentialReviewRunIdGenerator},
+    workflow::{
+        NoHumanReviews, PublicPolicyRun, SequentialMarkdownReviews, SequentialReviewRunIdGenerator,
+    },
 };
 
 const DEFAULT_API_BASE_URL: &str = "https://api.deepseek.com";
@@ -95,6 +97,7 @@ fn run() -> Result<CalibrationExitStatus, Box<dyn Error>> {
         &content_store,
         &reviewer,
         &review_store,
+        &NoHumanReviews,
         &policy,
         &mut review_ids,
         SystemTime::now(),

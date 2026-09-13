@@ -1,6 +1,9 @@
 use std::{error::Error, fmt, time::SystemTime};
 
-use crate::policy::{PublicPolicyDecision, ReviewRun, ReviewRunId, ReviewRunStore};
+use crate::{
+    domain::{ContentPath, Sha256},
+    policy::{PolicyIdentity, PublicPolicyDecision, ReviewRun, ReviewRunId, ReviewRunStore},
+};
 
 use super::{
     AssetReviewDecision, AssetReviewDisposition, AssetReviewRun, AssetReviewRunId,
@@ -23,9 +26,169 @@ impl HumanReviewId {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub enum HumanReviewSubject {
+pub enum HumanReviewKind {
+    Document,
+    Asset,
+}
+
+/// What one human decision is about: the exact reviewed content under one policy.
+///
+/// A human decision is never about "the attempt that happened to be pending when
+/// an operator looked". Attempts are re-executed whenever the provider is
+/// unavailable, and every execution mints a fresh audit identity, so a decision
+/// bound to one attempt cannot be recognised by the next one and the same question
+/// is asked forever. The content identity and the policy identity are the only
+/// facts that survive a re-run, so they are what a decision binds to.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReviewSubjectIdentity {
+    content_path: ContentPath,
+    content_sha256: Sha256,
+    policy: PolicyIdentity,
+}
+
+impl ReviewSubjectIdentity {
+    pub fn new(content_path: ContentPath, content_sha256: Sha256, policy: PolicyIdentity) -> Self {
+        Self {
+            content_path,
+            content_sha256,
+            policy,
+        }
+    }
+
+    pub fn content_path(&self) -> &ContentPath {
+        &self.content_path
+    }
+
+    pub fn content_sha256(&self) -> Sha256 {
+        self.content_sha256
+    }
+
+    pub fn policy(&self) -> &PolicyIdentity {
+        &self.policy
+    }
+}
+
+impl Ord for ReviewSubjectIdentity {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.content_path
+            .cmp(&other.content_path)
+            .then_with(|| {
+                self.content_sha256
+                    .as_bytes()
+                    .cmp(other.content_sha256.as_bytes())
+            })
+            .then_with(|| self.policy.name().cmp(other.policy.name()))
+            .then_with(|| self.policy.version().cmp(other.policy.version()))
+            .then_with(|| {
+                self.policy
+                    .hash()
+                    .as_bytes()
+                    .cmp(other.policy.hash().as_bytes())
+            })
+    }
+}
+
+impl PartialOrd for ReviewSubjectIdentity {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// The subject one automatic review outcome is about.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct HumanReviewSubject {
+    kind: HumanReviewKind,
+    identity: ReviewSubjectIdentity,
+}
+
+impl HumanReviewSubject {
+    fn new(kind: HumanReviewKind, identity: ReviewSubjectIdentity) -> Self {
+        Self { kind, identity }
+    }
+
+    /// The subject of one reviewed file, before any attempt about it exists.
+    ///
+    /// The review workflows use this to recognise a question a human has already
+    /// answered without running the provider again.
+    pub fn for_path(
+        kind: HumanReviewKind,
+        content_path: ContentPath,
+        content_sha256: Sha256,
+        policy: PolicyIdentity,
+    ) -> Self {
+        Self::new(
+            kind,
+            ReviewSubjectIdentity::new(content_path, content_sha256, policy),
+        )
+    }
+
+    pub fn document(run: &ReviewRun) -> Self {
+        Self::new(
+            HumanReviewKind::Document,
+            ReviewSubjectIdentity::new(
+                run.content_path().clone(),
+                run.content_sha256(),
+                run.policy().clone(),
+            ),
+        )
+    }
+
+    pub fn asset(run: &AssetReviewRun) -> Self {
+        Self::new(
+            HumanReviewKind::Asset,
+            ReviewSubjectIdentity::new(
+                run.content_path().clone(),
+                run.content_sha256(),
+                run.policy().clone(),
+            ),
+        )
+    }
+
+    pub fn kind(&self) -> HumanReviewKind {
+        self.kind
+    }
+
+    pub fn identity(&self) -> &ReviewSubjectIdentity {
+        &self.identity
+    }
+
+    pub fn content_path(&self) -> &ContentPath {
+        self.identity.content_path()
+    }
+
+    pub fn content_sha256(&self) -> Sha256 {
+        self.identity.content_sha256()
+    }
+
+    pub fn policy(&self) -> &PolicyIdentity {
+        self.identity.policy()
+    }
+}
+
+/// One automatic review attempt, as an audit identity.
+///
+/// It is what a decision written before subject binding named, and it stays in the
+/// audit trail of a current decision as the attempt that raised the question.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum HumanReviewAttempt {
     Document(ReviewRunId),
     Asset(AssetReviewRunId),
+}
+
+impl HumanReviewAttempt {
+    pub fn kind(self) -> HumanReviewKind {
+        match self {
+            Self::Document(_) => HumanReviewKind::Document,
+            Self::Asset(_) => HumanReviewKind::Asset,
+        }
+    }
+
+    pub fn run_id(self) -> u64 {
+        match self {
+            Self::Document(id) => id.get(),
+            Self::Asset(id) => id.get(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -34,11 +197,26 @@ pub enum HumanReviewDecision {
     Reject,
 }
 
-/// Immutable audit fact recording a final human decision about one automatic review attempt.
+/// What one human review record binds to.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum HumanReviewBinding {
+    /// The current binding: the decision is about this subject, and this attempt
+    /// is the one that raised the question.
+    Subject {
+        subject: HumanReviewSubject,
+        attempt: HumanReviewAttempt,
+    },
+    /// A record written before subjects were bound: it decided about exactly one
+    /// automatic attempt and nothing else. Kept readable, and never widened to a
+    /// subject its author never saw.
+    AttemptOnly(HumanReviewAttempt),
+}
+
+/// Immutable audit fact recording a final human decision about one review subject.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HumanReviewRecord {
     id: HumanReviewId,
-    subject: HumanReviewSubject,
+    binding: HumanReviewBinding,
     decision: HumanReviewDecision,
     created_at_unix_ms: u64,
     reviewer: Option<String>,
@@ -49,7 +227,7 @@ impl HumanReviewRecord {
     #[doc(hidden)]
     pub fn new(
         id: HumanReviewId,
-        subject: HumanReviewSubject,
+        binding: HumanReviewBinding,
         decision: HumanReviewDecision,
         created_at: SystemTime,
         reviewer: Option<String>,
@@ -69,7 +247,7 @@ impl HumanReviewRecord {
             .map_err(|_| HumanReviewRecordError::TimestampOutOfRange)?;
         Ok(Self {
             id,
-            subject,
+            binding,
             decision,
             created_at_unix_ms,
             reviewer,
@@ -81,8 +259,28 @@ impl HumanReviewRecord {
         self.id
     }
 
-    pub fn subject(&self) -> HumanReviewSubject {
-        self.subject
+    pub fn binding(&self) -> &HumanReviewBinding {
+        &self.binding
+    }
+
+    /// The subject this decision is about, when it was written under the current
+    /// binding.
+    pub fn subject(&self) -> Option<&HumanReviewSubject> {
+        match &self.binding {
+            HumanReviewBinding::Subject { subject, .. } => Some(subject),
+            HumanReviewBinding::AttemptOnly(_) => None,
+        }
+    }
+
+    /// Whether this decision answers the question one automatic outcome raised.
+    ///
+    /// A subject-bound decision answers every attempt about that subject; an
+    /// attempt-bound decision answers only the attempt it named.
+    pub fn applies_to(&self, subject: &HumanReviewSubject, attempt: HumanReviewAttempt) -> bool {
+        match &self.binding {
+            HumanReviewBinding::Subject { subject: bound, .. } => bound == subject,
+            HumanReviewBinding::AttemptOnly(bound) => *bound == attempt,
+        }
     }
 
     pub fn decision(&self) -> HumanReviewDecision {
@@ -104,7 +302,7 @@ impl HumanReviewRecord {
     #[doc(hidden)]
     pub fn rehydrate(
         id: HumanReviewId,
-        subject: HumanReviewSubject,
+        binding: HumanReviewBinding,
         decision: HumanReviewDecision,
         created_at_unix_ms: u64,
         reviewer: Option<String>,
@@ -118,7 +316,7 @@ impl HumanReviewRecord {
         }
         Ok(Self {
             id,
-            subject,
+            binding,
             decision,
             created_at_unix_ms,
             reviewer,
@@ -157,9 +355,16 @@ pub trait HumanReviewStore {
 
     fn save(&self, record: &HumanReviewRecord) -> Result<(), Self::Error>;
     fn get(&self, id: HumanReviewId) -> Result<Option<HumanReviewRecord>, Self::Error>;
+    /// The decision recorded for this exact subject under the current binding.
     fn get_for_subject(
         &self,
-        subject: HumanReviewSubject,
+        subject: &HumanReviewSubject,
+    ) -> Result<Option<HumanReviewRecord>, Self::Error>;
+    /// The decision recorded for one automatic attempt under the pre-subject
+    /// binding.
+    fn get_for_attempt(
+        &self,
+        attempt: HumanReviewAttempt,
     ) -> Result<Option<HumanReviewRecord>, Self::Error>;
     fn list(&self) -> Result<Vec<HumanReviewRecord>, Self::Error>;
 }
@@ -173,15 +378,17 @@ pub enum EffectiveReviewDecision {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EffectiveReviewDecisionError {
-    expected: HumanReviewSubject,
-    actual: HumanReviewSubject,
+    /// Boxed: a binding carries the whole reviewed subject, and this error travels
+    /// through every review outcome.
+    expected: Box<HumanReviewBinding>,
+    actual: Box<HumanReviewBinding>,
 }
 
 impl fmt::Display for EffectiveReviewDecisionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "human resolution subject {:?} does not match automatic review subject {:?}",
+            "human resolution {:?} does not answer the automatic review {:?}",
             self.actual, self.expected
         )
     }
@@ -207,16 +414,16 @@ impl HumanReviewResolution {
         R: ReviewRunStore + ?Sized,
         H: HumanReviewStore + ?Sized,
     {
+        let attempt = HumanReviewAttempt::Document(review_run_id);
         let run = automatic_store
             .get(review_run_id)
             .map_err(HumanReviewResolutionError::AutomaticStore)?
-            .ok_or(HumanReviewResolutionError::AutomaticReviewNotFound(
-                HumanReviewSubject::Document(review_run_id),
-            ))?;
+            .ok_or(HumanReviewResolutionError::AutomaticReviewNotFound(attempt))?;
         Self::resolve(
             human_store,
             id,
-            HumanReviewSubject::Document(review_run_id),
+            HumanReviewSubject::document(&run),
+            attempt,
             run.needs_human_review(),
             decision,
             created_at,
@@ -240,22 +447,84 @@ impl HumanReviewResolution {
         R: AssetReviewRunStore + ?Sized,
         H: HumanReviewStore + ?Sized,
     {
+        let attempt = HumanReviewAttempt::Asset(review_run_id);
         let run = automatic_store
             .get(review_run_id)
             .map_err(HumanReviewResolutionError::AutomaticStore)?
-            .ok_or(HumanReviewResolutionError::AutomaticReviewNotFound(
-                HumanReviewSubject::Asset(review_run_id),
-            ))?;
+            .ok_or(HumanReviewResolutionError::AutomaticReviewNotFound(attempt))?;
         Self::resolve(
             human_store,
             id,
-            HumanReviewSubject::Asset(review_run_id),
+            HumanReviewSubject::asset(&run),
+            attempt,
             run.needs_human_review(),
             decision,
             created_at,
             reviewer,
             note,
         )
+    }
+
+    /// The human decision that answers one automatic document outcome.
+    ///
+    /// The subject is looked up first, so a decision survives every later attempt
+    /// about the same content under the same policy. A decision written before
+    /// subjects were bound is found through the attempt it named: it keeps exactly
+    /// the meaning its author gave it.
+    pub fn document_resolution<H: HumanReviewStore + ?Sized>(
+        run: &ReviewRun,
+        human_store: &H,
+    ) -> Result<Option<HumanReviewRecord>, H::Error> {
+        let subject = HumanReviewSubject::document(run);
+        if let Some(record) = human_store.get_for_subject(&subject)? {
+            return Ok(Some(record));
+        }
+        human_store.get_for_attempt(HumanReviewAttempt::Document(run.id()))
+    }
+
+    /// The candidate paths whose exact content and policy a human has decided.
+    ///
+    /// A human decision is a final answer for the subject it decided about, so a
+    /// later attempt about that same subject must not ask the provider again: doing
+    /// so would not change the answer, would cost a call, and — when the provider
+    /// is the very thing that is down — would fail exactly the same way. The
+    /// subject is the content and the policy, never the attempt, which is why a
+    /// decision survives the re-run that follows a provider outage.
+    pub fn answered_paths<'a, H, I>(
+        human_store: &H,
+        kind: HumanReviewKind,
+        policy: &PolicyIdentity,
+        subjects: I,
+    ) -> Result<std::collections::BTreeSet<ContentPath>, H::Error>
+    where
+        H: HumanReviewStore + ?Sized,
+        I: IntoIterator<Item = (&'a ContentPath, Sha256)>,
+    {
+        let mut answered = std::collections::BTreeSet::new();
+        for (content_path, content_sha256) in subjects {
+            let subject = HumanReviewSubject::for_path(
+                kind,
+                content_path.clone(),
+                content_sha256,
+                policy.clone(),
+            );
+            if human_store.get_for_subject(&subject)?.is_some() {
+                answered.insert(content_path.clone());
+            }
+        }
+        Ok(answered)
+    }
+
+    /// The human decision that answers one automatic asset outcome.
+    pub fn asset_resolution<H: HumanReviewStore + ?Sized>(
+        run: &AssetReviewRun,
+        human_store: &H,
+    ) -> Result<Option<HumanReviewRecord>, H::Error> {
+        let subject = HumanReviewSubject::asset(run);
+        if let Some(record) = human_store.get_for_subject(&subject)? {
+            return Ok(Some(record));
+        }
+        human_store.get_for_attempt(HumanReviewAttempt::Asset(run.id()))
     }
 
     pub fn list_pending_documents<R, H>(
@@ -269,9 +538,7 @@ impl HumanReviewResolution {
         let runs = automatic_store
             .list_pending_human_review()
             .map_err(HumanReviewResolutionError::AutomaticStore)?;
-        Self::without_resolutions(runs, human_store, |run| {
-            HumanReviewSubject::Document(run.id())
-        })
+        Self::without_resolutions(runs, human_store, Self::document_resolution)
     }
 
     pub fn list_pending_assets<R, H>(
@@ -285,7 +552,7 @@ impl HumanReviewResolution {
         let runs = automatic_store
             .list_pending_human_review()
             .map_err(HumanReviewResolutionError::AutomaticStore)?;
-        Self::without_resolutions(runs, human_store, |run| HumanReviewSubject::Asset(run.id()))
+        Self::without_resolutions(runs, human_store, Self::asset_resolution)
     }
 
     pub fn effective_document(
@@ -297,9 +564,11 @@ impl HumanReviewResolution {
             PublicPolicyDecision::ReviewRejected | PublicPolicyDecision::ProgramIssues(_) => {
                 Ok(EffectiveReviewDecision::Rejected)
             }
-            PublicPolicyDecision::NeedsHumanReview(_) => {
-                Self::effective_human(HumanReviewSubject::Document(run.id()), resolution)
-            }
+            PublicPolicyDecision::NeedsHumanReview(_) => Self::effective_human(
+                HumanReviewSubject::document(run),
+                HumanReviewAttempt::Document(run.id()),
+                resolution,
+            ),
         }
     }
 
@@ -317,7 +586,11 @@ impl HumanReviewResolution {
             }
             AssetReviewDisposition::NeedsHumanReview(_)
             | AssetReviewDisposition::Reviewed(AssetReviewDecision::NeedsHumanReview) => {
-                Self::effective_human(HumanReviewSubject::Asset(run.id()), resolution)
+                Self::effective_human(
+                    HumanReviewSubject::asset(run),
+                    HumanReviewAttempt::Asset(run.id()),
+                    resolution,
+                )
             }
         }
     }
@@ -327,6 +600,7 @@ impl HumanReviewResolution {
         human_store: &H,
         id: HumanReviewId,
         subject: HumanReviewSubject,
+        attempt: HumanReviewAttempt,
         needs_human_review: bool,
         decision: HumanReviewDecision,
         created_at: SystemTime,
@@ -338,10 +612,17 @@ impl HumanReviewResolution {
         H: HumanReviewStore + ?Sized,
     {
         if !needs_human_review {
-            return Err(HumanReviewResolutionError::NotPendingHumanReview(subject));
+            return Err(HumanReviewResolutionError::NotPendingHumanReview(attempt));
         }
-        let record = HumanReviewRecord::new(id, subject, decision, created_at, reviewer, note)
-            .map_err(HumanReviewResolutionError::InvalidRecord)?;
+        let record = HumanReviewRecord::new(
+            id,
+            HumanReviewBinding::Subject { subject, attempt },
+            decision,
+            created_at,
+            reviewer,
+            note,
+        )
+        .map_err(HumanReviewResolutionError::InvalidRecord)?;
         human_store
             .save(&record)
             .map_err(HumanReviewResolutionError::HumanStore)?;
@@ -351,7 +632,7 @@ impl HumanReviewResolution {
     fn without_resolutions<T, A, H>(
         runs: Vec<T>,
         human_store: &H,
-        subject: impl Fn(&T) -> HumanReviewSubject,
+        resolution: impl Fn(&T, &H) -> Result<Option<HumanReviewRecord>, H::Error>,
     ) -> Result<Vec<T>, HumanReviewResolutionError<A, H::Error>>
     where
         A: Error + Send + Sync + 'static,
@@ -359,8 +640,7 @@ impl HumanReviewResolution {
     {
         let mut pending = Vec::new();
         for run in runs {
-            if human_store
-                .get_for_subject(subject(&run))
+            if resolution(&run, human_store)
                 .map_err(HumanReviewResolutionError::HumanStore)?
                 .is_none()
             {
@@ -371,16 +651,17 @@ impl HumanReviewResolution {
     }
 
     fn effective_human(
-        expected: HumanReviewSubject,
+        subject: HumanReviewSubject,
+        attempt: HumanReviewAttempt,
         resolution: Option<&HumanReviewRecord>,
     ) -> Result<EffectiveReviewDecision, EffectiveReviewDecisionError> {
         let Some(resolution) = resolution else {
             return Ok(EffectiveReviewDecision::PendingHumanReview);
         };
-        if resolution.subject() != expected {
+        if !resolution.applies_to(&subject, attempt) {
             return Err(EffectiveReviewDecisionError {
-                expected,
-                actual: resolution.subject(),
+                expected: Box::new(HumanReviewBinding::Subject { subject, attempt }),
+                actual: Box::new(resolution.binding().clone()),
             });
         }
         Ok(match resolution.decision() {
@@ -394,8 +675,8 @@ impl HumanReviewResolution {
 pub enum HumanReviewResolutionError<A, H> {
     AutomaticStore(A),
     HumanStore(H),
-    AutomaticReviewNotFound(HumanReviewSubject),
-    NotPendingHumanReview(HumanReviewSubject),
+    AutomaticReviewNotFound(HumanReviewAttempt),
+    NotPendingHumanReview(HumanReviewAttempt),
     InvalidRecord(HumanReviewRecordError),
 }
 
@@ -408,15 +689,13 @@ impl<A: fmt::Display, H: fmt::Display> fmt::Display for HumanReviewResolutionErr
             Self::HumanStore(error) => {
                 write!(formatter, "human review persistence failed: {error}")
             }
-            Self::AutomaticReviewNotFound(subject) => {
-                write!(formatter, "automatic review does not exist: {subject:?}")
+            Self::AutomaticReviewNotFound(attempt) => {
+                write!(formatter, "automatic review does not exist: {attempt:?}")
             }
-            Self::NotPendingHumanReview(subject) => {
-                write!(
-                    formatter,
-                    "automatic review is not awaiting human review: {subject:?}"
-                )
-            }
+            Self::NotPendingHumanReview(attempt) => write!(
+                formatter,
+                "automatic review is not awaiting human review: {attempt:?}"
+            ),
             Self::InvalidRecord(error) => write!(formatter, "invalid human review record: {error}"),
         }
     }

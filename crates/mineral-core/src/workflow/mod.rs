@@ -61,9 +61,10 @@ pub use final_dependency_closure::{
     BlockedMarkdown, FinalDependencyClosureError, FinalPublicationSet, MarkdownBlockingReason,
 };
 pub use human_review::{
-    EffectiveReviewDecision, EffectiveReviewDecisionError, HumanReviewDecision, HumanReviewId,
-    HumanReviewRecord, HumanReviewRecordError, HumanReviewResolution, HumanReviewResolutionError,
-    HumanReviewStore, HumanReviewSubject,
+    EffectiveReviewDecision, EffectiveReviewDecisionError, HumanReviewAttempt, HumanReviewBinding,
+    HumanReviewDecision, HumanReviewId, HumanReviewKind, HumanReviewRecord, HumanReviewRecordError,
+    HumanReviewResolution, HumanReviewResolutionError, HumanReviewStore, HumanReviewSubject,
+    ReviewSubjectIdentity,
 };
 pub use public_policy_run::{
     MarkdownReviewEvaluator, PublicPolicyRun, PublicPolicyRunError, PublicPolicyRunFailure,

@@ -31,7 +31,7 @@ mod tests {
             ReviewerError, ReviewerReport,
         },
         source::LocalSource,
-        storage::SqliteReviewRunStore,
+        storage::{SqliteAssetReviewRunStore, SqliteHumanReviewStore, SqliteReviewRunStore},
     };
 
     use super::*;
@@ -62,6 +62,14 @@ mod tests {
 
         fn database(&self) -> PathBuf {
             self.0.join("reviews.sqlite3")
+        }
+
+        fn human_database(&self) -> PathBuf {
+            self.0.join("human-reviews.sqlite3")
+        }
+
+        fn asset_database(&self) -> PathBuf {
+            self.0.join("asset-reviews.sqlite3")
         }
     }
 
@@ -234,15 +242,20 @@ mod tests {
         .unwrap()
     }
 
-    fn execute_with_fixed_clock<R: Reviewer + ?Sized, S: ReviewRunStore + ?Sized>(
+    fn execute_with_fixed_clock<
+        R: Reviewer + ?Sized,
+        S: ReviewRunStore + ?Sized,
+        H: HumanReviewStore + ?Sized,
+    >(
         snapshot: &Snapshot,
         content_store: &LocalContentStore,
         reviewer: &R,
         review_run_store: &S,
+        human_reviews: &H,
         first_id: u64,
     ) -> Result<
         PublicPolicyRunResult,
-        PublicPolicyRunError<S::Error, SequentialReviewRunIdGeneratorError>,
+        PublicPolicyRunError<S::Error, SequentialReviewRunIdGeneratorError, H::Error>,
     > {
         let mut ids = SequentialReviewRunIdGenerator::new(ReviewRunId::new(first_id).unwrap());
         PublicPolicyRun::execute_at(
@@ -250,6 +263,7 @@ mod tests {
             content_store,
             reviewer,
             review_run_store,
+            human_reviews,
             &policy(),
             &mut ids,
             SystemTime::UNIX_EPOCH + Duration::from_secs(10),
@@ -279,8 +293,15 @@ mod tests {
         ]);
         let review_store = RecordingStore::default();
 
-        let result = execute_with_fixed_clock(&snapshot, &store, &reviewer, &review_store, 10)
-            .expect("run succeeds");
+        let result = execute_with_fixed_clock(
+            &snapshot,
+            &store,
+            &reviewer,
+            &review_store,
+            &NoHumanReviews,
+            10,
+        )
+        .expect("run succeeds");
 
         assert_eq!(result.snapshot_id(), snapshot.id());
         assert_eq!(result.private_documents().len(), 1);
@@ -335,8 +356,15 @@ mod tests {
         )]);
         let review_store = RecordingStore::default();
 
-        let result = execute_with_fixed_clock(&snapshot, &store, &reviewer, &review_store, 20)
-            .expect("reviewer failure is a policy decision, not a run failure");
+        let result = execute_with_fixed_clock(
+            &snapshot,
+            &store,
+            &reviewer,
+            &review_store,
+            &NoHumanReviews,
+            20,
+        )
+        .expect("reviewer failure is a policy decision, not a run failure");
 
         assert!(matches!(
             result.document_outcomes()[0].decision(),
@@ -345,6 +373,95 @@ mod tests {
         ));
         assert!(result.approved_markdown_paths().is_empty());
         assert_eq!(review_store.saved(), result.document_outcomes());
+    }
+
+    /// S6.5 acceptance: a provider outage asks a human, and that human's answer is
+    /// reused by every later attempt of the same content under the same policy,
+    /// without calling the provider again.
+    ///
+    /// This is the chain the old attempt-bound decision could not complete: each
+    /// re-run minted a fresh attempt identity, so the approval could never be
+    /// recognised and the provider — the very thing that was down — was asked
+    /// again on every publication.
+    #[test]
+    fn an_approved_subject_is_never_sent_to_the_provider_again() {
+        let directory = TestDirectory::new();
+        let content_store = directory.store();
+        let snapshot = snapshot_with_content(&content_store, [("article.md", b"body" as &[u8])]);
+        let documents = SqliteReviewRunStore::open(directory.database()).unwrap();
+        let human = SqliteHumanReviewStore::open(directory.human_database()).unwrap();
+        let assets = SqliteAssetReviewRunStore::open(directory.asset_database()).unwrap();
+        let reviewer = RecordingReviewer::with_responses([(
+            "article.md",
+            Err(ReviewerError::new("provider unavailable")),
+        )]);
+
+        // The provider is unavailable: the attempt records that fact, and the
+        // question is asked by a human instead.
+        let first =
+            execute_with_fixed_clock(&snapshot, &content_store, &reviewer, &documents, &human, 1)
+                .unwrap();
+        assert_eq!(reviewer.calls(), ["article.md"]);
+        let attempt = first.document_outcomes()[0].clone();
+        assert!(attempt.needs_human_review());
+        assert!(attempt.reviewer_report().is_none());
+        assert_eq!(
+            HumanReviewResolution::list_pending_documents(&documents, &human)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // The operator answers the attempt that raised the question. The decision is
+        // recorded against the reviewed content and the policy, which is what a
+        // later attempt can recognise.
+        HumanReviewResolution::resolve_document(
+            &documents,
+            &human,
+            HumanReviewId::new(1).unwrap(),
+            attempt.id(),
+            HumanReviewDecision::Approve,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(30),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(
+            HumanReviewResolution::list_pending_documents(&documents, &human)
+                .unwrap()
+                .is_empty()
+        );
+
+        // The next publication reuses the same attempt and never calls the provider,
+        // so a provider that stays down cannot block the delivery.
+        let second =
+            execute_with_fixed_clock(&snapshot, &content_store, &reviewer, &documents, &human, 2)
+                .unwrap();
+        assert_eq!(
+            reviewer.calls(),
+            ["article.md"],
+            "an approved subject must not reach the provider again"
+        );
+        assert_eq!(
+            second.document_outcomes()[0].id(),
+            attempt.id(),
+            "the durable attempt is reused rather than re-minted"
+        );
+
+        // And the delivery is no longer waiting on a human.
+        let effective = EffectiveReviewSet::build(
+            &second,
+            &AssetReviewWorkflowResult::empty(snapshot.id()),
+            &documents,
+            &assets,
+            &human,
+        )
+        .unwrap();
+        assert_eq!(
+            effective.documents()[0].decision(),
+            EffectiveDocumentDecision::Approved
+        );
+        assert!(!effective.has_pending_review());
     }
 
     #[test]
@@ -361,9 +478,15 @@ mod tests {
         let reviewer = RecordingReviewer::approving(["approved.md"]);
         let review_store = SqliteReviewRunStore::open(directory.database()).unwrap();
 
-        let result =
-            execute_with_fixed_clock(&snapshot, &content_store, &reviewer, &review_store, 25)
-                .expect("run succeeds");
+        let result = execute_with_fixed_clock(
+            &snapshot,
+            &content_store,
+            &reviewer,
+            &review_store,
+            &NoHumanReviews,
+            25,
+        )
+        .expect("run succeeds");
 
         assert_eq!(
             review_store.list_by_snapshot(snapshot.id()).unwrap(),
@@ -383,6 +506,7 @@ mod tests {
             &content_store,
             &first_reviewer,
             &review_store,
+            &NoHumanReviews,
             40,
         )
         .unwrap();
@@ -394,6 +518,7 @@ mod tests {
             &content_store,
             &second_reviewer,
             &review_store,
+            &NoHumanReviews,
             41,
         )
         .unwrap();
@@ -425,8 +550,15 @@ mod tests {
         let reviewer = RecordingReviewer::with_responses([]);
         let review_store = RecordingStore::default();
 
-        let error = execute_with_fixed_clock(&snapshot, &store, &reviewer, &review_store, 30)
-            .expect_err("analysis must fail closed");
+        let error = execute_with_fixed_clock(
+            &snapshot,
+            &store,
+            &reviewer,
+            &review_store,
+            &NoHumanReviews,
+            30,
+        )
+        .expect_err("analysis must fail closed");
 
         assert!(matches!(
             error.failure(),
@@ -456,8 +588,15 @@ mod tests {
         let reviewer = RecordingReviewer::approving(["a.md", "b.md", "c.md"]);
         let review_store = RecordingStore::failing_on(2);
 
-        let error = execute_with_fixed_clock(&snapshot, &store, &reviewer, &review_store, 100)
-            .expect_err("second save fails the run");
+        let error = execute_with_fixed_clock(
+            &snapshot,
+            &store,
+            &reviewer,
+            &review_store,
+            &NoHumanReviews,
+            100,
+        )
+        .expect_err("second save fails the run");
 
         assert!(matches!(
             error.failure(),
@@ -508,8 +647,15 @@ mod tests {
         let reviewer = RecordingReviewer::approving(["deleted.md", "public.md"]);
         let review_store = RecordingStore::default();
 
-        let result = execute_with_fixed_clock(&snapshot, &store, &reviewer, &review_store, 200)
-            .expect("CAS content remains available");
+        let result = execute_with_fixed_clock(
+            &snapshot,
+            &store,
+            &reviewer,
+            &review_store,
+            &NoHumanReviews,
+            200,
+        )
+        .expect("CAS content remains available");
 
         assert_eq!(
             reviewer.calls(),
@@ -551,8 +697,15 @@ mod tests {
         let reviewer = RecordingReviewer::with_responses([]);
         let review_store = RecordingStore::default();
 
-        let result = execute_with_fixed_clock(&snapshot, &store, &reviewer, &review_store, 300)
-            .expect("private-only snapshot completes without review");
+        let result = execute_with_fixed_clock(
+            &snapshot,
+            &store,
+            &reviewer,
+            &review_store,
+            &NoHumanReviews,
+            300,
+        )
+        .expect("private-only snapshot completes without review");
 
         assert_eq!(result.private_documents().len(), 1);
         assert!(result.document_outcomes().is_empty());

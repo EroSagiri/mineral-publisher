@@ -25,21 +25,61 @@ pub use mineral_core::workflow::{
     DeliveryProjectionWire, DeliveryProjectionWireError, EffectiveAssetReview,
     EffectiveDocumentDecision, EffectiveDocumentReview, EffectiveReviewDecision,
     EffectiveReviewDecisionError, EffectiveReviewSet, EffectiveReviewSetError,
-    FinalDependencyClosureError, FinalPublicationSet, HumanReviewDecision, HumanReviewId,
-    HumanReviewRecord, HumanReviewRecordError, HumanReviewResolution, HumanReviewResolutionError,
-    HumanReviewStore, HumanReviewSubject, ImageDimensions, ImageSanitizationFormat,
-    MAX_ASSET_REVIEW_SUMMARY_CHARS, ManagedRoot, MarkdownBlockingReason, MarkdownReviewEvaluator,
-    MockAssetReviewer, ProjectionEntry, ProjectionEntryKind, ProjectionTargetPath,
-    ProjectionTargetPathError, PublicPolicyRun, PublicPolicyRunError, PublicPolicyRunFailure,
-    PublicPolicyRunResult, PublicProjection, PublicProjectionError, PublicationFileMode,
-    PublishOperation, PublishPlan, PublishPlanError, PublishedAsset, ReviewRunIdGenerator,
-    SanitizationTransformation, SanitizedAsset, SanitizedAssetSet,
-    SequentialAssetReviewRunIdGenerator, SequentialAssetReviewRunIdGeneratorError,
-    SequentialAssetReviews, SequentialMarkdownReviews, SequentialReviewRunIdGenerator,
-    SequentialReviewRunIdGeneratorError, TextProjection, TextProjectionFile,
+    FinalDependencyClosureError, FinalPublicationSet, HumanReviewAttempt, HumanReviewBinding,
+    HumanReviewDecision, HumanReviewId, HumanReviewKind, HumanReviewRecord, HumanReviewRecordError,
+    HumanReviewResolution, HumanReviewResolutionError, HumanReviewStore, HumanReviewSubject,
+    ImageDimensions, ImageSanitizationFormat, MAX_ASSET_REVIEW_SUMMARY_CHARS, ManagedRoot,
+    MarkdownBlockingReason, MarkdownReviewEvaluator, MockAssetReviewer, ProjectionEntry,
+    ProjectionEntryKind, ProjectionTargetPath, ProjectionTargetPathError, PublicPolicyRun,
+    PublicPolicyRunError, PublicPolicyRunFailure, PublicPolicyRunResult, PublicProjection,
+    PublicProjectionError, PublicationFileMode, PublishOperation, PublishPlan, PublishPlanError,
+    PublishedAsset, ReviewRunIdGenerator, ReviewSubjectIdentity, SanitizationTransformation,
+    SanitizedAsset, SanitizedAssetSet, SequentialAssetReviewRunIdGenerator,
+    SequentialAssetReviewRunIdGeneratorError, SequentialAssetReviews, SequentialMarkdownReviews,
+    SequentialReviewRunIdGenerator, SequentialReviewRunIdGeneratorError, TextProjection,
+    TextProjectionFile,
 };
 pub use publication_application::{
     CompletedPublication, ExplicitHumanReviewSelection, PublicationApplication,
     PublicationApplicationError, PublicationApplicationOutcome, PublicationApplicationRequest,
     PublicationTrace,
 };
+
+/// A human review store with no decisions at all.
+///
+/// For runtimes that only evaluate reviewers and never consult a human decision
+/// (the reviewer calibration and smoke examples). A composition root that decides
+/// publications must bind the real store: this one answers "no decision exists" for
+/// every subject, so an approval recorded elsewhere would not be seen.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoHumanReviews;
+
+impl HumanReviewStore for NoHumanReviews {
+    type Error = std::convert::Infallible;
+
+    fn save(&self, _: &HumanReviewRecord) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn get(&self, _: HumanReviewId) -> Result<Option<HumanReviewRecord>, Self::Error> {
+        Ok(None)
+    }
+
+    fn get_for_subject(
+        &self,
+        _: &HumanReviewSubject,
+    ) -> Result<Option<HumanReviewRecord>, Self::Error> {
+        Ok(None)
+    }
+
+    fn get_for_attempt(
+        &self,
+        _: HumanReviewAttempt,
+    ) -> Result<Option<HumanReviewRecord>, Self::Error> {
+        Ok(None)
+    }
+
+    fn list(&self) -> Result<Vec<HumanReviewRecord>, Self::Error> {
+        Ok(Vec::new())
+    }
+}

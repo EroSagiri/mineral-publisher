@@ -41,8 +41,8 @@ use mineral_publisher::{
     workflow::{
         AssetDeliveryConfig, AssetReviewCandidate, AssetReviewRunId, AssetReviewRunIdGenerator,
         AssetReviewRunStore, AssetReviewer, AssetReviewerError, AssetReviewerReport,
-        ExplicitHumanReviewSelection, HumanReviewDecision, HumanReviewId, HumanReviewRecordError,
-        HumanReviewResolution, HumanReviewStore, HumanReviewSubject, PublicationApplication,
+        ExplicitHumanReviewSelection, HumanReviewAttempt, HumanReviewDecision, HumanReviewId,
+        HumanReviewRecordError, HumanReviewResolution, PublicationApplication,
         PublicationApplicationOutcome, PublicationApplicationRequest, ReviewRunIdGenerator,
     },
 };
@@ -653,14 +653,19 @@ fn review(workspace: Workspace, args: &[String]) -> Result<(), Box<dyn Error>> {
     }
 }
 
-fn parse_subject(value: &str) -> Result<HumanReviewSubject, Box<dyn Error>> {
+/// Parses the operator-facing review ID, which names one automatic attempt.
+///
+/// The ID an operator sees is the attempt they are being asked about. The decision
+/// they make is recorded against the reviewed content and policy, so approving an
+/// attempt answers every later attempt about the same subject.
+fn parse_attempt(value: &str) -> Result<HumanReviewAttempt, Box<dyn Error>> {
     let (kind, id) = value
         .split_once(':')
         .ok_or("review ID must be document:ID or asset:ID")?;
     let id: u64 = id.parse()?;
     match kind {
-        "document" => Ok(HumanReviewSubject::Document(ReviewRunId::new(id)?)),
-        "asset" => Ok(HumanReviewSubject::Asset(AssetReviewRunId::new(id)?)),
+        "document" => Ok(HumanReviewAttempt::Document(ReviewRunId::new(id)?)),
+        "asset" => Ok(HumanReviewAttempt::Asset(AssetReviewRunId::new(id)?)),
         _ => Err("review ID must be document:ID or asset:ID".into()),
     }
 }
@@ -671,9 +676,9 @@ fn show_review(
     assets: &SqliteAssetReviewRunStore,
     human: &SqliteHumanReviewStore,
 ) -> Result<(), Box<dyn Error>> {
-    let subject = parse_subject(subject)?;
-    match subject {
-        HumanReviewSubject::Document(id) => {
+    let attempt = parse_attempt(subject)?;
+    match attempt {
+        HumanReviewAttempt::Document(id) => {
             let run = documents.get(id)?.ok_or("document review not found")?;
             println!(
                 "Review\n  id: document:{}\n  subject: Markdown\n  path: {}\n  sha256: {}\n  decision: {:?}\n  contract: {} {} {}",
@@ -693,7 +698,7 @@ fn show_review(
                 );
             }
         }
-        HumanReviewSubject::Asset(id) => {
+        HumanReviewAttempt::Asset(id) => {
             let run = assets.get(id)?.ok_or("asset review not found")?;
             println!(
                 "Review\n  id: asset:{}\n  subject: Asset\n  path: {}\n  sha256: {}\n  decision: {:?}\n  contract: {} {} {}",
@@ -714,9 +719,22 @@ fn show_review(
             }
         }
     }
+    // A decision is recognised by the subject it decided about, so the question
+    // this attempt is still asking is answered by that lookup first, and by the
+    // attempt itself for a record written before subjects were bound.
+    let resolution = match attempt {
+        HumanReviewAttempt::Document(id) => {
+            let run = documents.get(id)?.ok_or("document review not found")?;
+            HumanReviewResolution::document_resolution(&run, human)?
+        }
+        HumanReviewAttempt::Asset(id) => {
+            let run = assets.get(id)?.ok_or("asset review not found")?;
+            HumanReviewResolution::asset_resolution(&run, human)?
+        }
+    };
     println!(
         "  human_resolution: {}",
-        if human.get_for_subject(subject)?.is_some() {
+        if resolution.is_some() {
             "resolved"
         } else {
             "pending"
@@ -732,8 +750,18 @@ fn resolve_review(
     assets: &SqliteAssetReviewRunStore,
     human: &SqliteHumanReviewStore,
 ) -> Result<(), Box<dyn Error>> {
-    let subject = parse_subject(subject)?;
-    if let Some(existing) = human.get_for_subject(subject)? {
+    let attempt = parse_attempt(subject)?;
+    let existing = match attempt {
+        HumanReviewAttempt::Document(id) => {
+            let run = documents.get(id)?.ok_or("document review not found")?;
+            HumanReviewResolution::document_resolution(&run, human)?
+        }
+        HumanReviewAttempt::Asset(id) => {
+            let run = assets.get(id)?.ok_or("asset review not found")?;
+            HumanReviewResolution::asset_resolution(&run, human)?
+        }
+    };
+    if let Some(existing) = existing {
         if existing.decision() == decision {
             println!("Review already {:?}.", decision);
             return Ok(());
@@ -741,8 +769,8 @@ fn resolve_review(
         return Err("review already has the opposite immutable human resolution".into());
     }
     let id = random_human_id()?;
-    match subject {
-        HumanReviewSubject::Document(run) => {
+    match attempt {
+        HumanReviewAttempt::Document(run) => {
             HumanReviewResolution::resolve_document(
                 documents,
                 human,
@@ -754,7 +782,7 @@ fn resolve_review(
                 None,
             )?;
         }
-        HumanReviewSubject::Asset(run) => {
+        HumanReviewAttempt::Asset(run) => {
             HumanReviewResolution::resolve_asset(
                 assets,
                 human,

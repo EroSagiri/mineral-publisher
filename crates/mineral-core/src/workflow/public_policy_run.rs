@@ -11,6 +11,8 @@ use crate::{
     ports::BlobStore,
 };
 
+use super::{HumanReviewKind, HumanReviewResolution, HumanReviewStore};
+
 /// Decides how a batch of review candidates is executed.
 ///
 /// The engine only needs "evaluate these candidates"; whether that happens
@@ -180,9 +182,10 @@ impl PublicPolicyRunResult {
 
 /// The stage that prevented a run from completing successfully.
 #[derive(Debug)]
-pub enum PublicPolicyRunFailure<StoreError, IdError> {
+pub enum PublicPolicyRunFailure<StoreError, IdError, HumanError> {
     MarkdownAnalysis(Vec<SnapshotMarkdownAnalysisError>),
     ReviewCacheLookup(StoreError),
+    HumanReviewLookup(HumanError),
     ReviewRunId {
         path: ContentPath,
         source: IdError,
@@ -200,23 +203,23 @@ pub enum PublicPolicyRunFailure<StoreError, IdError> {
 
 /// A failed run together with every Review Run that was saved before the failure.
 #[derive(Debug)]
-pub struct PublicPolicyRunError<StoreError, IdError> {
+pub struct PublicPolicyRunError<StoreError, IdError, HumanError> {
     partial_result: PublicPolicyRunResult,
-    failure: Box<PublicPolicyRunFailure<StoreError, IdError>>,
+    failure: Box<PublicPolicyRunFailure<StoreError, IdError, HumanError>>,
 }
 
-impl<StoreError, IdError> PublicPolicyRunError<StoreError, IdError> {
+impl<StoreError, IdError, HumanError> PublicPolicyRunError<StoreError, IdError, HumanError> {
     pub fn partial_result(&self) -> &PublicPolicyRunResult {
         &self.partial_result
     }
 
-    pub fn failure(&self) -> &PublicPolicyRunFailure<StoreError, IdError> {
+    pub fn failure(&self) -> &PublicPolicyRunFailure<StoreError, IdError, HumanError> {
         &self.failure
     }
 }
 
-impl<StoreError: fmt::Display, IdError: fmt::Display> fmt::Display
-    for PublicPolicyRunError<StoreError, IdError>
+impl<StoreError: fmt::Display, IdError: fmt::Display, HumanError: fmt::Display> fmt::Display
+    for PublicPolicyRunError<StoreError, IdError, HumanError>
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.failure.as_ref() {
@@ -225,6 +228,12 @@ impl<StoreError: fmt::Display, IdError: fmt::Display> fmt::Display
                 "public policy run failed to analyze {} Markdown document(s)",
                 failures.len()
             ),
+            PublicPolicyRunFailure::HumanReviewLookup(source) => {
+                write!(
+                    formatter,
+                    "could not look up human review decisions: {source}"
+                )
+            }
             PublicPolicyRunFailure::ReviewCacheLookup(source) => {
                 write!(
                     formatter,
@@ -250,10 +259,12 @@ impl<StoreError: fmt::Display, IdError: fmt::Display> fmt::Display
     }
 }
 
-impl<StoreError, IdError> Error for PublicPolicyRunError<StoreError, IdError>
+impl<StoreError, IdError, HumanError> Error
+    for PublicPolicyRunError<StoreError, IdError, HumanError>
 where
     StoreError: Error + Send + Sync + 'static,
     IdError: Error + Send + Sync + 'static,
+    HumanError: Error + Send + Sync + 'static,
 {
 }
 
@@ -266,20 +277,22 @@ impl PublicPolicyRun {
     /// The engine never reads a clock itself: `created_at` is the run's audit
     /// timestamp for every ReviewRun it persists, and `evaluator` decides how a
     /// batch of candidates is executed.
-    #[allow(clippy::too_many_arguments)]
-    pub fn execute_at<R, S, I, E, B>(
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    pub fn execute_at<R, S, I, E, B, H>(
         snapshot: &Snapshot,
         content_store: &B,
         reviewer: &R,
         review_run_store: &S,
+        human_reviews: &H,
         policy: &PolicyIdentity,
         id_generator: &mut I,
         created_at: SystemTime,
         evaluator: &E,
-    ) -> Result<PublicPolicyRunResult, PublicPolicyRunError<S::Error, I::Error>>
+    ) -> Result<PublicPolicyRunResult, PublicPolicyRunError<S::Error, I::Error, H::Error>>
     where
         R: Reviewer + ?Sized,
         S: ReviewRunStore + ?Sized,
+        H: HumanReviewStore + ?Sized,
         I: ReviewRunIdGenerator + ?Sized,
         E: MarkdownReviewEvaluator<R> + ?Sized,
         B: BlobStore + Clone,
@@ -322,6 +335,22 @@ impl PublicPolicyRun {
                 partial_result: result.clone(),
                 failure: Box::new(PublicPolicyRunFailure::ReviewCacheLookup(source)),
             })?;
+        // A subject a human already decided is a final answer: the provider is not
+        // asked about it again, whatever the previous attempt recorded. That is what
+        // lets an approval survive the re-run after a provider outage instead of
+        // being invalidated by the next failed attempt.
+        let human_answered = HumanReviewResolution::answered_paths(
+            human_reviews,
+            HumanReviewKind::Document,
+            policy,
+            candidates
+                .iter()
+                .map(|candidate| (candidate.path(), candidate.analysis().file().sha256())),
+        )
+        .map_err(|source| PublicPolicyRunError {
+            partial_result: result.clone(),
+            failure: Box::new(PublicPolicyRunFailure::HumanReviewLookup(source)),
+        })?;
 
         if !evaluator.is_bounded() {
             for candidate in candidates {
@@ -332,7 +361,8 @@ impl PublicPolicyRun {
                         run.content_path() == candidate.path()
                             && run.content_sha256() == candidate.analysis().file().sha256()
                             && run.policy() == policy
-                            && run.reviewer_report().is_some()
+                            && (run.reviewer_report().is_some()
+                                || human_answered.contains(candidate.path()))
                     })
                 {
                     result.document_outcomes.push(previous.clone());
@@ -393,7 +423,8 @@ impl PublicPolicyRun {
                     run.content_path() == candidate.path()
                         && run.content_sha256() == candidate.analysis().file().sha256()
                         && run.policy() == policy
-                        && run.reviewer_report().is_some()
+                        && (run.reviewer_report().is_some()
+                            || human_answered.contains(candidate.path()))
                 })
             {
                 reused.insert(candidate.path().clone(), previous.clone());

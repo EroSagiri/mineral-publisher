@@ -458,16 +458,34 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["asset-1.png"]
         );
+        // Each decision is recorded against the subject it decided about, and the
+        // attempt that raised the question stays in the audit trail.
         assert_eq!(
             human
                 .list()
                 .unwrap()
                 .iter()
-                .map(|record| record.subject())
+                .map(|record| record.subject().unwrap().content_path().as_str())
                 .collect::<Vec<_>>(),
-            [
-                HumanReviewSubject::Asset(AssetReviewRunId::new(2).unwrap()),
-                HumanReviewSubject::Document(ReviewRunId::new(2).unwrap()),
+            ["asset-2.png", "document-2.md"]
+        );
+        // `list` orders by subject kind (`asset` before `document`).
+        assert_eq!(
+            human
+                .list()
+                .unwrap()
+                .iter()
+                .map(|record| record.binding().clone())
+                .collect::<Vec<_>>(),
+            vec![
+                HumanReviewBinding::Subject {
+                    subject: HumanReviewSubject::asset(&asset_runs[0]),
+                    attempt: HumanReviewAttempt::Asset(asset_runs[0].id()),
+                },
+                HumanReviewBinding::Subject {
+                    subject: HumanReviewSubject::document(&document_runs[2]),
+                    attempt: HumanReviewAttempt::Document(document_runs[2].id()),
+                },
             ]
         );
     }
@@ -491,16 +509,26 @@ mod tests {
         .unwrap_err();
         assert!(matches!(
             missing,
-            HumanReviewResolutionError::AutomaticReviewNotFound(HumanReviewSubject::Document(_))
+            HumanReviewResolutionError::AutomaticReviewNotFound(HumanReviewAttempt::Document(_))
         ));
 
         let run = document_run(
             1,
             PublicPolicyDecision::NeedsHumanReview(HumanReviewReason::ReviewerRequested),
         );
+        // A decision about another subject does not answer this question, even when
+        // it was raised by the same attempt id.
         let wrong = HumanReviewRecord::rehydrate(
             HumanReviewId::new(2).unwrap(),
-            HumanReviewSubject::Asset(AssetReviewRunId::new(1).unwrap()),
+            HumanReviewBinding::Subject {
+                subject: HumanReviewSubject::for_path(
+                    HumanReviewKind::Asset,
+                    path("asset-1.png"),
+                    Sha256::new([4; 32]),
+                    PolicyIdentity::new("asset", "v1", Sha256::new([2; 32])).unwrap(),
+                ),
+                attempt: HumanReviewAttempt::Document(run.id()),
+            },
             HumanReviewDecision::Approve,
             9_001,
             None,
@@ -514,6 +542,99 @@ mod tests {
         );
     }
 
+    /// S6.5 durability: the upgrade from the attempt-bound schema changes no fact.
+    ///
+    /// A record written before subjects were bound decided about one attempt. It
+    /// keeps exactly that meaning: it is readable, it answers the attempt it named,
+    /// and it is never widened to a subject its author never saw.
+    #[test]
+    fn a_legacy_attempt_bound_record_survives_the_schema_upgrade() {
+        let directory = TestDirectory::new();
+        let database = directory.database("human.sqlite3");
+        let run = document_run(
+            7,
+            PublicPolicyDecision::NeedsHumanReview(HumanReviewReason::ReviewerRequested),
+        );
+        {
+            // The version 1 schema and one row, exactly as the previous engine wrote
+            // them.
+            let connection = rusqlite::Connection::open(&database).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE human_review_records (
+                         id INTEGER PRIMARY KEY CHECK (id > 0),
+                         subject_kind TEXT NOT NULL CHECK (subject_kind IN ('document', 'asset')),
+                         subject_run_id INTEGER NOT NULL CHECK (subject_run_id > 0),
+                         decision TEXT NOT NULL CHECK (decision IN ('approve', 'reject')),
+                         created_at_unix_ms INTEGER NOT NULL CHECK (created_at_unix_ms >= 0),
+                         reviewer TEXT CHECK (reviewer IS NULL OR length(trim(reviewer)) > 0),
+                         note TEXT,
+                         UNIQUE(subject_kind, subject_run_id)
+                     );
+                     PRAGMA user_version = 1;",
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO human_review_records (
+                         id, subject_kind, subject_run_id, decision, created_at_unix_ms
+                     ) VALUES (1, 'document', 7, 'approve', 1000)",
+                    [],
+                )
+                .unwrap();
+        }
+
+        let human = SqliteHumanReviewStore::open(&database).unwrap();
+        let version: i64 = rusqlite::Connection::open(&database)
+            .unwrap()
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 2, "the schema is upgraded in place");
+
+        let record = human.get(HumanReviewId::new(1).unwrap()).unwrap().unwrap();
+        assert_eq!(
+            record.binding(),
+            &HumanReviewBinding::AttemptOnly(HumanReviewAttempt::Document(run.id()))
+        );
+        assert!(record.subject().is_none());
+        assert_eq!(
+            HumanReviewResolution::document_resolution(&run, &human).unwrap(),
+            Some(record)
+        );
+
+        // The same content under the same policy, reviewed again: the old decision is
+        // not silently treated as an answer to a question its author never saw.
+        let other_attempt = ReviewRun::rehydrate(
+            ReviewRunId::new(8).unwrap(),
+            run.snapshot_id(),
+            run.content_path().clone(),
+            run.content_sha256(),
+            run.policy().clone(),
+            (
+                PublicPolicyDecision::NeedsHumanReview(HumanReviewReason::ReviewerRequested),
+                None,
+            ),
+            1_008,
+        );
+        assert!(
+            human
+                .get_for_subject(&HumanReviewSubject::document(&other_attempt))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            HumanReviewResolution::document_resolution(&other_attempt, &human)
+                .unwrap()
+                .is_none()
+        );
+        // Nothing is pending in an automatic store that holds no runs, and listing
+        // a legacy record never fails the lookup.
+        let documents =
+            SqliteReviewRunStore::open(directory.database("documents.sqlite3")).unwrap();
+        let pending = HumanReviewResolution::list_pending_documents(&documents, &human).unwrap();
+        assert!(pending.is_empty());
+    }
+
     #[test]
     fn invalid_record_fields_are_rejected() {
         assert_eq!(
@@ -522,7 +643,15 @@ mod tests {
         );
         let result = HumanReviewRecord::new(
             HumanReviewId::new(1).unwrap(),
-            HumanReviewSubject::Document(ReviewRunId::new(1).unwrap()),
+            HumanReviewBinding::Subject {
+                subject: HumanReviewSubject::for_path(
+                    HumanReviewKind::Document,
+                    path("document-1.md"),
+                    Sha256::new([1; 32]),
+                    PolicyIdentity::new("public", "v1", Sha256::new([1; 32])).unwrap(),
+                ),
+                attempt: HumanReviewAttempt::Document(ReviewRunId::new(1).unwrap()),
+            },
             HumanReviewDecision::Approve,
             SystemTime::UNIX_EPOCH - Duration::from_millis(1),
             Some("   ".to_owned()),

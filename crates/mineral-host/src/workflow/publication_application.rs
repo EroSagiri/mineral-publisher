@@ -1,6 +1,5 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    convert::Infallible,
     error::Error,
     fmt,
     path::Path,
@@ -25,9 +24,9 @@ use super::{
     AssetDeliveryConfig, AssetProgramCheck, AssetReviewEvaluator, AssetReviewRunIdGenerator,
     AssetReviewRunStore, AssetReviewWorkflow, AssetReviewWorkflowInput, AssetReviewWorkflowResult,
     AssetReviewer, AssetSanitizer, CandidateAssetSet, DeliveryProjectionStore, EffectiveReviewSet,
-    FinalPublicationSet, HumanReviewRecord, HumanReviewStore, HumanReviewSubject, ManagedRoot,
-    MarkdownReviewEvaluator, PublicPolicyRun, PublicPolicyRunResult, PublicProjection,
-    ReviewRunIdGenerator,
+    FinalPublicationSet, HumanReviewAttempt, HumanReviewBinding, HumanReviewKind,
+    HumanReviewRecord, HumanReviewStore, HumanReviewSubject, ManagedRoot, MarkdownReviewEvaluator,
+    PublicPolicyRun, PublicPolicyRunResult, PublicProjection, ReviewRunIdGenerator,
 };
 
 /// Caller-selected, durable human decisions.  The application never discovers
@@ -124,9 +123,11 @@ pub enum PublicationApplicationError {
         stage: &'static str,
         source: Box<dyn Error>,
     },
-    DuplicateHumanReviewSelection(HumanReviewSubject),
-    HumanReviewNotPersisted(HumanReviewSubject),
-    IrrelevantHumanReviewSelection(HumanReviewSubject),
+    /// Boxed: a binding carries the whole reviewed subject, and this error is
+    /// returned by every publication entry point.
+    DuplicateHumanReviewSelection(Box<HumanReviewBinding>),
+    HumanReviewNotPersisted(Box<HumanReviewBinding>),
+    IrrelevantHumanReviewSelection(Box<HumanReviewBinding>),
     MissingDependencyGraph,
 }
 impl fmt::Display for PublicationApplicationError {
@@ -222,18 +223,30 @@ impl PublicationApplication {
             content_store,
             markdown_reviewer,
             document_runs,
+            human_store,
             request.markdown_policy,
             document_ids,
             created_at,
             markdown_evaluator,
         )
         .map_err(|e| stage("markdown review", e))?;
-        let selected =
-            SelectedReviews::validate(&request.human_reviews, human_store, &documents, None)?;
+        validate_explicit_selection(
+            &request.human_reviews,
+            human_store,
+            &documents,
+            None,
+            request.snapshot,
+            request.asset_policy,
+        )?;
         let no_assets = AssetReviewWorkflowResult::empty(request.snapshot.id());
-        let document_effective =
-            EffectiveReviewSet::build(&documents, &no_assets, document_runs, asset_runs, &selected)
-                .map_err(|e| stage("Markdown human resolution", e))?;
+        let document_effective = EffectiveReviewSet::build(
+            &documents,
+            &no_assets,
+            document_runs,
+            asset_runs,
+            human_store,
+        )
+        .map_err(|e| stage("Markdown human resolution", e))?;
         if document_effective.has_pending_review() {
             return Ok(PublicationApplicationOutcome::NeedsHumanReview {
                 trace: PublicationTrace {
@@ -259,19 +272,22 @@ impl PublicationApplication {
             ),
             asset_reviewer,
             asset_runs,
+            human_store,
             asset_ids,
             created_at,
             asset_evaluator,
         )
         .map_err(|e| stage("asset review", e))?;
-        let selected = SelectedReviews::validate(
+        validate_explicit_selection(
             &request.human_reviews,
             human_store,
             &documents,
             Some(&assets),
+            request.snapshot,
+            request.asset_policy,
         )?;
         let effective =
-            EffectiveReviewSet::build(&documents, &assets, document_runs, asset_runs, &selected)
+            EffectiveReviewSet::build(&documents, &assets, document_runs, asset_runs, human_store)
                 .map_err(|e| stage("effective review selection", e))?;
         let trace = PublicationTrace {
             snapshot: request.snapshot.clone(),
@@ -339,90 +355,83 @@ fn stage(stage: &'static str, source: impl Error + 'static) -> PublicationApplic
     }
 }
 
-struct SelectedReviews {
-    records: BTreeMap<HumanReviewSubject, HumanReviewRecord>,
-}
-impl SelectedReviews {
-    fn validate<H: HumanReviewStore + ?Sized>(
-        selection: &ExplicitHumanReviewSelection,
-        store: &H,
-        documents: &PublicPolicyRunResult,
-        assets: Option<&AssetReviewWorkflowResult>,
-    ) -> Result<Self, PublicationApplicationError> {
-        let valid = documents
-            .document_outcomes()
-            .iter()
-            .map(|run| HumanReviewSubject::Document(run.id()))
-            .chain(assets.into_iter().flat_map(|items| {
-                items
-                    .entries()
+/// Validates an explicit human-review selection against the runs of this attempt.
+///
+/// Durable decisions are found by the subject they decided about, so this is only
+/// an assertion for callers that hand in records explicitly: every selected record
+/// must answer a review this attempt actually produced, must not repeat another
+/// selection, and must already be persisted exactly as given. A record written
+/// before subjects were bound answers the attempt it named, and is matched that way.
+fn validate_explicit_selection<H: HumanReviewStore + ?Sized>(
+    selection: &ExplicitHumanReviewSelection,
+    store: &H,
+    documents: &PublicPolicyRunResult,
+    assets: Option<&AssetReviewWorkflowResult>,
+    snapshot: &Snapshot,
+    asset_policy: &PolicyIdentity,
+) -> Result<(), PublicationApplicationError> {
+    let valid_subjects = documents
+        .document_outcomes()
+        .iter()
+        .map(HumanReviewSubject::document)
+        .chain(assets.into_iter().flat_map(|items| {
+            items.entries().iter().filter_map(|entry| {
+                let file = snapshot
+                    .files()
                     .iter()
-                    .map(|entry| HumanReviewSubject::Asset(entry.review_run_id()))
-            }))
-            .collect::<BTreeSet<_>>();
-        let mut records = BTreeMap::new();
-        // Durable human resolutions are keyed by the exact automatic review
-        // subject, so discovering them is safe and is the normal CLI path.
-        // Explicit selections remain supported for callers that want an
-        // additional assertion about which records are being used.
-        for subject in &valid {
-            if let Some(record) = store
-                .get_for_subject(*subject)
-                .map_err(|e| stage("human review lookup", e))?
-            {
-                records.insert(*subject, record);
-            }
+                    .find(|file| file.path() == entry.content_path())?;
+                Some(HumanReviewSubject::for_path(
+                    HumanReviewKind::Asset,
+                    entry.content_path().clone(),
+                    file.sha256(),
+                    asset_policy.clone(),
+                ))
+            })
+        }))
+        .collect::<BTreeSet<_>>();
+    let valid_attempts = documents
+        .document_outcomes()
+        .iter()
+        .map(|run| HumanReviewAttempt::Document(run.id()))
+        .chain(assets.into_iter().flat_map(|items| {
+            items
+                .entries()
+                .iter()
+                .map(|entry| HumanReviewAttempt::Asset(entry.review_run_id()))
+        }))
+        .collect::<BTreeSet<_>>();
+
+    let mut seen: BTreeMap<HumanReviewBinding, u64> = BTreeMap::new();
+    for record in selection.records() {
+        let binding = record.binding().clone();
+        let relevant = match &binding {
+            HumanReviewBinding::Subject { subject, .. } => valid_subjects.contains(subject),
+            HumanReviewBinding::AttemptOnly(attempt) => valid_attempts.contains(attempt),
+        };
+        if !relevant {
+            return Err(PublicationApplicationError::IrrelevantHumanReviewSelection(
+                Box::new(binding),
+            ));
         }
-        for record in selection.records() {
-            let subject = record.subject();
-            if !valid.contains(&subject) {
-                return Err(PublicationApplicationError::IrrelevantHumanReviewSelection(
-                    subject,
+        if let Some(existing) = seen.get(&binding)
+            && *existing != record.id().get()
+        {
+            return Err(PublicationApplicationError::DuplicateHumanReviewSelection(
+                Box::new(binding),
+            ));
+        }
+        seen.insert(binding.clone(), record.id().get());
+        match store
+            .get(record.id())
+            .map_err(|e| stage("human review lookup", e))?
+        {
+            Some(saved) if saved == *record => {}
+            _ => {
+                return Err(PublicationApplicationError::HumanReviewNotPersisted(
+                    Box::new(binding),
                 ));
             }
-            if let Some(existing) = records.get(&subject) {
-                if existing != record {
-                    return Err(PublicationApplicationError::DuplicateHumanReviewSelection(
-                        subject,
-                    ));
-                }
-            } else {
-                records.insert(subject, record.clone());
-            }
-            match store
-                .get(record.id())
-                .map_err(|e| stage("human review lookup", e))?
-            {
-                Some(saved) if saved == *record => {}
-                _ => {
-                    return Err(PublicationApplicationError::HumanReviewNotPersisted(
-                        subject,
-                    ));
-                }
-            }
         }
-        Ok(Self { records })
     }
-}
-impl HumanReviewStore for SelectedReviews {
-    type Error = Infallible;
-    fn save(&self, _: &HumanReviewRecord) -> Result<(), Self::Error> {
-        Ok(())
-    }
-    fn get(&self, id: super::HumanReviewId) -> Result<Option<HumanReviewRecord>, Self::Error> {
-        Ok(self
-            .records
-            .values()
-            .find(|record| record.id() == id)
-            .cloned())
-    }
-    fn get_for_subject(
-        &self,
-        subject: HumanReviewSubject,
-    ) -> Result<Option<HumanReviewRecord>, Self::Error> {
-        Ok(self.records.get(&subject).cloned())
-    }
-    fn list(&self) -> Result<Vec<HumanReviewRecord>, Self::Error> {
-        Ok(self.records.values().cloned().collect())
-    }
+    Ok(())
 }

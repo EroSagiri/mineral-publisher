@@ -21,9 +21,9 @@ use mineral_publisher::{
     storage::{LocalContentStore, SqliteAssetReviewRunStore, SqliteReviewRunStore},
     workflow::{
         AssetHumanReviewReason, AssetProgramCheck, AssetReviewDisposition, AssetReviewRunId,
-        AssetReviewWorkflow, AssetReviewWorkflowInput, CandidateAssetSet, PublicPolicyRun,
-        SequentialAssetReviewRunIdGenerator, SequentialAssetReviews, SequentialMarkdownReviews,
-        SequentialReviewRunIdGenerator,
+        AssetReviewWorkflow, AssetReviewWorkflowInput, CandidateAssetSet, NoHumanReviews,
+        PublicPolicyRun, SequentialAssetReviewRunIdGenerator, SequentialAssetReviews,
+        SequentialMarkdownReviews, SequentialReviewRunIdGenerator,
     },
 };
 
@@ -71,6 +71,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         &content_store,
         &markdown_reviewer,
         &markdown_store,
+        &NoHumanReviews,
         &markdown_policy,
         &mut markdown_ids,
         SystemTime::now(),
@@ -108,6 +109,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         ),
         &reviewer,
         &store,
+        &NoHumanReviews,
         &mut ids,
         SystemTime::now(),
         &SequentialAssetReviews,

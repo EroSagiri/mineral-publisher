@@ -8,18 +8,20 @@ use crate::{
 use super::{
     AssetInspector, AssetPolicy, AssetReviewEvaluator, AssetReviewRun, AssetReviewRunError,
     AssetReviewRunId, AssetReviewRunIdGenerator, AssetReviewRunStore, AssetReviewWorkflowEntry,
-    AssetReviewWorkflowResult, AssetReviewer, CandidateAssetSet,
+    AssetReviewWorkflowResult, AssetReviewer, CandidateAssetSet, HumanReviewKind,
+    HumanReviewResolution, HumanReviewStore,
 };
 
 /// The boundary that stopped a workflow before it had a complete durable result.
 #[derive(Debug)]
-pub enum AssetReviewWorkflowFailure<StoreError, IdError, CheckError> {
+pub enum AssetReviewWorkflowFailure<StoreError, IdError, CheckError, HumanError> {
     SnapshotMismatch {
         candidate_snapshot_id: SnapshotId,
         snapshot_id: SnapshotId,
     },
     ProgramCheck(CheckError),
     ReviewCacheLookup(StoreError),
+    HumanReviewLookup(HumanError),
     ReviewRunId {
         path: ContentPath,
         source: IdError,
@@ -37,23 +39,31 @@ pub enum AssetReviewWorkflowFailure<StoreError, IdError, CheckError> {
 
 /// A failure together with the durable prefix already saved before it.
 #[derive(Debug)]
-pub struct AssetReviewWorkflowError<StoreError, IdError, CheckError> {
+pub struct AssetReviewWorkflowError<StoreError, IdError, CheckError, HumanError> {
     partial_result: AssetReviewWorkflowResult,
-    failure: Box<AssetReviewWorkflowFailure<StoreError, IdError, CheckError>>,
+    failure: Box<AssetReviewWorkflowFailure<StoreError, IdError, CheckError, HumanError>>,
 }
 
-impl<StoreError, IdError, CheckError> AssetReviewWorkflowError<StoreError, IdError, CheckError> {
+impl<StoreError, IdError, CheckError, HumanError>
+    AssetReviewWorkflowError<StoreError, IdError, CheckError, HumanError>
+{
     pub fn partial_result(&self) -> &AssetReviewWorkflowResult {
         &self.partial_result
     }
 
-    pub fn failure(&self) -> &AssetReviewWorkflowFailure<StoreError, IdError, CheckError> {
+    pub fn failure(
+        &self,
+    ) -> &AssetReviewWorkflowFailure<StoreError, IdError, CheckError, HumanError> {
         &self.failure
     }
 }
 
-impl<StoreError: fmt::Display, IdError: fmt::Display, CheckError: fmt::Display> fmt::Display
-    for AssetReviewWorkflowError<StoreError, IdError, CheckError>
+impl<
+    StoreError: fmt::Display,
+    IdError: fmt::Display,
+    CheckError: fmt::Display,
+    HumanError: fmt::Display,
+> fmt::Display for AssetReviewWorkflowError<StoreError, IdError, CheckError, HumanError>
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.failure.as_ref() {
@@ -67,6 +77,12 @@ impl<StoreError: fmt::Display, IdError: fmt::Display, CheckError: fmt::Display> 
                 write!(
                     formatter,
                     "could not look up reusable Asset ReviewResults: {source}"
+                )
+            }
+            AssetReviewWorkflowFailure::HumanReviewLookup(source) => {
+                write!(
+                    formatter,
+                    "could not look up human review decisions: {source}"
                 )
             }
             AssetReviewWorkflowFailure::ReviewRunId { path, source } => {
@@ -91,12 +107,13 @@ impl<StoreError: fmt::Display, IdError: fmt::Display, CheckError: fmt::Display> 
     }
 }
 
-impl<StoreError, IdError, CheckError> Error
-    for AssetReviewWorkflowError<StoreError, IdError, CheckError>
+impl<StoreError, IdError, CheckError, HumanError> Error
+    for AssetReviewWorkflowError<StoreError, IdError, CheckError, HumanError>
 where
     StoreError: Error + Send + Sync + 'static,
     IdError: Error + Send + Sync + 'static,
     CheckError: Error + Send + Sync + 'static,
+    HumanError: Error + Send + Sync + 'static,
 {
 }
 
@@ -137,17 +154,22 @@ impl AssetReviewWorkflow {
     /// timestamp for every AssetReviewRun it persists, and `evaluator` decides
     /// how a batch of reviewed assets is executed.
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
-    pub fn execute_at<R, S, I, E, C>(
+    pub fn execute_at<R, S, I, E, C, H>(
         input: AssetReviewWorkflowInput<'_, C>,
         reviewer: &R,
         review_run_store: &S,
+        human_reviews: &H,
         id_generator: &mut I,
         created_at: SystemTime,
         evaluator: &E,
-    ) -> Result<AssetReviewWorkflowResult, AssetReviewWorkflowError<S::Error, I::Error, C::Error>>
+    ) -> Result<
+        AssetReviewWorkflowResult,
+        AssetReviewWorkflowError<S::Error, I::Error, C::Error, H::Error>,
+    >
     where
         R: AssetReviewer + ?Sized,
         S: AssetReviewRunStore + ?Sized,
+        H: HumanReviewStore + ?Sized,
         I: AssetReviewRunIdGenerator + ?Sized,
         E: AssetReviewEvaluator<R> + ?Sized,
         C: AssetInspector,
@@ -178,6 +200,22 @@ impl AssetReviewWorkflow {
                 partial_result: result.clone(),
                 failure: Box::new(AssetReviewWorkflowFailure::ReviewCacheLookup(source)),
             })?;
+        // A subject a human already decided is a final answer: the provider is not
+        // asked about it again, whatever the previous attempt recorded.
+        let human_answered = HumanReviewResolution::answered_paths(
+            human_reviews,
+            HumanReviewKind::Asset,
+            input.policy,
+            input
+                .snapshot
+                .files()
+                .iter()
+                .map(|file| (file.path(), file.sha256())),
+        )
+        .map_err(|source| AssetReviewWorkflowError {
+            partial_result: result.clone(),
+            failure: Box::new(AssetReviewWorkflowFailure::HumanReviewLookup(source)),
+        })?;
 
         if !evaluator.is_bounded() {
             for policy_outcome in policy_result.outcomes() {
@@ -191,7 +229,9 @@ impl AssetReviewWorkflow {
                     run.content_path() == policy_outcome.path()
                         && current_sha256.is_some_and(|sha| sha == run.content_sha256())
                         && run.policy() == input.policy
-                        && (!run.reviewer_was_called() || run.outcome().reviewer_report().is_some())
+                        && (!run.reviewer_was_called()
+                            || run.outcome().reviewer_report().is_some()
+                            || human_answered.contains(policy_outcome.path()))
                 }) {
                     result.push_entry(AssetReviewWorkflowEntry::from_parts(
                         previous.content_path().clone(),
@@ -253,7 +293,9 @@ impl AssetReviewWorkflow {
                 run.content_path() == policy_outcome.path()
                     && current_sha256.is_some_and(|sha| sha == run.content_sha256())
                     && run.policy() == input.policy
-                    && (!run.reviewer_was_called() || run.outcome().reviewer_report().is_some())
+                    && (!run.reviewer_was_called()
+                        || run.outcome().reviewer_report().is_some()
+                        || human_answered.contains(policy_outcome.path()))
             }) {
                 reused.insert(policy_outcome.path().clone(), previous.clone());
             } else {
@@ -345,12 +387,15 @@ mod tests {
     };
 
     use super::*;
-    use crate::storage::LocalContentStore;
+    use crate::storage::{LocalContentStore, SqliteHumanReviewStore, SqliteReviewRunStore};
+    use crate::workflow::NoHumanReviews;
     use crate::workflow::{
         AssetProgramCheck, AssetProgramCheckError, AssetReviewDecision, AssetReviewDisposition,
-        SequentialAssetReviewRunIdGenerator, SequentialAssetReviewRunIdGeneratorError,
-        SequentialAssetReviews,
+        EffectiveReviewDecision, EffectiveReviewSet, HumanReviewDecision, HumanReviewId,
+        PublicPolicyRunResult, SequentialAssetReviewRunIdGenerator,
+        SequentialAssetReviewRunIdGeneratorError, SequentialAssetReviews,
     };
+    use std::convert::Infallible;
 
     static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(1);
 
@@ -580,6 +625,7 @@ mod tests {
             TestStoreError,
             SequentialAssetReviewRunIdGeneratorError,
             AssetProgramCheckError,
+            Infallible,
         >,
     > {
         let mut ids =
@@ -589,6 +635,44 @@ mod tests {
             AssetReviewWorkflowInput::new(candidates, snapshot, &inspector, &policy()),
             reviewer,
             run_store,
+            &NoHumanReviews,
+            &mut ids,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(20),
+            &SequentialAssetReviews,
+        )
+    }
+
+    /// The same workflow, with the human decisions the runtime actually holds.
+    #[allow(clippy::too_many_arguments)]
+    fn execute_with_human<S, H>(
+        candidates: &CandidateAssetSet,
+        snapshot: &Snapshot,
+        store: &LocalContentStore,
+        reviewer: &RecordingReviewer,
+        run_store: &S,
+        human_reviews: &H,
+        first_id: u64,
+    ) -> Result<
+        AssetReviewWorkflowResult,
+        AssetReviewWorkflowError<
+            S::Error,
+            SequentialAssetReviewRunIdGeneratorError,
+            AssetProgramCheckError,
+            H::Error,
+        >,
+    >
+    where
+        S: AssetReviewRunStore + ?Sized,
+        H: HumanReviewStore + ?Sized,
+    {
+        let mut ids =
+            SequentialAssetReviewRunIdGenerator::new(AssetReviewRunId::new(first_id).unwrap());
+        let inspector = AssetProgramCheck::new(store.clone());
+        AssetReviewWorkflow::execute_at(
+            AssetReviewWorkflowInput::new(candidates, snapshot, &inspector, &policy()),
+            reviewer,
+            run_store,
+            human_reviews,
             &mut ids,
             SystemTime::UNIX_EPOCH + Duration::from_secs(20),
             &SequentialAssetReviews,
@@ -616,6 +700,97 @@ mod tests {
         assert_eq!(
             run_store.saved()[0].outcome(),
             result.entries()[0].outcome()
+        );
+    }
+
+    /// S6.5: an approved asset subject is never sent to the visual provider again.
+    ///
+    /// The asset side had the same defect as the document side: a failed attempt was
+    /// re-executed on every publication, and the human approval was bound to the
+    /// attempt that no longer existed.
+    #[test]
+    fn an_approved_asset_is_never_sent_to_the_provider_again() {
+        let directory = TestDirectory::new();
+        let store = directory.store();
+        let snapshot = snapshot(&store, [("clean.png", png())]);
+        let candidates = candidates(snapshot.id(), [("clean.png", vec!["article.md"])]);
+        let reviewer = RecordingReviewer::with_responses([(
+            path("clean.png"),
+            Err(super::super::AssetReviewerError::new(
+                "provider unavailable",
+            )),
+        )]);
+        let run_store = RecordingStore::default();
+        let human = SqliteHumanReviewStore::open(":memory:").unwrap();
+        let documents = SqliteReviewRunStore::open(":memory:").unwrap();
+
+        let first = execute_with_human(
+            &candidates,
+            &snapshot,
+            &store,
+            &reviewer,
+            &run_store,
+            &human,
+            30,
+        )
+        .unwrap();
+        assert_eq!(reviewer.calls(), [path("clean.png")]);
+        let entry = first.entries()[0].clone();
+        assert!(matches!(
+            entry.outcome().disposition(),
+            AssetReviewDisposition::NeedsHumanReview(_)
+        ));
+        assert_eq!(
+            HumanReviewResolution::list_pending_assets(&run_store, &human)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        HumanReviewResolution::resolve_asset(
+            &run_store,
+            &human,
+            HumanReviewId::new(1).unwrap(),
+            entry.review_run_id(),
+            HumanReviewDecision::Approve,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(25),
+            None,
+            None,
+        )
+        .unwrap();
+
+        let second = execute_with_human(
+            &candidates,
+            &snapshot,
+            &store,
+            &reviewer,
+            &run_store,
+            &human,
+            31,
+        )
+        .unwrap();
+        assert_eq!(
+            reviewer.calls(),
+            [path("clean.png")],
+            "an approved asset must not reach the provider again"
+        );
+        assert_eq!(
+            second.entries()[0].review_run_id(),
+            entry.review_run_id(),
+            "the durable attempt is reused rather than re-minted"
+        );
+
+        let effective = EffectiveReviewSet::build(
+            &PublicPolicyRunResult::from_document_outcomes_for_test(snapshot.id(), Vec::new()),
+            &second,
+            &documents,
+            &run_store,
+            &human,
+        )
+        .unwrap();
+        assert_eq!(
+            effective.assets()[0].decision(),
+            EffectiveReviewDecision::Approved
         );
     }
 
@@ -840,6 +1015,7 @@ mod tests {
             ),
             &reviewer,
             &sqlite,
+            &NoHumanReviews,
             &mut ids,
             SystemTime::now(),
             &SequentialAssetReviews,
