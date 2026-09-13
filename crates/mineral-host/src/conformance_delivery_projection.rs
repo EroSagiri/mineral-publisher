@@ -14,6 +14,10 @@ use std::{
 };
 
 use crate::{
+    asset::{
+        AssetObservationId, AssetObservationStore, AssetTarget, FilesystemAssetTarget,
+        SequentialAssetObservationIdGenerator,
+    },
     domain::{ContentPath, Sha256, Snapshot, SnapshotFile, SnapshotId, SourceId, TimestampMillis},
     publisher::{
         DeliveryProjectionBinding, GitCommitObjectCreator, GitCommitOid, GitCommitSpec,
@@ -23,8 +27,8 @@ use crate::{
         SequentialRemoteObservationIdGenerator,
     },
     storage::{
-        LocalContentStore, SqliteDeliveryProjectionStore, SqlitePublishRunStore,
-        SqliteRemoteObservationStore,
+        LocalContentStore, SqliteAssetObservationStore, SqliteDeliveryProjectionStore,
+        SqlitePublishRunStore, SqliteRemoteObservationStore,
     },
     workflow::{
         AssetContentType, AssetDeliveryConfig, AssetReviewRunId, DeliveryProjection,
@@ -225,6 +229,10 @@ impl Drop for TestRepository {
 
 fn config() -> AssetDeliveryConfig {
     AssetDeliveryConfig::new("https://assets.example.com").unwrap()
+}
+
+fn asset_target(repository: &TestRepository) -> FilesystemAssetTarget {
+    FilesystemAssetTarget::new(repository.path.join("asset-target"))
 }
 
 fn png_content_type() -> AssetContentType {
@@ -528,12 +536,20 @@ fn a_runtime_that_lost_its_objects_republishes_from_the_durable_projection() {
 
     let observations =
         SqliteRemoteObservationStore::open(repository.path.join("observations.sqlite")).unwrap();
+    let asset_observations =
+        SqliteAssetObservationStore::open(repository.path.join("asset-observations.sqlite"))
+            .unwrap();
     let mut observation_ids =
         SequentialRemoteObservationIdGenerator::new(RemoteObservationId::new(1).unwrap());
+    let mut asset_observation_ids =
+        SequentialAssetObservationIdGenerator::new(AssetObservationId::new(1).unwrap());
     let execution = GitPublicationApplication::resume(
         run.id(),
         &runs,
         &deliveries,
+        &asset_target(&repository),
+        &asset_observations,
+        &mut asset_observation_ids,
         &observations,
         &mut observation_ids,
         &repository.store,
@@ -568,6 +584,154 @@ fn a_runtime_that_lost_its_objects_republishes_from_the_durable_projection() {
     assert_eq!(
         deliveries.get(delivery.delivery_sha256()).unwrap(),
         Some(delivery)
+    );
+}
+
+/// §3/§10: the exact Git compare-and-swap may not happen until every required
+/// asset is verified on the asset target, proven against a real repository, a real
+/// filesystem object target, real SQLite stores, and the real CAS.
+#[test]
+fn a_broken_asset_keeps_a_real_publication_off_the_remote() {
+    let Some(repository) = TestRepository::new() else {
+        return;
+    };
+    let (snapshot, projection) = repository.projection();
+    let delivery =
+        DeliveryProjectionBuilder::build(&projection, &snapshot, &config(), &repository.store)
+            .unwrap();
+    let target_root = repository.path.join("asset-target");
+    let target = FilesystemAssetTarget::new(&target_root);
+
+    let deliveries =
+        SqliteDeliveryProjectionStore::open(repository.path.join("deliveries.sqlite")).unwrap();
+    DeliveryProjectionStore::save(&deliveries, &delivery).unwrap();
+
+    let base = GitCommitOid::new(repository.head()).unwrap();
+    let reviewed = GitProjectionMaterializer::materialize(
+        &repository.local,
+        base.as_str(),
+        delivery.text(),
+        &repository.store,
+    )
+    .unwrap();
+    let spec = GitCommitSpec::new(
+        base.clone(),
+        GitTreeOid::new(reviewed.tree_oid()).unwrap(),
+        "Mineral Publisher",
+        "publisher@example.invalid",
+        TimestampMillis::from_unix_millis(1_500),
+        "Mineral Publisher",
+        "publisher@example.invalid",
+        TimestampMillis::from_unix_millis(1_500),
+        "Publish Mineral content",
+    )
+    .unwrap();
+    let desired_commit =
+        GitCommitObjectCreator::create_from_spec(&repository.local, &spec).unwrap();
+    let run = PublishRun::rehydrate(
+        PublishRunId::new(1).unwrap(),
+        snapshot.id(),
+        None,
+        Some(delivery.text().projection_sha256()),
+        Some(delivery.delivery_sha256()),
+        ManagedRoot::new("content").unwrap(),
+        PublishTargetId::new("origin:refs/heads/main").unwrap(),
+        RepositoryLocator::new(repository.local.to_str().unwrap()).unwrap(),
+        GitRefTarget::new("origin", "refs/heads/main").unwrap(),
+        base.as_str().to_owned(),
+        reviewed.tree_oid().to_owned(),
+        Some(desired_commit.clone()),
+        Some(spec.clone()),
+        1_500,
+    )
+    .unwrap();
+    let runs = SqlitePublishRunStore::open(repository.path.join("runs.sqlite")).unwrap();
+    PublishRunStore::save(&runs, &run).unwrap();
+    let observations =
+        SqliteRemoteObservationStore::open(repository.path.join("observations.sqlite")).unwrap();
+    let asset_observations =
+        SqliteAssetObservationStore::open(repository.path.join("asset-observations.sqlite"))
+            .unwrap();
+    let mut observation_ids =
+        SequentialRemoteObservationIdGenerator::new(RemoteObservationId::new(1).unwrap());
+    let mut asset_observation_ids =
+        SequentialAssetObservationIdGenerator::new(AssetObservationId::new(1).unwrap());
+
+    // The immutable content store loses the published asset blob: the runtime
+    // cannot produce the frozen representation any more.
+    let published_sha256 = delivery.assets().assets()[0].published_sha256();
+    let cas_blob = repository.store.root().join(published_sha256.to_string());
+    let published_bytes = fs::read(&cas_blob).unwrap();
+    fs::remove_file(&cas_blob).unwrap();
+    assert!(repository.remote_head() == base.as_str());
+
+    let error = GitPublicationApplication::resume(
+        run.id(),
+        &runs,
+        &deliveries,
+        &target,
+        &asset_observations,
+        &mut asset_observation_ids,
+        &observations,
+        &mut observation_ids,
+        &repository.store,
+    )
+    .unwrap_err();
+
+    // The Git target never moved, and the asset target still holds nothing.
+    assert!(format!("{error}").contains("required assets"), "{error}");
+    assert_eq!(repository.remote_head(), base.as_str());
+    assert!(matches!(
+        target
+            .inspect(delivery.assets().assets()[0].object_key())
+            .unwrap(),
+        crate::asset::AssetTargetState::Missing
+    ));
+    // The missing observation was still recorded before the attempt refused.
+    assert_eq!(
+        asset_observations
+            .list_for_publish_run(run.id())
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // Restoring the frozen representation lets the same attempt finish: the asset
+    // is published, verified, and only then does the ref move.
+    fs::write(&cas_blob, &published_bytes).unwrap();
+    let execution = GitPublicationApplication::resume(
+        run.id(),
+        &runs,
+        &deliveries,
+        &target,
+        &asset_observations,
+        &mut asset_observation_ids,
+        &observations,
+        &mut observation_ids,
+        &repository.store,
+    )
+    .unwrap();
+
+    assert!(execution.is_satisfied(), "got {execution:?}");
+    assert_eq!(repository.remote_head(), desired_commit.as_str());
+    assert!(repository.object_exists(&format!("{}^{{commit}}", desired_commit.as_str())));
+    assert!(matches!(
+        target
+            .inspect(delivery.assets().assets()[0].object_key())
+            .unwrap(),
+        crate::asset::AssetTargetState::Present(_)
+    ));
+    assert_eq!(
+        fs::read(
+            target_root.join(
+                delivery.assets().assets()[0]
+                    .object_key()
+                    .as_str()
+                    .replace('/', std::path::MAIN_SEPARATOR_STR)
+            )
+        )
+        .unwrap(),
+        published_bytes
     );
 }
 

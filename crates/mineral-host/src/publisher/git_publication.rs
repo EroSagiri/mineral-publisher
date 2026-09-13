@@ -3,6 +3,7 @@ use std::{error::Error, fmt, path::Path, time::SystemTime};
 use uuid::Uuid;
 
 use crate::{
+    asset::{AssetObservationIdGenerator, AssetObservationStore, AssetTarget},
     domain::{Snapshot, TimestampMillis},
     ports::BlobStore,
     runtime::SystemClock,
@@ -13,8 +14,8 @@ use crate::{
 };
 
 use super::{
-    DeliveryProjectionBinding, GitCommitMetadata, GitPublicationExecuteError,
-    GitPublicationExecution, GitPublicationExecutor, GitPublicationPrepareError,
+    DeliveryProjectionBinding, DeliveryPublicationExecuteError, DeliveryPublicationExecution,
+    DeliveryPublicationExecutor, GitCommitMetadata, GitPublicationPrepareError,
     GitPublicationPrepareRequest, GitPublicationPreparer, GitRefTarget, GitRemoteAdapter,
     GitRemoteError, GitRemoteObserver, GitRepositoryAdapter, GitRepositoryAdapterError,
     GitRepositoryIdentity, GitRepositoryIdentityError, PublishRunId, PublishRunStore,
@@ -184,7 +185,7 @@ pub struct GitPublicationApplicationResult {
     projection_sha256: crate::domain::Sha256,
     delivery_sha256: crate::domain::Sha256,
     publish_plan_sha256: crate::domain::Sha256,
-    workflow: GitPublicationExecution,
+    workflow: DeliveryPublicationExecution,
 }
 
 impl GitPublicationApplicationResult {
@@ -207,13 +208,24 @@ impl GitPublicationApplicationResult {
         self.publish_plan_sha256
     }
 
-    pub fn workflow(&self) -> &GitPublicationExecution {
+    /// The complete delivery verdict: Git facts plus the asset facts that had to
+    /// hold before the Git target was allowed to become public.
+    pub fn workflow(&self) -> &DeliveryPublicationExecution {
         &self.workflow
     }
 }
 
 #[derive(Debug)]
-pub enum GitPublicationApplicationError<P: Error, D: Error, O: Error, R: Error, I: Error> {
+pub enum GitPublicationApplicationError<
+    P: Error,
+    D: Error,
+    A: Error,
+    S: Error,
+    G: Error,
+    O: Error,
+    R: Error,
+    I: Error,
+> {
     RepositoryIdentity(GitRepositoryIdentityError),
     PreparationObservation(GitRemoteError),
     TargetMissing,
@@ -233,11 +245,23 @@ pub enum GitPublicationApplicationError<P: Error, D: Error, O: Error, R: Error, 
     PublishRunMissing(PublishRunId),
     /// Binding the native adapters failed.
     RemoteAdapter(GitRemoteError),
-    Workflow(GitPublicationExecuteError<P, D, O, I, GitRepositoryAdapterError, GitRemoteError>),
+    Workflow(
+        DeliveryPublicationExecuteError<
+            P,
+            D,
+            A,
+            S,
+            G,
+            O,
+            I,
+            GitRepositoryAdapterError,
+            GitRemoteError,
+        >,
+    ),
 }
 
-impl<P: Error, D: Error, O: Error, R: Error, I: Error> fmt::Display
-    for GitPublicationApplicationError<P, D, O, R, I>
+impl<P: Error, D: Error, A: Error, S: Error, G: Error, O: Error, R: Error, I: Error> fmt::Display
+    for GitPublicationApplicationError<P, D, A, S, G, O, R, I>
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -292,10 +316,13 @@ impl<P: Error, D: Error, O: Error, R: Error, I: Error> fmt::Display
 impl<
     P: Error + 'static,
     D: Error + 'static,
+    A: Error + 'static,
+    S: Error + 'static,
+    G: Error + 'static,
     O: Error + 'static,
     R: Error + 'static,
     I: Error + 'static,
-> Error for GitPublicationApplicationError<P, D, O, R, I>
+> Error for GitPublicationApplicationError<P, D, A, S, G, O, R, I>
 {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
@@ -317,7 +344,7 @@ impl<
 
 impl GitPublicationApplication {
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
-    pub fn prepare_and_publish<P, D, O, R, I, B>(
+    pub fn prepare_and_publish<P, D, T, S, G, O, R, I, B>(
         projection: &PublicProjection,
         snapshot: &Snapshot,
         delivery_config: &AssetDeliveryConfig,
@@ -328,16 +355,31 @@ impl GitPublicationApplication {
         content_store: &B,
         publish_run_store: &P,
         delivery_projections: &D,
+        asset_target: &T,
+        asset_observations: &S,
+        asset_observation_ids: &mut G,
         observation_store: &O,
         publish_run_ids: &mut R,
         observation_ids: &mut I,
     ) -> Result<
         GitPublicationApplicationResult,
-        GitPublicationApplicationError<P::Error, D::Error, O::Error, R::Error, I::Error>,
+        GitPublicationApplicationError<
+            P::Error,
+            D::Error,
+            T::Error,
+            S::Error,
+            G::Error,
+            O::Error,
+            R::Error,
+            I::Error,
+        >,
     >
     where
         P: PublishRunStore,
         D: DeliveryProjectionStore,
+        T: AssetTarget,
+        S: AssetObservationStore,
+        G: AssetObservationIdGenerator,
         O: RemoteObservationStore,
         R: PublishRunIdGenerator,
         I: RemoteObservationIdGenerator,
@@ -408,10 +450,14 @@ impl GitPublicationApplication {
             .map_err(GitPublicationApplicationError::PublishRunPersistence)?;
         let remote = GitRemoteAdapter::new(repository.path())
             .map_err(GitPublicationApplicationError::RemoteAdapter)?;
-        let workflow = GitPublicationExecutor::execute(
+        let workflow = DeliveryPublicationExecutor::execute(
             publish_run_id,
             publish_run_store,
             delivery_projections,
+            asset_target,
+            asset_observations,
+            asset_observation_ids,
+            content_store,
             observation_store,
             observation_ids,
             &git_repository,
@@ -436,18 +482,24 @@ impl GitPublicationApplication {
     /// is reloaded by the executor, which is the only reader that decides what to
     /// publish.
     #[allow(clippy::type_complexity, clippy::too_many_arguments)]
-    pub fn resume<P, D, O, I, B>(
+    pub fn resume<P, D, T, S, G, O, I, B>(
         publish_run_id: PublishRunId,
         publish_run_store: &P,
         delivery_projections: &D,
+        asset_target: &T,
+        asset_observations: &S,
+        asset_observation_ids: &mut G,
         observation_store: &O,
         observation_ids: &mut I,
         content_store: &B,
     ) -> Result<
-        GitPublicationExecution,
+        DeliveryPublicationExecution,
         GitPublicationApplicationError<
             P::Error,
             D::Error,
+            T::Error,
+            S::Error,
+            G::Error,
             O::Error,
             std::convert::Infallible,
             I::Error,
@@ -456,6 +508,9 @@ impl GitPublicationApplication {
     where
         P: PublishRunStore,
         D: DeliveryProjectionStore,
+        T: AssetTarget,
+        S: AssetObservationStore,
+        G: AssetObservationIdGenerator,
         O: RemoteObservationStore,
         I: RemoteObservationIdGenerator,
         B: BlobStore,
@@ -474,10 +529,14 @@ impl GitPublicationApplication {
                 .map_err(GitPublicationApplicationError::RepositoryAdapter)?;
         let remote = GitRemoteAdapter::from_locator(publish_run.repository())
             .map_err(GitPublicationApplicationError::RemoteAdapter)?;
-        GitPublicationExecutor::execute(
+        DeliveryPublicationExecutor::execute(
             publish_run_id,
             publish_run_store,
             delivery_projections,
+            asset_target,
+            asset_observations,
+            asset_observation_ids,
+            content_store,
             observation_store,
             observation_ids,
             &git_repository,
@@ -501,13 +560,15 @@ mod tests {
     };
 
     use crate::{
+        asset::{AssetObservationId, FilesystemAssetTarget, SequentialAssetObservationIdGenerator},
         domain::{ContentPath, Snapshot, SnapshotFile, SnapshotId, SourceId},
         publisher::{
-            GitCommitObjectCreator, PublishRun, PublishRunPublication,
+            GitCommitObjectCreator, GitPublicationExecution, PublishRun, PublishRunPublication,
             SequentialRemoteObservationIdGenerator,
         },
         storage::{
-            SqliteDeliveryProjectionStore, SqlitePublishRunStore, SqliteRemoteObservationStore,
+            SqliteAssetObservationStore, SqliteDeliveryProjectionStore, SqlitePublishRunStore,
+            SqliteRemoteObservationStore,
         },
         workflow::{DeliveryProjectionBuilder, FinalPublicationSet, ManagedRoot, PublicProjection},
     };
@@ -776,6 +837,12 @@ mod tests {
             SqliteRemoteObservationStore::open(repository.root.join("obs.sqlite")).unwrap();
         let deliveries =
             SqliteDeliveryProjectionStore::open(repository.root.join("deliveries.sqlite")).unwrap();
+        let asset_target = FilesystemAssetTarget::new(repository.root.join("asset-target"));
+        let asset_observations =
+            SqliteAssetObservationStore::open(repository.root.join("asset-observations.sqlite"))
+                .unwrap();
+        let mut asset_observation_ids =
+            SequentialAssetObservationIdGenerator::new(AssetObservationId::new(1).unwrap());
         let mut run_ids = SequentialPublishRunIdGenerator::new(PublishRunId::new(1).unwrap());
         let mut observation_ids =
             SequentialRemoteObservationIdGenerator::new(RemoteObservationId::new(1).unwrap());
@@ -791,6 +858,9 @@ mod tests {
             &store,
             &runs,
             &deliveries,
+            &asset_target,
+            &asset_observations,
+            &mut asset_observation_ids,
             &observations,
             &mut run_ids,
             &mut observation_ids,
@@ -819,6 +889,12 @@ mod tests {
             SqliteRemoteObservationStore::open(repository.root.join("obs.sqlite")).unwrap();
         let deliveries =
             SqliteDeliveryProjectionStore::open(repository.root.join("deliveries.sqlite")).unwrap();
+        let asset_target = FilesystemAssetTarget::new(repository.root.join("asset-target"));
+        let asset_observations =
+            SqliteAssetObservationStore::open(repository.root.join("asset-observations.sqlite"))
+                .unwrap();
+        let mut asset_observation_ids =
+            SequentialAssetObservationIdGenerator::new(AssetObservationId::new(1).unwrap());
         let mut run_ids = SequentialPublishRunIdGenerator::new(PublishRunId::new(1).unwrap());
         let mut observation_ids =
             SequentialRemoteObservationIdGenerator::new(RemoteObservationId::new(1).unwrap());
@@ -834,6 +910,9 @@ mod tests {
             &store,
             &runs,
             &RejectingDeliveryProjectionStore,
+            &asset_target,
+            &asset_observations,
+            &mut asset_observation_ids,
             &observations,
             &mut run_ids,
             &mut observation_ids,
@@ -862,6 +941,12 @@ mod tests {
             SqliteRemoteObservationStore::open(repository.root.join("obs.sqlite")).unwrap();
         let deliveries =
             SqliteDeliveryProjectionStore::open(repository.root.join("deliveries.sqlite")).unwrap();
+        let asset_target = FilesystemAssetTarget::new(repository.root.join("asset-target"));
+        let asset_observations =
+            SqliteAssetObservationStore::open(repository.root.join("asset-observations.sqlite"))
+                .unwrap();
+        let mut asset_observation_ids =
+            SequentialAssetObservationIdGenerator::new(AssetObservationId::new(1).unwrap());
         let mut run_ids = SequentialPublishRunIdGenerator::new(PublishRunId::new(1).unwrap());
         let mut observation_ids =
             SequentialRemoteObservationIdGenerator::new(RemoteObservationId::new(1).unwrap());
@@ -877,6 +962,9 @@ mod tests {
             &store,
             &RejectingPublishRunStore,
             &deliveries,
+            &asset_target,
+            &asset_observations,
+            &mut asset_observation_ids,
             &observations,
             &mut run_ids,
             &mut observation_ids,
@@ -912,6 +1000,12 @@ mod tests {
             SqliteRemoteObservationStore::open(repository.root.join("obs.sqlite")).unwrap();
         let deliveries =
             SqliteDeliveryProjectionStore::open(repository.root.join("deliveries.sqlite")).unwrap();
+        let asset_target = FilesystemAssetTarget::new(repository.root.join("asset-target"));
+        let asset_observations =
+            SqliteAssetObservationStore::open(repository.root.join("asset-observations.sqlite"))
+                .unwrap();
+        let mut asset_observation_ids =
+            SequentialAssetObservationIdGenerator::new(AssetObservationId::new(1).unwrap());
         let mut run_ids = SequentialPublishRunIdGenerator::new(PublishRunId::new(1).unwrap());
         let mut observation_ids =
             SequentialRemoteObservationIdGenerator::new(RemoteObservationId::new(1).unwrap());
@@ -927,6 +1021,9 @@ mod tests {
             &store,
             &runs,
             &deliveries,
+            &asset_target,
+            &asset_observations,
+            &mut asset_observation_ids,
             &observations,
             &mut run_ids,
             &mut observation_ids,
@@ -934,7 +1031,7 @@ mod tests {
         .unwrap();
 
         assert!(matches!(
-            result.workflow(),
+            result.workflow().git(),
             GitPublicationExecution::RemoteChanged { .. }
         ));
         assert_eq!(
@@ -962,6 +1059,12 @@ mod tests {
         let observations = SqliteRemoteObservationStore::open(&observation_db).unwrap();
         let deliveries =
             SqliteDeliveryProjectionStore::open(repository.root.join("deliveries.sqlite")).unwrap();
+        let asset_target = FilesystemAssetTarget::new(repository.root.join("asset-target"));
+        let asset_observations =
+            SqliteAssetObservationStore::open(repository.root.join("asset-observations.sqlite"))
+                .unwrap();
+        let mut asset_observation_ids =
+            SequentialAssetObservationIdGenerator::new(AssetObservationId::new(1).unwrap());
         let mut run_ids = SequentialPublishRunIdGenerator::new(PublishRunId::new(1).unwrap());
         let mut observation_ids =
             SequentialRemoteObservationIdGenerator::new(RemoteObservationId::new(1).unwrap());
@@ -977,15 +1080,20 @@ mod tests {
             &store,
             &runs,
             &deliveries,
+            &asset_target,
+            &asset_observations,
+            &mut asset_observation_ids,
             &observations,
             &mut run_ids,
             &mut observation_ids,
         )
         .unwrap();
         assert!(matches!(
-            result.workflow(),
+            result.workflow().git(),
             GitPublicationExecution::Published { .. }
         ));
+        // The required asset was published and verified before the push.
+        assert!(result.workflow().is_satisfied());
         let published = repository.remote_oid();
         assert_ne!(
             published,
@@ -998,21 +1106,31 @@ mod tests {
         let observations = SqliteRemoteObservationStore::open(&observation_db).unwrap();
         let deliveries =
             SqliteDeliveryProjectionStore::open(repository.root.join("deliveries.sqlite")).unwrap();
+        let asset_target = FilesystemAssetTarget::new(repository.root.join("asset-target"));
+        let asset_observations =
+            SqliteAssetObservationStore::open(repository.root.join("asset-observations.sqlite"))
+                .unwrap();
+        let mut asset_observation_ids =
+            SequentialAssetObservationIdGenerator::new(AssetObservationId::new(1).unwrap());
         let mut recovery_ids =
             SequentialRemoteObservationIdGenerator::new(RemoteObservationId::new(3).unwrap());
         let recovered = GitPublicationApplication::resume(
             result.publish_run_id(),
             &runs,
             &deliveries,
+            &asset_target,
+            &asset_observations,
+            &mut asset_observation_ids,
             &observations,
             &mut recovery_ids,
             &store,
         )
         .unwrap();
         assert!(matches!(
-            recovered,
+            recovered.git(),
             GitPublicationExecution::AlreadyPublished { .. }
         ));
+        assert!(recovered.is_satisfied());
         assert_eq!(repository.remote_oid(), published);
     }
 
@@ -1031,6 +1149,12 @@ mod tests {
                 .unwrap();
         let deliveries =
             SqliteDeliveryProjectionStore::open(repository.root.join("deliveries.sqlite")).unwrap();
+        let asset_target = FilesystemAssetTarget::new(repository.root.join("asset-target"));
+        let asset_observations =
+            SqliteAssetObservationStore::open(repository.root.join("asset-observations.sqlite"))
+                .unwrap();
+        let mut asset_observation_ids =
+            SequentialAssetObservationIdGenerator::new(AssetObservationId::new(1).unwrap());
         let mut run_ids = SequentialPublishRunIdGenerator::new(PublishRunId::new(1).unwrap());
         let mut observation_ids =
             SequentialRemoteObservationIdGenerator::new(RemoteObservationId::new(1).unwrap());
@@ -1046,15 +1170,20 @@ mod tests {
             &store,
             &runs,
             &deliveries,
+            &asset_target,
+            &asset_observations,
+            &mut asset_observation_ids,
             &observations,
             &mut run_ids,
             &mut observation_ids,
         )
         .unwrap();
         assert!(matches!(
-            result.workflow(),
+            result.workflow().git(),
             GitPublicationExecution::Published { .. }
         ));
+        // The required asset was published and verified before the push.
+        assert!(result.workflow().is_satisfied());
         drop(observations);
         drop(runs);
 
@@ -1100,6 +1229,12 @@ mod tests {
                 .unwrap();
         let deliveries =
             SqliteDeliveryProjectionStore::open(repository.root.join("deliveries.sqlite")).unwrap();
+        let asset_target = FilesystemAssetTarget::new(repository.root.join("asset-target"));
+        let asset_observations =
+            SqliteAssetObservationStore::open(repository.root.join("asset-observations.sqlite"))
+                .unwrap();
+        let mut asset_observation_ids =
+            SequentialAssetObservationIdGenerator::new(AssetObservationId::new(1).unwrap());
         let mut run_ids = SequentialPublishRunIdGenerator::new(PublishRunId::new(1).unwrap());
         let mut observation_ids =
             SequentialRemoteObservationIdGenerator::new(RemoteObservationId::new(1).unwrap());
@@ -1115,15 +1250,20 @@ mod tests {
             &store,
             &runs,
             &deliveries,
+            &asset_target,
+            &asset_observations,
+            &mut asset_observation_ids,
             &observations,
             &mut run_ids,
             &mut observation_ids,
         )
         .unwrap();
         assert!(matches!(
-            result.workflow(),
+            result.workflow().git(),
             GitPublicationExecution::NoopSatisfied { .. }
         ));
+        // The Git target needed nothing, and the asset side still had to hold.
+        assert!(result.workflow().is_satisfied());
         drop(observations);
         drop(runs);
 

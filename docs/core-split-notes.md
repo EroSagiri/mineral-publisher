@@ -53,10 +53,11 @@ core 的纯净性只能靠：
 ```text
 BEGIN IMMEDIATE / COMMIT   → 只出现在 schema 迁移里
 每一个 store.save(...)      → 单条 INSERT OR IGNORE，没有显式事务
-5 个 store                 → 5 个独立 SQLite 文件
+7 个 store                 → 7 个独立 SQLite 文件
 ```
 
-五个状态文件（`.mineral/` 下）：
+七个状态文件（`.mineral/` 下；S6.2 增加 `delivery-projections.sqlite3`，
+S6.3 增加 `asset-observations.sqlite3`）：
 
 ```text
 document-reviews.sqlite3
@@ -64,11 +65,13 @@ asset-reviews.sqlite3
 human-reviews.sqlite3
 publish-runs.sqlite3
 remote-observations.sqlite3
+delivery-projections.sqlite3
+asset-observations.sqlite3
 ```
 
 ### 2.2 结论：跨 store 原子性目前不存在
 
-由于状态分散在 5 个数据库文件中，**没有任何一个事务能同时覆盖两个 store**。
+由于状态分散在 7 个数据库文件中，**没有任何一个事务能同时覆盖两个 store**。
 所以系统当前依赖的不是原子性，而是**顺序 + 幂等**：
 
 ```text
@@ -88,6 +91,11 @@ intent 必须先于副作用
 
 如果将来需要真正的跨 store 原子性，只有两条路：合并到单一数据库文件，或引入显式的
 journal/outbox。**当前未做，也不应该顺手做。**
+
+S6.3 又新增了一类**不可回滚的外部对象**：published asset 放在 asset target 上
+（native host 是本地目录，Cloudflare runtime 将是对象存储），它与 Git ref、
+SQLite 三者之间同样没有事务。因此这里的原则不变：**顺序 + 幂等**，
+content-addressed 的 staged orphan 允许存在，重试时重新 observe 而不是回滚。
 
 ### 2.3 已批准的 schema 变更
 

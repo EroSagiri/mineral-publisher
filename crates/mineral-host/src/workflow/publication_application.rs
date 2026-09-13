@@ -19,6 +19,8 @@ use crate::{
     },
 };
 
+use crate::asset::{AssetObservationIdGenerator, AssetObservationStore, AssetTarget};
+
 use super::{
     AssetDeliveryConfig, AssetProgramCheck, AssetReviewEvaluator, AssetReviewRunIdGenerator,
     AssetReviewRunStore, AssetReviewWorkflow, AssetReviewWorkflowInput, AssetReviewWorkflowResult,
@@ -162,7 +164,7 @@ impl Error for PublicationApplicationError {
 pub struct PublicationApplication;
 impl PublicationApplication {
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
-    pub fn run<R, AR, D, A, H, P, DP, O, DI, AI, PI, OI, B>(
+    pub fn run<R, AR, D, A, H, P, DP, T, S, G, O, DI, AI, PI, OI, B>(
         request: PublicationApplicationRequest<'_>,
         content_store: &B,
         markdown_reviewer: &R,
@@ -172,6 +174,9 @@ impl PublicationApplication {
         human_store: &H,
         publish_runs: &P,
         delivery_projections: &DP,
+        asset_target: &T,
+        asset_observations: &S,
+        asset_observation_ids: &mut G,
         observations: &O,
         document_ids: &mut DI,
         asset_ids: &mut AI,
@@ -189,6 +194,9 @@ impl PublicationApplication {
         H: HumanReviewStore + ?Sized,
         P: PublishRunStore,
         DP: DeliveryProjectionStore,
+        T: AssetTarget,
+        S: AssetObservationStore,
+        G: AssetObservationIdGenerator,
         O: RemoteObservationStore,
         DI: ReviewRunIdGenerator + ?Sized,
         AI: AssetReviewRunIdGenerator + ?Sized,
@@ -200,6 +208,9 @@ impl PublicationApplication {
         H::Error: 'static,
         P::Error: 'static,
         DP::Error: 'static,
+        T::Error: 'static,
+        S::Error: 'static,
+        G::Error: 'static,
         O::Error: 'static,
         DI::Error: 'static,
         AI::Error: 'static,
@@ -302,6 +313,9 @@ impl PublicationApplication {
             content_store,
             publish_runs,
             delivery_projections,
+            asset_target,
+            asset_observations,
+            asset_observation_ids,
             observations,
             publish_ids,
             observation_ids,

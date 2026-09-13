@@ -6,4 +6,5 @@
 //! `publication/r2`, ...) with its own application workflow, instead of this
 //! module pretending that every publisher shares a universal "target".
 
+pub mod asset;
 pub mod git;

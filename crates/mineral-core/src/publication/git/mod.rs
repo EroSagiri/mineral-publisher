@@ -7,7 +7,10 @@ mod ports;
 mod prepare;
 mod wire;
 
-pub use execute::{GitPublicationExecuteError, GitPublicationExecution, GitPublicationExecutor};
+pub use execute::{
+    DeliveryPublicationExecuteError, DeliveryPublicationExecution, DeliveryPublicationExecutor,
+    GitPublicationExecution,
+};
 pub use model::{
     CasOutcome, GitCommitFacts, GitCommitOid, GitCommitOidError, GitCommitSpec, GitCommitSpecError,
     GitCurrentTarget, GitRefTarget, GitRefTargetError, GitTreeOid, GitTreeOidError,

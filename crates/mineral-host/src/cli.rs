@@ -13,6 +13,7 @@ use std::{
 };
 
 use mineral_publisher::{
+    asset::{AssetPublicationOutcome, FilesystemAssetTarget, UuidAssetObservationIdGenerator},
     domain::{Sha256, Snapshot, SnapshotId, SourceId},
     policy::{
         PolicyIdentity, ReviewCandidate, ReviewRunId, ReviewRunStore, Reviewer, ReviewerError,
@@ -30,9 +31,9 @@ use mineral_publisher::{
     runtime::{HostAssetReviews, HostMarkdownReviews},
     source::LocalSource,
     storage::{
-        LocalContentStore, SqliteAssetReviewRunStore, SqliteDeliveryProjectionStore,
-        SqliteHumanReviewStore, SqlitePublishRunStore, SqliteRemoteObservationStore,
-        SqliteReviewRunStore,
+        LocalContentStore, SqliteAssetObservationStore, SqliteAssetReviewRunStore,
+        SqliteDeliveryProjectionStore, SqliteHumanReviewStore, SqlitePublishRunStore,
+        SqliteRemoteObservationStore, SqliteReviewRunStore,
     },
     workflow::{
         AssetDeliveryConfig, AssetReviewCandidate, AssetReviewRunId, AssetReviewRunIdGenerator,
@@ -59,6 +60,7 @@ git:
   message: Publish Mineral content
 assets:
   public_base_url: https://assets.example.com
+  target_path: ./asset-target
 review:
   api_base_url: https://api.deepseek.com
   markdown_model: deepseek-flash
@@ -124,6 +126,9 @@ impl GitConfig {
 struct AssetsConfig {
     /// Absolute HTTPS base URL every published asset URL is built from.
     public_base_url: String,
+    /// Where the native runtime places published objects. The Cloudflare runtime
+    /// implements the same asset-target port over object storage instead.
+    target_path: PathBuf,
 }
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -163,6 +168,9 @@ impl Workspace {
         config.source.path = absolute(base, &config.source.path)?;
         config.state.path = absolute(base, &config.state.path)?;
         config.git.repository = absolute(base, &config.git.repository)?;
+        if let Some(assets) = &mut config.assets {
+            assets.target_path = absolute(base, &assets.target_path)?;
+        }
         Ok(Self {
             config,
             config_path: path,
@@ -190,11 +198,21 @@ impl Workspace {
         self.config.state.path.join("delivery-projections.sqlite3")
     }
     fn asset_delivery(&self) -> Result<AssetDeliveryConfig, Box<dyn Error>> {
-        let assets =
-            self.config.assets.as_ref().ok_or(
-                "assets.public_base_url must be configured before publishing binary assets",
-            )?;
-        Ok(AssetDeliveryConfig::new(assets.public_base_url.clone())?)
+        Ok(AssetDeliveryConfig::new(
+            self.assets()?.public_base_url.clone(),
+        )?)
+    }
+    fn assets(&self) -> Result<&AssetsConfig, Box<dyn Error>> {
+        self.config.assets.as_ref().ok_or(
+            "assets.public_base_url and assets.target_path must be configured before publishing"
+                .into(),
+        )
+    }
+    fn asset_target(&self) -> Result<FilesystemAssetTarget, Box<dyn Error>> {
+        Ok(FilesystemAssetTarget::new(&self.assets()?.target_path))
+    }
+    fn asset_observations_db(&self) -> PathBuf {
+        self.config.state.path.join("asset-observations.sqlite3")
     }
 }
 
@@ -271,6 +289,7 @@ fn open_stores(workspace: &Workspace) -> Result<(), Box<dyn Error>> {
     SqlitePublishRunStore::open(workspace.publish_db())?;
     SqliteRemoteObservationStore::open(workspace.observation_db())?;
     SqliteDeliveryProjectionStore::open(workspace.delivery_db())?;
+    SqliteAssetObservationStore::open(workspace.asset_observations_db())?;
     Ok(())
 }
 
@@ -313,6 +332,9 @@ fn publish(workspace: Workspace) -> Result<(), Box<dyn Error>> {
     let human = SqliteHumanReviewStore::open(workspace.human_db())?;
     let publish_runs = SqlitePublishRunStore::open(workspace.publish_db())?;
     let delivery_projections = SqliteDeliveryProjectionStore::open(workspace.delivery_db())?;
+    let asset_target = workspace.asset_target()?;
+    let asset_root = asset_target.root().to_path_buf();
+    let asset_observations = SqliteAssetObservationStore::open(workspace.asset_observations_db())?;
     let observations = SqliteRemoteObservationStore::open(workspace.observation_db())?;
     let markdown_reviewer = LazyMarkdownReviewer {
         config: workspace.config.review.clone(),
@@ -365,6 +387,7 @@ fn publish(workspace: Workspace) -> Result<(), Box<dyn Error>> {
     let mut asset_ids = RandomAssetIds;
     let mut publish_ids = UuidPublishRunIdGenerator;
     let mut observation_ids = UuidRemoteObservationIdGenerator;
+    let mut asset_observation_ids = UuidAssetObservationIdGenerator;
     eprintln!("[2/4] Running privacy, program checks, and semantic review...");
     let outcome = PublicationApplication::run(
         request,
@@ -376,6 +399,9 @@ fn publish(workspace: Workspace) -> Result<(), Box<dyn Error>> {
         &human,
         &publish_runs,
         &delivery_projections,
+        &asset_target,
+        &asset_observations,
+        &mut asset_observation_ids,
         &observations,
         &mut document_ids,
         &mut asset_ids,
@@ -386,11 +412,11 @@ fn publish(workspace: Workspace) -> Result<(), Box<dyn Error>> {
         &asset_evaluator,
     )?;
     eprintln!("[4/4] Publication workflow finished.");
-    render_publication(outcome);
+    render_publication(outcome, &asset_root);
     Ok(())
 }
 
-fn render_publication(outcome: PublicationApplicationOutcome) {
+fn render_publication(outcome: PublicationApplicationOutcome, asset_root: &Path) {
     match outcome {
         PublicationApplicationOutcome::NeedsHumanReview { trace } => {
             println!(
@@ -408,7 +434,8 @@ fn render_publication(outcome: PublicationApplicationOutcome) {
         }
         PublicationApplicationOutcome::Completed { trace, completed } => {
             let publication = completed.publication();
-            let status = match publication.workflow() {
+            let delivery = publication.workflow();
+            let status = match delivery.git() {
                 GitPublicationExecution::NoopSatisfied { .. } => "noop",
                 GitPublicationExecution::Published { .. }
                 | GitPublicationExecution::AlreadyPublished { .. } => "published",
@@ -420,14 +447,43 @@ fn render_publication(outcome: PublicationApplicationOutcome) {
                     "not_published"
                 }
             };
+            // A Git target holding the right Markdown is not a finished delivery:
+            // its documents point at objects, and those have to be verified too.
+            let status = if delivery.is_satisfied() {
+                status
+            } else {
+                "incomplete"
+            };
+            let assets = match delivery.assets() {
+                AssetPublicationOutcome::NoDurableProjection => "not_required".to_owned(),
+                AssetPublicationOutcome::NotAttempted => "not_attempted".to_owned(),
+                AssetPublicationOutcome::Satisfied {
+                    verified,
+                    published,
+                } => format!("{verified} verified, {published} published"),
+            };
             println!(
-                "Publication\n  status: {status}\n  run: {}\n  snapshot: {}\n  projection: {}\n  delivery: {}\n  markdown: {}\n  assets: {}",
+                "Publication\n  status: {status}\n  git: {}\n  run: {}\n  snapshot: {}\n  projection: {}\n  delivery: {}\n  markdown: {}\n  assets: {}\n  asset delivery: {}\n  asset target: {}",
+                match delivery.git() {
+                    GitPublicationExecution::NoopSatisfied { .. } => "noop",
+                    GitPublicationExecution::Published { .. }
+                    | GitPublicationExecution::AlreadyPublished { .. } => "published",
+                    GitPublicationExecution::RemoteChanged { .. } => "conflict",
+                    GitPublicationExecution::Indeterminate { .. } => "indeterminate",
+                    GitPublicationExecution::TargetMissing { .. } => "target_missing",
+                    GitPublicationExecution::PushFailedButRemoteUnchanged { .. }
+                    | GitPublicationExecution::RemoteUnchangedAfterSuccessfulPush { .. } => {
+                        "not_published"
+                    }
+                },
                 publication.publish_run_id().get(),
                 trace.snapshot().id().get(),
                 completed.projection().projection_sha256(),
                 publication.delivery_sha256(),
                 completed.publication_set().markdown_paths().len(),
-                completed.publication_set().asset_paths().len()
+                completed.publication_set().asset_paths().len(),
+                assets,
+                asset_root.display()
             );
             if status == "noop" {
                 println!("  No changes to publish.");
@@ -676,6 +732,7 @@ fn doctor(workspace: Workspace) -> Result<(), Box<dyn Error>> {
             workspace.publish_db(),
             workspace.observation_db(),
             workspace.delivery_db(),
+            workspace.asset_observations_db(),
         ]
         .iter()
         .all(|path| path.is_file()),

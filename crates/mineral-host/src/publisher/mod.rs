@@ -2,7 +2,7 @@
 //! composition root that binds them to the portable engine.
 //!
 //! There is exactly one publication path. Preparation is
-//! [`GitPublicationPreparer`] and execution is [`GitPublicationExecutor`], both
+//! [`GitPublicationPreparer`] and execution is [`DeliveryPublicationExecutor`], both
 //! defined by the engine; everything in this module either produces a fact a
 //! runtime alone can observe or persists one the engine decided.
 
@@ -15,12 +15,13 @@ mod git_repository;
 mod remote_observation;
 
 pub use mineral_core::publication::git::{
-    CasOutcome, CommitSpecWire, CommitSpecWireError, GitCommitFacts, GitCommitOid,
+    CasOutcome, CommitSpecWire, CommitSpecWireError, DeliveryPublicationExecuteError,
+    DeliveryPublicationExecution, DeliveryPublicationExecutor, GitCommitFacts, GitCommitOid,
     GitCommitOidError, GitCommitSpec, GitCommitSpecError, GitCurrentTarget,
-    GitPublicationExecuteError, GitPublicationExecution, GitPublicationExecutor,
-    GitPublicationPreparation, GitPublicationPrepareError, GitPublicationPrepareRequest,
-    GitPublicationPreparer, GitRefTarget, GitRefTargetError, GitRemote, GitRepository, GitTreeOid,
-    GitTreeOidError, LocalCommitState, RefUpdate, RemoteRefState, ReviewedGitTree,
+    GitPublicationExecution, GitPublicationPreparation, GitPublicationPrepareError,
+    GitPublicationPrepareRequest, GitPublicationPreparer, GitRefTarget, GitRefTargetError,
+    GitRemote, GitRepository, GitTreeOid, GitTreeOidError, LocalCommitState, RefUpdate,
+    RemoteRefState, ReviewedGitTree,
 };
 pub use mineral_core::publish::{
     DeliveryProjectionBinding, PublishReconciliation, PublishReconciliationError, PublishRun,

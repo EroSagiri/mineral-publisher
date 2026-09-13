@@ -1,5 +1,7 @@
 use std::{error::Error, fmt};
 
+use serde::{Deserialize, Serialize};
+
 use crate::domain::Sha256;
 
 /// The fixed object-key prefix every delivered asset lives under.
@@ -16,8 +18,19 @@ pub const ASSET_OBJECT_KEY_PREFIX: &str = "assets/sha256";
 /// sanitization re-encoded to JPEG is `image/jpeg` even when the vault path still
 /// ends in `.png`, and an asset published unchanged carries the media type the
 /// program check actually detected in its bytes.
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
 pub struct AssetContentType(String);
+
+impl<'de> Deserialize<'de> for AssetContentType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
 
 impl AssetContentType {
     pub fn new(value: impl Into<String>) -> Result<Self, AssetContentTypeError> {
@@ -175,10 +188,50 @@ impl AssetObjectKey {
         Self(format!("{ASSET_OBJECT_KEY_PREFIX}/{}/{}", &hex[..2], hex))
     }
 
+    /// Rebuilds a key from its durable textual form.
+    ///
+    /// The canonical shape is pinned — `assets/sha256/<2 hex>/<64 hex>` — so a
+    /// stored key can never smuggle in an absolute path, a `..` segment, or a key
+    /// that does not match the bytes it names.
+    pub fn rehydrate(value: impl Into<String>) -> Result<Self, AssetObjectKeyError> {
+        let value = value.into();
+        let Some((prefix, digest)) = value
+            .strip_prefix(ASSET_OBJECT_KEY_PREFIX)
+            .and_then(|rest| rest.strip_prefix('/'))
+            .and_then(|rest| rest.split_once('/'))
+        else {
+            return Err(AssetObjectKeyError::NotCanonical);
+        };
+        if !is_lower_hex(prefix, 2) || !is_lower_hex(digest, 64) || !digest.starts_with(prefix) {
+            return Err(AssetObjectKeyError::NotCanonical);
+        }
+        Ok(Self(value))
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
 }
+
+fn is_lower_hex(value: &str, length: usize) -> bool {
+    value.len() == length
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AssetObjectKeyError {
+    NotCanonical,
+}
+
+impl fmt::Display for AssetObjectKeyError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("asset object key is not the canonical content-addressed key")
+    }
+}
+
+impl Error for AssetObjectKeyError {}
 
 impl fmt::Display for AssetObjectKey {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -263,6 +316,35 @@ mod tests {
 
         assert_eq!(first, second);
         assert_eq!(first.as_str(), format!("assets/sha256/ab/{}", identity));
+    }
+
+    #[test]
+    fn an_object_key_round_trips_only_in_its_canonical_form() {
+        let identity = Sha256::new([0xab; 32]);
+        let key = AssetObjectKey::for_published_sha256(&identity);
+
+        assert_eq!(
+            AssetObjectKey::rehydrate(key.as_str()).unwrap(),
+            key,
+            "the canonical form rehydrates"
+        );
+        for value in [
+            "".to_owned(),
+            "assets/sha256/ab".to_owned(),
+            format!("assets/sha256/{identity}"),
+            format!("assets/sha256/ab/{}", "0".repeat(64)),
+            format!("assets/sha256/AB/{}", identity),
+            format!("assets/sha256/ab/{identity}/extra"),
+            format!("assets//sha256/ab/{identity}"),
+            format!("assets/sha256/../ab/{identity}"),
+            format!("/assets/sha256/ab/{identity}"),
+            format!("assets\\sha256\\ab\\{identity}"),
+        ] {
+            assert!(
+                AssetObjectKey::rehydrate(value.clone()).is_err(),
+                "accepted {value:?}"
+            );
+        }
     }
 
     #[test]
