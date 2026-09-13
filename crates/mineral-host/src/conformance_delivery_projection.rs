@@ -21,8 +21,8 @@ use crate::{
     },
     domain::{ContentPath, Sha256, Snapshot, SnapshotFile, SnapshotId, SourceId, TimestampMillis},
     publisher::{
-        DeliveryProjectionBinding, GitCommitMetadata, GitCommitObjectCreator, GitCommitOid,
-        GitCommitSpec, GitProjectionMaterializer, GitPublicationApplication,
+        DeliveryProjectionBinding, FrozenPublicScope, GitCommitMetadata, GitCommitObjectCreator,
+        GitCommitOid, GitCommitSpec, GitProjectionMaterializer, GitPublicationApplication,
         GitPublicationPrepareRequest, GitPublicationPreparer, GitRefTarget, GitRepositoryAdapter,
         GitTreeOid, PublishRun, PublishRunId, PublishRunStore, PublishTargetId,
         RemoteObservationId, RepositoryLocator, SequentialPublishRunIdGenerator,
@@ -551,7 +551,7 @@ fn a_runtime_that_lost_its_objects_republishes_from_the_durable_projection() {
     )
     .unwrap();
     let runs = SqlitePublishRunStore::open(repository.path.join("runs.sqlite")).unwrap();
-    PublishRunStore::save(&runs, &run).unwrap();
+    PublishRunStore::save(&runs, &run, &FrozenPublicScope::empty()).unwrap();
     assert_eq!(repository.remote_head(), base.as_str());
 
     // The object database loses the reviewed tree and the commit. Recreating the
@@ -678,7 +678,7 @@ fn a_broken_asset_keeps_a_real_publication_off_the_remote() {
     )
     .unwrap();
     let runs = SqlitePublishRunStore::open(repository.path.join("runs.sqlite")).unwrap();
-    PublishRunStore::save(&runs, &run).unwrap();
+    PublishRunStore::save(&runs, &run, &FrozenPublicScope::empty()).unwrap();
     let observations =
         SqliteRemoteObservationStore::open(repository.path.join("observations.sqlite")).unwrap();
     let asset_observations =

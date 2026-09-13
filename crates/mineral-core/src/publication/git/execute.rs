@@ -1001,7 +1001,8 @@ mod tests {
             ReviewedGitTree,
         },
         publish::{
-            PublishTargetId, RemoteObservationId, RemoteObservationIdError, RepositoryLocator,
+            FrozenPublicScope, PublishTargetId, RemoteObservationId, RemoteObservationIdError,
+            RepositoryLocator,
         },
         workflow::{
             AssetContentType, AssetDeliveryConfig, AssetObjectKey, AssetProjection,
@@ -1149,7 +1150,7 @@ mod tests {
     impl PublishRunStore for FakePublishRuns {
         type Error = Infallible;
 
-        fn save(&self, _: &PublishRun) -> Result<(), Self::Error> {
+        fn save(&self, _: &PublishRun, _: &FrozenPublicScope) -> Result<(), Self::Error> {
             unreachable!("execution never writes an intent")
         }
         fn get(&self, id: PublishRunId) -> Result<Option<PublishRun>, Self::Error> {
@@ -1160,6 +1161,9 @@ mod tests {
         }
         fn list_for_target(&self, _: &GitRefTarget) -> Result<Vec<PublishRun>, Self::Error> {
             Ok(Vec::new())
+        }
+        fn public_scope(&self, _: PublishRunId) -> Result<Option<FrozenPublicScope>, Self::Error> {
+            Ok(None)
         }
     }
 

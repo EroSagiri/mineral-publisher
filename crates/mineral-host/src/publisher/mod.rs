@@ -24,11 +24,11 @@ pub use mineral_core::publication::git::{
     RemoteRefState, ReviewedGitTree,
 };
 pub use mineral_core::publish::{
-    DeliveryProjectionBinding, PublishReconciliation, PublishReconciliationError, PublishRun,
-    PublishRunError, PublishRunId, PublishRunIdError, PublishRunPublication, PublishRunStore,
-    PublishTargetId, PublishTargetIdError, ReadyToPush, RemoteObservationId,
-    RemoteObservationIdError, RemoteObservationIdGenerator, RemoteObservationStore,
-    RemoteRefObservation, RepositoryLocator, RepositoryLocatorError,
+    DeliveryProjectionBinding, FrozenPublicScope, FrozenPublicScopeError, PublishReconciliation,
+    PublishReconciliationError, PublishRun, PublishRunError, PublishRunId, PublishRunIdError,
+    PublishRunPublication, PublishRunStore, PublishTargetId, PublishTargetIdError, ReadyToPush,
+    RemoteObservationId, RemoteObservationIdError, RemoteObservationIdGenerator,
+    RemoteObservationStore, RemoteRefObservation, RepositoryLocator, RepositoryLocatorError,
 };
 
 pub use git_commit_object::{

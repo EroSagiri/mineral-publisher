@@ -3,7 +3,7 @@ use std::{error::Error, fmt};
 use crate::{
     domain::{Sha256, SnapshotId, TimestampMillis},
     publication::git::{GitCommitOid, GitCommitSpec, GitRefTarget, ReviewedGitTree},
-    workflow::{DeliveryProjection, ManagedRoot},
+    workflow::{DeliveryProjection, ManagedRoot, PublicExclusionRules},
 };
 
 use super::{PublishTargetId, RepositoryLocator};
@@ -468,32 +468,102 @@ impl fmt::Display for PublishRunError {
 
 impl Error for PublishRunError {}
 
+/// The public scope one publication attempt was decided under, as recorded.
+///
+/// It is provenance, not identity: it says which source paths the public question
+/// was asked about, and it takes no part in what the attempt publishes. It is
+/// validated again whenever it is read, so a damaged record is reported rather than
+/// quietly meaning "no exclusions".
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FrozenPublicScope {
+    rules: Vec<String>,
+}
+
+impl FrozenPublicScope {
+    /// The scope that excludes nothing.
+    pub fn empty() -> Self {
+        Self { rules: Vec::new() }
+    }
+
+    /// Freezes the validated, canonical rules of one configured scope.
+    pub fn of(rules: &PublicExclusionRules) -> Self {
+        Self {
+            rules: rules.canonical().into_iter().map(str::to_owned).collect(),
+        }
+    }
+
+    /// Rebuilds a frozen scope from its durable form.
+    ///
+    /// A stored record is exactly the input that can be damaged, so every rule is
+    /// re-validated and the record must already be in canonical form: a hand-edited
+    /// row is refused instead of being silently normalized into a different scope.
+    pub fn rehydrate(
+        rules: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Result<Self, FrozenPublicScopeError> {
+        let rules = rules.into_iter().map(Into::into).collect::<Vec<_>>();
+        let scope = PublicExclusionRules::from_canonical(rules.clone())
+            .map_err(FrozenPublicScopeError::Rule)?;
+        if scope.canonical() != rules.iter().map(String::as_str).collect::<Vec<_>>() {
+            return Err(FrozenPublicScopeError::NotCanonical);
+        }
+        Ok(Self { rules })
+    }
+
+    pub fn rules(&self) -> &[String] {
+        &self.rules
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rules.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.rules.len()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FrozenPublicScopeError {
+    /// A stored rule is not a usable public exclusion rule.
+    Rule(crate::workflow::PublicExclusionRuleError),
+    /// The stored rules are usable but not in canonical form.
+    NotCanonical,
+}
+
+impl fmt::Display for FrozenPublicScopeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Rule(error) => write!(formatter, "frozen public scope rule is unusable: {error}"),
+            Self::NotCanonical => {
+                formatter.write_str("frozen public scope is not in canonical form")
+            }
+        }
+    }
+}
+
+impl Error for FrozenPublicScopeError {}
+
 pub trait PublishRunStore {
     type Error: Error;
 
-    fn save(&self, run: &PublishRun) -> Result<(), Self::Error>;
+    /// Persists one intent together with the public scope it was decided under.
+    ///
+    /// It is one call on purpose. A store can commit both facts together, so an
+    /// attempt this engine records can never exist without the provenance that
+    /// explains which source paths were in scope — and a store that cannot record
+    /// that provenance must fail the attempt instead of persisting an
+    /// unattributable run.
+    fn save(&self, run: &PublishRun, public_scope: &FrozenPublicScope) -> Result<(), Self::Error>;
+
     fn get(&self, id: PublishRunId) -> Result<Option<PublishRun>, Self::Error>;
     fn list(&self) -> Result<Vec<PublishRun>, Self::Error>;
     fn list_for_target(&self, target: &GitRefTarget) -> Result<Vec<PublishRun>, Self::Error>;
-
-    /// Freezes the public scope one attempt was decided under.
-    ///
-    /// The scope is provenance, not identity: it says which source paths the public
-    /// question was asked about, and it must never change what the attempt publishes.
-    /// It is stored beside the intent rather than inside it, so a configuration
-    /// change can be audited without re-interpreting, or re-identifying, anything a
-    /// historical run already published.
-    fn save_public_scope(&self, _id: PublishRunId, _rules: &[String]) -> Result<(), Self::Error> {
-        Ok(())
-    }
 
     /// The public scope frozen for one attempt, in canonical order.
     ///
     /// `None` means the attempt was recorded before scopes were frozen; it does not
     /// mean the scope was empty.
-    fn public_scope(&self, _id: PublishRunId) -> Result<Option<Vec<String>>, Self::Error> {
-        Ok(None)
-    }
+    fn public_scope(&self, id: PublishRunId) -> Result<Option<FrozenPublicScope>, Self::Error>;
 }
 
 #[cfg(test)]

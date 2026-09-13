@@ -16,7 +16,7 @@ use crate::{
 
 use super::{
     DeliveryProjectionBinding, DeliveryPublicationExecuteError, DeliveryPublicationExecution,
-    DeliveryPublicationExecutor, GitCommitMetadata, GitPublicationPrepareError,
+    DeliveryPublicationExecutor, FrozenPublicScope, GitCommitMetadata, GitPublicationPrepareError,
     GitPublicationPrepareRequest, GitPublicationPreparer, GitRefTarget, GitRemoteAdapter,
     GitRemoteError, GitRemoteObserver, GitRepositoryAdapter, GitRepositoryAdapterError,
     GitRepositoryIdentity, GitRepositoryIdentityError, PublishRunId, PublishRunStore,
@@ -447,21 +447,11 @@ impl GitPublicationApplication {
         .map_err(GitPublicationApplicationError::Prepare)?;
         let publish_plan_sha256 = preparation.publish_plan_sha256();
         let publish_run = preparation.into_publish_run();
+        // The scope this attempt was decided under is frozen beside the intent and
+        // becomes durable in the same write: a recorded attempt can never be left
+        // without the provenance that explains its public scope.
         publish_run_store
-            .save(&publish_run)
-            .map_err(GitPublicationApplicationError::PublishRunPersistence)?;
-        // The scope this attempt was decided under is frozen beside the intent,
-        // never inside it: reproducibility of the audit must not change what the
-        // delivery identity already means.
-        publish_run_store
-            .save_public_scope(
-                publish_run.id(),
-                &public_scope
-                    .canonical()
-                    .into_iter()
-                    .map(str::to_owned)
-                    .collect::<Vec<_>>(),
-            )
+            .save(&publish_run, &FrozenPublicScope::of(public_scope))
             .map_err(GitPublicationApplicationError::PublishRunPersistence)?;
         let remote = GitRemoteAdapter::new(repository.path())
             .map_err(GitPublicationApplicationError::RemoteAdapter)?;
@@ -762,7 +752,7 @@ mod tests {
     struct RejectingPublishRunStore;
     impl PublishRunStore for RejectingPublishRunStore {
         type Error = SaveFailure;
-        fn save(&self, _: &PublishRun) -> Result<(), Self::Error> {
+        fn save(&self, _: &PublishRun, _: &FrozenPublicScope) -> Result<(), Self::Error> {
             Err(SaveFailure)
         }
         fn get(&self, _: PublishRunId) -> Result<Option<PublishRun>, Self::Error> {
@@ -774,6 +764,9 @@ mod tests {
         fn list_for_target(&self, _: &GitRefTarget) -> Result<Vec<PublishRun>, Self::Error> {
             Ok(Vec::new())
         }
+        fn public_scope(&self, _: PublishRunId) -> Result<Option<FrozenPublicScope>, Self::Error> {
+            Ok(None)
+        }
     }
 
     struct AdvancingPublishRunStore {
@@ -784,8 +777,12 @@ mod tests {
     impl PublishRunStore for AdvancingPublishRunStore {
         type Error = crate::storage::SqlitePublishRunStoreError;
 
-        fn save(&self, run: &PublishRun) -> Result<(), Self::Error> {
-            self.inner.save(run)?;
+        fn save(
+            &self,
+            run: &PublishRun,
+            public_scope: &FrozenPublicScope,
+        ) -> Result<(), Self::Error> {
+            self.inner.save(run, public_scope)?;
             fs::write(
                 self.repository.join("content/foreign.md"),
                 b"foreign advance",
@@ -808,13 +805,17 @@ mod tests {
         fn list_for_target(&self, target: &GitRefTarget) -> Result<Vec<PublishRun>, Self::Error> {
             self.inner.list_for_target(target)
         }
+
+        fn public_scope(&self, id: PublishRunId) -> Result<Option<FrozenPublicScope>, Self::Error> {
+            self.inner.public_scope(id)
+        }
     }
 
     #[derive(Default)]
     struct MemoryPublishRunStore(BTreeMap<PublishRunId, PublishRun>);
     impl PublishRunStore for MemoryPublishRunStore {
         type Error = Infallible;
-        fn save(&self, _: &PublishRun) -> Result<(), Self::Error> {
+        fn save(&self, _: &PublishRun, _: &FrozenPublicScope) -> Result<(), Self::Error> {
             unreachable!()
         }
         fn get(&self, id: PublishRunId) -> Result<Option<PublishRun>, Self::Error> {
@@ -825,6 +826,9 @@ mod tests {
         }
         fn list_for_target(&self, _: &GitRefTarget) -> Result<Vec<PublishRun>, Self::Error> {
             Ok(Vec::new())
+        }
+        fn public_scope(&self, _: PublishRunId) -> Result<Option<FrozenPublicScope>, Self::Error> {
+            Ok(None)
         }
     }
 
@@ -1152,6 +1156,67 @@ mod tests {
         ));
         assert!(recovered.is_satisfied());
         assert_eq!(repository.remote_oid(), published);
+    }
+
+    /// The scope an attempt was decided under is frozen together with the intent: a
+    /// durable run can always answer "which source paths was the public question
+    /// asked about?" without consulting current configuration.
+    #[test]
+    fn a_successful_attempt_freezes_the_configured_public_scope() {
+        let repository = TestRepository::new();
+        let store = LocalContentStore::new(repository.root.join("content-store"));
+        let (snapshot, projection) = repository.projection(&store);
+        let runs = SqlitePublishRunStore::open(repository.root.join("runs.sqlite")).unwrap();
+        let observations =
+            SqliteRemoteObservationStore::open(repository.root.join("observations.sqlite"))
+                .unwrap();
+        let deliveries =
+            SqliteDeliveryProjectionStore::open(repository.root.join("deliveries.sqlite")).unwrap();
+        let asset_target = FilesystemAssetTarget::new(repository.root.join("asset-target"));
+        let asset_observations =
+            SqliteAssetObservationStore::open(repository.root.join("asset-observations.sqlite"))
+                .unwrap();
+        let mut asset_observation_ids =
+            SequentialAssetObservationIdGenerator::new(AssetObservationId::new(1).unwrap());
+        let mut run_ids = SequentialPublishRunIdGenerator::new(PublishRunId::new(1).unwrap());
+        let mut observation_ids =
+            SequentialRemoteObservationIdGenerator::new(RemoteObservationId::new(1).unwrap());
+        // Configured out of canonical order on purpose.
+        let scope =
+            PublicExclusionRules::new(["secret.md".to_owned(), "private/**".to_owned()]).unwrap();
+
+        let result = GitPublicationApplication::prepare_and_publish(
+            &projection,
+            &snapshot,
+            &scope,
+            &delivery_config(),
+            &repository.local,
+            target_id(),
+            target(),
+            &metadata(),
+            &store,
+            &runs,
+            &deliveries,
+            &asset_target,
+            &asset_observations,
+            &mut asset_observation_ids,
+            &observations,
+            &mut run_ids,
+            &mut observation_ids,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            result.workflow().git(),
+            GitPublicationExecution::Published { .. }
+        ));
+        let frozen = runs.public_scope(result.publish_run_id()).unwrap();
+        assert_eq!(frozen, Some(FrozenPublicScope::of(&scope)));
+        assert_eq!(
+            frozen.unwrap().rules(),
+            ["private/**", "secret.md"],
+            "the frozen record stores the canonical order, not the configured one"
+        );
     }
 
     /// The boundary this step establishes for real publications: a new non-Noop

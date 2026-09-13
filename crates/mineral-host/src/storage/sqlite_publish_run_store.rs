@@ -5,8 +5,8 @@ use rusqlite::{Connection, OptionalExtension, params, types::Type};
 use crate::{
     domain::{Sha256, SnapshotId},
     publisher::{
-        CommitSpecWire, GitCommitOid, GitRefTarget, PublishRun, PublishRunId, PublishRunStore,
-        PublishTargetId, RepositoryLocator,
+        CommitSpecWire, FrozenPublicScope, FrozenPublicScopeError, GitCommitOid, GitRefTarget,
+        PublishRun, PublishRunId, PublishRunStore, PublishTargetId, RepositoryLocator,
     },
     workflow::ManagedRoot,
 };
@@ -226,12 +226,9 @@ impl SqlitePublishRunStore {
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(SqlitePublishRunStoreError::Sqlite)
     }
-}
 
-impl PublishRunStore for SqlitePublishRunStore {
-    type Error = SqlitePublishRunStoreError;
-
-    fn save(&self, run: &PublishRun) -> Result<(), Self::Error> {
+    /// Writes one intent without committing; the caller owns the transaction.
+    fn save_intent(&self, run: &PublishRun) -> Result<(), SqlitePublishRunStoreError> {
         let (kind, commit_oid): (&str, Option<&str>) = match run.desired_commit() {
             None => ("noop", None),
             Some(commit_oid) => ("commit_ready", Some(commit_oid.as_str())),
@@ -284,6 +281,84 @@ impl PublishRunStore for SqlitePublishRunStore {
         }
     }
 
+    /// Records the frozen public scope beside its intent without committing; the
+    /// caller owns the transaction.
+    fn save_scope(
+        &self,
+        id: PublishRunId,
+        public_scope: &FrozenPublicScope,
+    ) -> Result<(), SqlitePublishRunStoreError> {
+        let encoded = serde_json::to_string(public_scope.rules())
+            .map_err(SqlitePublishRunStoreError::Serialization)?;
+        let inserted = self
+            .connection
+            .execute(
+                "INSERT OR IGNORE INTO publish_run_public_scope (publish_run_id, rules_json)
+                 VALUES (?1, ?2)",
+                params![integer("publish run ID", id.get())?, encoded],
+            )
+            .map_err(SqlitePublishRunStoreError::Sqlite)?;
+        if inserted == 1 {
+            return Ok(());
+        }
+        // Re-recording the same attempt is idempotent; a second, different scope for
+        // one attempt is refused, because the frozen provenance is immutable.
+        match self.public_scope(id)? {
+            Some(stored) if stored == *public_scope => Ok(()),
+            Some(_) => Err(SqlitePublishRunStoreError::ConflictingPublicScope(id)),
+            None => Err(SqlitePublishRunStoreError::Persistence(
+                "public scope insert was ignored without an existing row".to_owned(),
+            )),
+        }
+    }
+}
+
+impl PublishRunStore for SqlitePublishRunStore {
+    type Error = SqlitePublishRunStoreError;
+
+    fn save(&self, run: &PublishRun, public_scope: &FrozenPublicScope) -> Result<(), Self::Error> {
+        // The intent and the scope it was decided under become durable together: a
+        // run this engine records can never be left without the provenance that
+        // explains its public scope, and a store that cannot record the scope fails
+        // the attempt instead of publishing an unattributable run.
+        let transaction = self
+            .connection
+            .unchecked_transaction()
+            .map_err(SqlitePublishRunStoreError::Sqlite)?;
+        let saved = self
+            .save_intent(run)
+            .and_then(|()| self.save_scope(run.id(), public_scope));
+        if let Err(error) = saved {
+            // Dropping the transaction rolls back both writes: the intent is not
+            // durable without the scope it was decided under.
+            drop(transaction);
+            return Err(error);
+        }
+        transaction
+            .commit()
+            .map_err(SqlitePublishRunStoreError::Sqlite)
+    }
+
+    fn public_scope(&self, id: PublishRunId) -> Result<Option<FrozenPublicScope>, Self::Error> {
+        let encoded: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT rules_json FROM publish_run_public_scope WHERE publish_run_id = ?1",
+                [integer("publish run ID", id.get())?],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(SqlitePublishRunStoreError::Sqlite)?;
+        let Some(encoded) = encoded else {
+            return Ok(None);
+        };
+        let rules: Vec<String> =
+            serde_json::from_str(&encoded).map_err(SqlitePublishRunStoreError::Serialization)?;
+        FrozenPublicScope::rehydrate(rules)
+            .map(Some)
+            .map_err(SqlitePublishRunStoreError::FrozenPublicScope)
+    }
+
     fn get(&self, id: PublishRunId) -> Result<Option<PublishRun>, Self::Error> {
         self.connection
             .query_row(
@@ -320,47 +395,6 @@ impl PublishRunStore for SqlitePublishRunStore {
              ORDER BY created_at_unix_ms ASC, id ASC",
             Some(target),
         )
-    }
-
-    fn save_public_scope(
-        &self,
-        id: PublishRunId,
-        rules: &[String],
-    ) -> Result<(), SqlitePublishRunStoreError> {
-        let encoded =
-            serde_json::to_string(rules).map_err(SqlitePublishRunStoreError::Serialization)?;
-        self.connection
-            .execute(
-                "INSERT OR IGNORE INTO publish_run_public_scope (publish_run_id, rules_json)
-                 VALUES (?1, ?2)",
-                params![integer("publish run ID", id.get())?, encoded],
-            )
-            .map_err(SqlitePublishRunStoreError::Sqlite)?;
-        Ok(())
-    }
-
-    fn public_scope(
-        &self,
-        id: PublishRunId,
-    ) -> Result<Option<Vec<String>>, SqlitePublishRunStoreError> {
-        let encoded: Option<String> = self
-            .connection
-            .query_row(
-                "SELECT rules_json FROM publish_run_public_scope WHERE publish_run_id = ?1",
-                [integer("publish run ID", id.get())?],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(SqlitePublishRunStoreError::Sqlite)?;
-        let Some(encoded) = encoded else {
-            return Ok(None);
-        };
-        // A stored row is exactly the input that can be damaged: it is decoded
-        // strictly, so a corrupt scope is reported instead of silently becoming an
-        // empty one.
-        serde_json::from_str::<Vec<String>>(&encoded)
-            .map(Some)
-            .map_err(SqlitePublishRunStoreError::Serialization)
     }
 }
 
@@ -496,6 +530,10 @@ pub enum SqlitePublishRunStoreError {
     ValueOutOfRange(&'static str),
     /// A frozen public scope could not be encoded or was stored unreadably.
     Serialization(serde_json::Error),
+    /// A stored frozen public scope is not a usable canonical scope.
+    FrozenPublicScope(FrozenPublicScopeError),
+    /// An attempt already records a different public scope.
+    ConflictingPublicScope(PublishRunId),
     Persistence(String),
 }
 impl fmt::Display for SqlitePublishRunStoreError {
@@ -519,6 +557,12 @@ impl fmt::Display for SqlitePublishRunStoreError {
             Self::Serialization(error) => {
                 write!(formatter, "frozen public scope is not readable: {error}")
             }
+            Self::FrozenPublicScope(error) => write!(formatter, "{error}"),
+            Self::ConflictingPublicScope(id) => write!(
+                formatter,
+                "publish run {} already records a different public scope",
+                id.get()
+            ),
             Self::Persistence(message) => formatter.write_str(message),
         }
     }
@@ -528,6 +572,7 @@ impl Error for SqlitePublishRunStoreError {
         match self {
             Self::Sqlite(error) => Some(error),
             Self::Serialization(error) => Some(error),
+            Self::FrozenPublicScope(error) => Some(error),
             _ => None,
         }
     }
@@ -704,8 +749,8 @@ mod tests {
         let created = run(&directory, 1, "refs/heads/main", Some('c'), 10);
         let noop = run(&directory, 2, "refs/heads/main", None, 11);
         let store = SqlitePublishRunStore::open(&database).unwrap();
-        store.save(&created).unwrap();
-        store.save(&noop).unwrap();
+        store.save(&created, &FrozenPublicScope::empty()).unwrap();
+        store.save(&noop, &FrozenPublicScope::empty()).unwrap();
         drop(store);
         let reopened = SqlitePublishRunStore::open(&database).unwrap();
         assert_eq!(reopened.get(created.id()).unwrap(), Some(created));
@@ -717,11 +762,11 @@ mod tests {
         let directory = TestDirectory::new();
         let store = SqlitePublishRunStore::open(directory.database()).unwrap();
         let first = run(&directory, 1, "refs/heads/main", Some('c'), 10);
-        store.save(&first).unwrap();
-        store.save(&first).unwrap();
+        store.save(&first, &FrozenPublicScope::empty()).unwrap();
+        store.save(&first, &FrozenPublicScope::empty()).unwrap();
         let conflict = run(&directory, 1, "refs/heads/main", Some('d'), 10);
         assert!(
-            matches!(store.save(&conflict), Err(SqlitePublishRunStoreError::ConflictingPublishRunId(id)) if id == first.id())
+            matches!(store.save(&conflict, &FrozenPublicScope::empty()), Err(SqlitePublishRunStoreError::ConflictingPublishRunId(id)) if id == first.id())
         );
     }
 
@@ -732,9 +777,9 @@ mod tests {
         let late = run(&directory, 2, "refs/heads/main", Some('c'), 20);
         let first = run(&directory, 1, "refs/heads/main", Some('c'), 10);
         let staging = run(&directory, 3, "refs/heads/staging", Some('c'), 10);
-        store.save(&late).unwrap();
-        store.save(&first).unwrap();
-        store.save(&staging).unwrap();
+        store.save(&late, &FrozenPublicScope::empty()).unwrap();
+        store.save(&first, &FrozenPublicScope::empty()).unwrap();
+        store.save(&staging, &FrozenPublicScope::empty()).unwrap();
         assert_eq!(
             store.list().unwrap(),
             vec![first.clone(), staging.clone(), late]
@@ -757,7 +802,7 @@ mod tests {
             Some('c'),
             10,
         );
-        store.save(&run).unwrap();
+        store.save(&run, &FrozenPublicScope::empty()).unwrap();
         let restored = store.get(run.id()).unwrap().unwrap();
         assert_eq!(restored.target_id().as_str(), "public-production");
         assert_eq!(restored.target().remote_name(), "origin");
@@ -834,35 +879,119 @@ mod tests {
         assert_eq!(restored.commit_spec(), None);
     }
 
-    /// The public scope one attempt was decided under is frozen beside it, and a row
-    /// written before scopes were frozen reads as `None` rather than as empty.
+    /// The public scope one attempt was decided under is frozen together with the
+    /// intent, and a row written before scopes were frozen reads as `None` rather
+    /// than as empty.
     #[test]
-    fn the_public_scope_of_an_attempt_is_frozen_beside_it() {
+    fn the_public_scope_of_an_attempt_is_frozen_with_the_intent() {
         let directory = TestDirectory::new();
         let database = directory.database();
         let store = SqlitePublishRunStore::open(&database).unwrap();
-        let run = run(&directory, 1, "refs/heads/main", Some('b'), 10);
-        store.save(&run).unwrap();
+        let recorded = run(&directory, 1, "refs/heads/main", Some('b'), 10);
+        let scope = FrozenPublicScope::rehydrate(["private/**", "secret.md"]).unwrap();
+        store.save(&recorded, &scope).unwrap();
 
-        // A row with no frozen scope is "unknown", not "empty".
-        assert_eq!(store.public_scope(run.id()).unwrap(), None);
+        // A row that predates frozen scopes is "unknown", not "empty": it is written
+        // the way a database migrated from schema v4 looks.
+        let legacy = run(&directory, 2, "refs/heads/main", Some('b'), 11);
+        store.save(&legacy, &FrozenPublicScope::empty()).unwrap();
+        store
+            .connection
+            .execute(
+                "DELETE FROM publish_run_public_scope WHERE publish_run_id = ?1",
+                [integer("publish run ID", legacy.id().get()).unwrap()],
+            )
+            .unwrap();
 
-        store
-            .save_public_scope(run.id(), &["private/**".to_owned(), "secret.md".to_owned()])
-            .unwrap();
-        // Freezing is idempotent and never rewrites the first record.
-        store
-            .save_public_scope(run.id(), &["other/**".to_owned()])
-            .unwrap();
+        assert_eq!(store.public_scope(legacy.id()).unwrap(), None);
+        assert_eq!(
+            store.public_scope(recorded.id()).unwrap(),
+            Some(scope.clone()),
+            "an empty scope is recorded as an empty scope, not as unknown"
+        );
         drop(store);
 
         let reopened = SqlitePublishRunStore::open(&database).unwrap();
-        assert_eq!(
-            reopened.public_scope(run.id()).unwrap(),
-            Some(vec!["private/**".to_owned(), "secret.md".to_owned()])
-        );
+        assert_eq!(reopened.public_scope(recorded.id()).unwrap(), Some(scope));
         // The frozen scope is provenance: it is not part of the intent it describes.
-        assert_eq!(reopened.get(run.id()).unwrap(), Some(run));
+        assert_eq!(reopened.get(recorded.id()).unwrap(), Some(recorded));
+    }
+
+    /// Re-recording the same attempt is idempotent, but the frozen provenance is
+    /// immutable: a second, different scope for one attempt fails closed.
+    #[test]
+    fn re_saving_one_attempt_with_a_different_scope_fails_closed() {
+        let directory = TestDirectory::new();
+        let store = SqlitePublishRunStore::open(directory.database()).unwrap();
+        let run = run(&directory, 1, "refs/heads/main", Some('b'), 10);
+        let scope = FrozenPublicScope::rehydrate(["private/**"]).unwrap();
+        let other = FrozenPublicScope::rehydrate(["secret.md"]).unwrap();
+
+        store.save(&run, &scope).unwrap();
+        store.save(&run, &scope).unwrap();
+
+        assert!(matches!(
+            store.save(&run, &other),
+            Err(SqlitePublishRunStoreError::ConflictingPublicScope(id)) if id == run.id()
+        ));
+        assert!(matches!(
+            store.save(&run, &FrozenPublicScope::empty()),
+            Err(SqlitePublishRunStoreError::ConflictingPublicScope(id)) if id == run.id()
+        ));
+        assert_eq!(store.public_scope(run.id()).unwrap(), Some(scope));
+    }
+
+    /// The intent and its scope are one durable fact: when the scope cannot be
+    /// recorded, the intent is not recorded either.
+    #[test]
+    fn an_unrecordable_scope_rolls_back_the_intent() {
+        let directory = TestDirectory::new();
+        let store = SqlitePublishRunStore::open(directory.database()).unwrap();
+        let run = run(&directory, 1, "refs/heads/main", Some('b'), 10);
+        store
+            .connection
+            .execute_batch("DROP TABLE publish_run_public_scope;")
+            .unwrap();
+
+        assert!(store.save(&run, &FrozenPublicScope::empty()).is_err());
+        assert_eq!(
+            store.get(run.id()).unwrap(),
+            None,
+            "the intent must not survive a failed scope write"
+        );
+        assert_eq!(store.list().unwrap(), Vec::new());
+    }
+
+    /// A stored record is exactly the input that can be damaged, so it is validated
+    /// again on the way out instead of quietly meaning something else.
+    #[test]
+    fn a_stored_scope_that_is_not_canonical_is_refused() {
+        let directory = TestDirectory::new();
+        let store = SqlitePublishRunStore::open(directory.database()).unwrap();
+        let run = run(&directory, 1, "refs/heads/main", Some('b'), 10);
+        store.save(&run, &FrozenPublicScope::empty()).unwrap();
+
+        for damaged in [
+            r#"["b/**","a/**"]"#,
+            r#"["/absolute.md"]"#,
+            r#"["..\\escape.md"]"#,
+            r#"[""]"#,
+        ] {
+            store
+                .connection
+                .execute(
+                    "UPDATE publish_run_public_scope SET rules_json = ?1 WHERE publish_run_id = ?2",
+                    params![damaged, integer("publish run ID", run.id().get()).unwrap()],
+                )
+                .unwrap();
+            assert!(
+                matches!(
+                    store.public_scope(run.id()),
+                    Err(SqlitePublishRunStoreError::FrozenPublicScope(_))
+                ),
+                "damaged scope {damaged} was accepted"
+            );
+        }
     }
 
     #[test]
@@ -881,7 +1010,7 @@ mod tests {
             10,
         );
         let store = SqlitePublishRunStore::open(&database).unwrap();
-        store.save(&run).unwrap();
+        store.save(&run, &FrozenPublicScope::empty()).unwrap();
         drop(store);
 
         let reopened = SqlitePublishRunStore::open(&database).unwrap();
@@ -1145,6 +1274,11 @@ mod tests {
             assert_eq!(run.delivery_projection_binding(), None);
         }
 
+        // A run that predates frozen scopes has an unknown scope rather than an
+        // empty one: the upgrade must not invent provenance it never recorded.
+        assert_eq!(store.public_scope(noop.id()).unwrap(), None);
+        assert_eq!(store.public_scope(historical.id()).unwrap(), None);
+
         // Nothing was invented in the delivery projection store; a historical run
         // simply has no durable delivery intent, which is a degraded but honest
         // state rather than corruption.
@@ -1197,7 +1331,7 @@ mod tests {
         )
         .unwrap();
         let store = SqlitePublishRunStore::open(&database).unwrap();
-        store.save(&run).unwrap();
+        store.save(&run, &FrozenPublicScope::empty()).unwrap();
         drop(store);
 
         let reopened = SqlitePublishRunStore::open(&database).unwrap();

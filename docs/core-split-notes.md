@@ -154,6 +154,21 @@ DeliveryProjection 或 Git 身份：规则变了而选中集合没变时最终�
 每次 publish run 用 `publish-runs.sqlite3` 的 `publish_run_public_scope` 旁表冻结当次
 canonical 规则（纯 provenance，不改变任何已有 identity，也不改 Git 恢复路径）。
 
+S6.6.1 把这条 provenance 从"默认实现可以悄悄丢掉"变成**强制且原子**的 durable 事实。
+审计发现：`PublishRunStore::save_public_scope` / `public_scope` 当时带着 `Ok(())` / `Ok(None)`
+的**默认实现**，任何忘记覆写它们的 store 都能在"发布成功"的同时静默丢掉审计事实；而且
+intent 与 scope 是两次独立写入（`save` 再 `save_public_scope`），中间失败或崩溃会留下
+一个没有 scope 的 durable run，与 S6.6 之前的旧行**无法区分**。现在：
+
+* 契约改成一次调用 `save(&PublishRun, &FrozenPublicScope)`，没有默认实现：一个 store 要么
+  同时记录两者，要么记录不了——忘记实现是编译错误，而不是沉默的数据丢失；
+* `FrozenPublicScope` 是 canonical 规则的冻结副本（`of` 从校验过的规则冻结、`empty` 表示
+  "空范围"、`rehydrate` 重新校验并**要求已是 canonical 顺序**），读回时损坏的记录 fail closed；
+* SQLite store 在一个事务里写 intent + 旁表（schema v4→v5 只加旁表），任一失败则两者一起
+  回滚；同一 attempt 重复写同一 scope 幂等，写**不同** scope 是 `ConflictingPublicScope`；
+* `public_scope(id)` 的 `None` 只有一个含义：这一行写在"scope 会被冻结"之前（旧库），
+  绝不表示"范围为空"——空范围被记录成空范围，与新库旧行可以区分。
+
 同一轮还修掉一个 durable identity 的漏洞：`delivery_sha256` 当初只哈希
 "交付的文本树 + 已发布资产"，却没有覆盖它自己存储的 snapshot provenance
 （`snapshot_id`、`managed_root`、每篇文档的 `source_path`/`source_sha256`）。于是
