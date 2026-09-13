@@ -26,7 +26,8 @@ use super::{
     AssetReviewer, AssetSanitizer, CandidateAssetSet, DeliveryProjectionStore, EffectiveReviewSet,
     FinalPublicationSet, HumanReviewAttempt, HumanReviewBinding, HumanReviewKind,
     HumanReviewRecord, HumanReviewStore, HumanReviewSubject, ManagedRoot, MarkdownReviewEvaluator,
-    PublicPolicyRun, PublicPolicyRunResult, PublicProjection, ReviewRunIdGenerator,
+    PublicExclusionRules, PublicPolicyRun, PublicPolicyRunResult, PublicProjection,
+    PublicScopeIdentity, ReviewRunIdGenerator,
 };
 
 /// Caller-selected, durable human decisions.  The application never discovers
@@ -61,6 +62,12 @@ pub struct PublicationApplicationRequest<'a> {
     pub target: GitRefTarget,
     pub commit_metadata: &'a GitCommitMetadata,
     pub human_reviews: ExplicitHumanReviewSelection,
+    /// Which source paths the public publication may consider at all.
+    ///
+    /// This is a frozen input like the rest: the application never reads
+    /// configuration or the environment, and an excluded path is decided from its
+    /// canonical name before any of its bytes are evaluated.
+    pub public_scope: &'a PublicExclusionRules,
     /// Where delivered binary assets will be served from. This is a frozen
     /// input: the application never reads configuration or the environment.
     pub asset_delivery: &'a AssetDeliveryConfig,
@@ -69,6 +76,7 @@ pub struct PublicationApplicationRequest<'a> {
 #[derive(Clone, Debug)]
 pub struct PublicationTrace {
     snapshot: Snapshot,
+    public_scope: PublicScopeIdentity,
     markdown_reviews: PublicPolicyRunResult,
     asset_reviews: AssetReviewWorkflowResult,
     effective_reviews: EffectiveReviewSet,
@@ -76,6 +84,10 @@ pub struct PublicationTrace {
 impl PublicationTrace {
     pub fn snapshot(&self) -> &Snapshot {
         &self.snapshot
+    }
+    /// The frozen identity of the public scope this run was decided under.
+    pub fn public_scope(&self) -> PublicScopeIdentity {
+        self.public_scope
     }
     pub fn markdown_reviews(&self) -> &PublicPolicyRunResult {
         &self.markdown_reviews
@@ -224,6 +236,7 @@ impl PublicationApplication {
             markdown_reviewer,
             document_runs,
             human_store,
+            request.public_scope,
             request.markdown_policy,
             document_ids,
             created_at,
@@ -253,6 +266,7 @@ impl PublicationApplication {
             return Ok(PublicationApplicationOutcome::NeedsHumanReview {
                 trace: PublicationTrace {
                     snapshot: request.snapshot.clone(),
+                    public_scope: request.public_scope.identity(),
                     markdown_reviews: documents,
                     asset_reviews: no_assets,
                     effective_reviews: document_effective,
@@ -263,8 +277,9 @@ impl PublicationApplication {
             .dependency_graph()
             .cloned()
             .ok_or(PublicationApplicationError::MissingDependencyGraph)?;
-        let candidates = CandidateAssetSet::select_effective(&document_effective, &graph)
-            .map_err(|e| stage("candidate asset selection", e))?;
+        let candidates =
+            CandidateAssetSet::select_effective(&document_effective, &graph, request.public_scope)
+                .map_err(|e| stage("candidate asset selection", e))?;
         let assets = AssetReviewWorkflow::execute_at(
             AssetReviewWorkflowInput::new(
                 &candidates,
@@ -300,6 +315,7 @@ impl PublicationApplication {
         .map_err(|e| stage("effective review selection", e))?;
         let trace = PublicationTrace {
             snapshot: request.snapshot.clone(),
+            public_scope: request.public_scope.identity(),
             markdown_reviews: documents,
             asset_reviews: assets,
             effective_reviews: effective,
@@ -330,6 +346,7 @@ impl PublicationApplication {
         let publication = GitPublicationApplication::prepare_and_publish(
             &projection,
             request.snapshot,
+            request.public_scope,
             request.asset_delivery,
             request.repository,
             request.target_id,

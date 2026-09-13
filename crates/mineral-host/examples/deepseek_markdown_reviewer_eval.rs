@@ -25,7 +25,8 @@ use mineral_publisher::{
     source::LocalSource,
     storage::{LocalContentStore, SqliteReviewRunStore},
     workflow::{
-        NoHumanReviews, PublicPolicyRun, SequentialMarkdownReviews, SequentialReviewRunIdGenerator,
+        NoHumanReviews, PublicExclusionRules, PublicPolicyRun, SequentialMarkdownReviews,
+        SequentialReviewRunIdGenerator,
     },
 };
 
@@ -98,6 +99,7 @@ fn run() -> Result<CalibrationExitStatus, Box<dyn Error>> {
         &reviewer,
         &review_store,
         &NoHumanReviews,
+        &PublicExclusionRules::empty(),
         &policy,
         &mut review_ids,
         SystemTime::now(),

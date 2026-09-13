@@ -141,6 +141,19 @@ vault 变动（哪怕只是加一个与交付无关的文件）都换掉 snapsho
 * 与人工绑定一致：复用键保留 `content_path`（比 provider request identity 更保守），
   rename 会重新评审，跨 rename 的 content cache 留给以后单独设计。
 
+S6.6 增加 `public.exclude`：**公共发布范围排除规则**（不是 source ignore，也不是
+privacy reject）。规则定义并校验在 `mineral-core/workflow/public_scope`：相对 vault root
+的锚定 path pattern，支持 `*`（单段内任意字符）、`?`（单段内一个字符）、`**`（跨段；
+尾部 `/**` 表示"其下后代"），集合是无序并集，顺序与重复不影响 identity；非法规则
+（空、绝对路径/盘符、`\`、控制字符、`.`/`..`、空段、`!`）在**加载配置时**就 fail closed。
+位置：Snapshot/CAS **之后**、deterministic privacy 与所有 reviewer **之前**——被排除的文件
+仍进 Snapshot 与 CAS，但从不被分析、不进入候选集、不产生 pending、不调用 provider。
+included 文档依赖 excluded 资产时 fail closed（`ExcludedPublicDependency`），既不静默发布
+也不产生断链 URL。`PublicScopeIdentity` 是规则的确定性身份（用于报告/审计），但**不进入**
+DeliveryProjection 或 Git 身份：规则变了而选中集合没变时最终仍然 noop、不产生提交。
+每次 publish run 用 `publish-runs.sqlite3` 的 `publish_run_public_scope` 旁表冻结当次
+canonical 规则（纯 provenance，不改变任何已有 identity，也不改 Git 恢复路径）。
+
 同一轮还修掉一个 durable identity 的漏洞：`delivery_sha256` 当初只哈希
 "交付的文本树 + 已发布资产"，却没有覆盖它自己存储的 snapshot provenance
 （`snapshot_id`、`managed_root`、每篇文档的 `source_path`/`source_sha256`）。于是

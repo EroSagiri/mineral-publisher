@@ -475,6 +475,25 @@ pub trait PublishRunStore {
     fn get(&self, id: PublishRunId) -> Result<Option<PublishRun>, Self::Error>;
     fn list(&self) -> Result<Vec<PublishRun>, Self::Error>;
     fn list_for_target(&self, target: &GitRefTarget) -> Result<Vec<PublishRun>, Self::Error>;
+
+    /// Freezes the public scope one attempt was decided under.
+    ///
+    /// The scope is provenance, not identity: it says which source paths the public
+    /// question was asked about, and it must never change what the attempt publishes.
+    /// It is stored beside the intent rather than inside it, so a configuration
+    /// change can be audited without re-interpreting, or re-identifying, anything a
+    /// historical run already published.
+    fn save_public_scope(&self, _id: PublishRunId, _rules: &[String]) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    /// The public scope frozen for one attempt, in canonical order.
+    ///
+    /// `None` means the attempt was recorded before scopes were frozen; it does not
+    /// mean the scope was empty.
+    fn public_scope(&self, _id: PublishRunId) -> Result<Option<Vec<String>>, Self::Error> {
+        Ok(None)
+    }
 }
 
 #[cfg(test)]

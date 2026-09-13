@@ -9,7 +9,7 @@ use crate::{
     domain::{ContentPath, SnapshotId},
 };
 
-use super::{EffectiveReviewSet, PublicPolicyRunResult};
+use super::{EffectiveReviewSet, PublicExclusionRules, PublicPolicyRunResult};
 
 /// One local asset eligible for the later asset-review stage.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -123,6 +123,7 @@ impl CandidateAssetSet {
     pub fn select_effective(
         reviews: &EffectiveReviewSet,
         graph: &AssetDependencyGraph,
+        public_scope: &PublicExclusionRules,
     ) -> Result<Self, CandidateAssetSelectionError> {
         if reviews.snapshot_id() != graph.snapshot_id() {
             return Err(CandidateAssetSelectionError::SnapshotMismatch {
@@ -156,6 +157,20 @@ impl CandidateAssetSet {
                     .or_default()
                     .insert(dependency.document_path().clone());
             }
+        }
+        // Public scope outranks dependency inclusion: a document that is in scope
+        // and references an asset that is not must not drag it back into the public
+        // set, and it must not be published with a reference to an object nobody may
+        // serve. That is a scope conflict, and it is reported as one.
+        if let Some((asset, document)) = closure.iter().find_map(|(asset, dependents)| {
+            public_scope
+                .excludes(asset)
+                .then(|| (asset.clone(), dependents.iter().next().cloned()))
+        }) {
+            return Err(CandidateAssetSelectionError::ExcludedPublicDependency {
+                document: document.expect("a closure entry always has a dependent"),
+                dependency: asset,
+            });
         }
         Ok(Self {
             snapshot_id: reviews.snapshot_id(),
@@ -202,6 +217,15 @@ pub enum CandidateAssetSelectionError {
         graph_snapshot_id: SnapshotId,
     },
     ApprovedDocumentsHaveDependencyProblems(Vec<DependencyProblem>),
+    /// A document inside public scope requires an asset that public scope excludes.
+    ///
+    /// The two rules cannot both be honoured: publishing the document would publish
+    /// a reference to an object that is out of scope, and publishing the asset would
+    /// override the operator's exclusion. The attempt stops with the conflict named.
+    ExcludedPublicDependency {
+        document: ContentPath,
+        dependency: ContentPath,
+    },
 }
 
 impl fmt::Display for CandidateAssetSelectionError {
@@ -218,6 +242,13 @@ impl fmt::Display for CandidateAssetSelectionError {
                 formatter,
                 "{} unresolved dependency problem(s) belong to approved Markdown",
                 problems.len()
+            ),
+            Self::ExcludedPublicDependency {
+                document,
+                dependency,
+            } => write!(
+                formatter,
+                "public scope excludes {dependency}, which {document} requires"
             ),
         }
     }
@@ -313,6 +344,60 @@ mod tests {
             &AssetDependencyGraph::build(snapshot_id, documents),
         )
         .unwrap()
+    }
+
+    fn select_with_scope(
+        snapshot_id: SnapshotId,
+        documents: &[AnalyzedMarkdown],
+        outcomes: Vec<ReviewRun>,
+        scope: &PublicExclusionRules,
+    ) -> Result<CandidateAssetSet, CandidateAssetSelectionError> {
+        let policy = policy(snapshot_id, outcomes);
+        let graph = AssetDependencyGraph::build(snapshot_id, documents);
+        CandidateAssetSet::select_effective(
+            &crate::workflow::EffectiveReviewSet::from_parts_for_test(
+                snapshot_id,
+                policy
+                    .document_outcomes()
+                    .iter()
+                    .map(|run| {
+                        (
+                            run.content_path().clone(),
+                            crate::workflow::EffectiveDocumentDecision::Approved,
+                        )
+                    })
+                    .collect(),
+                Vec::new(),
+            ),
+            &graph,
+            scope,
+        )
+    }
+
+    /// Public scope outranks dependency inclusion: a document in scope that needs an
+    /// asset out of scope is a conflict, not an instruction to publish the asset.
+    #[test]
+    fn an_excluded_asset_dependency_fails_closed() {
+        let id = snapshot_id(1);
+        let document = analyzed("a.md", "![[private.png]]", vec![asset("private.png")]);
+        let scope = PublicExclusionRules::new(["private.png"]).unwrap();
+
+        let error =
+            select_with_scope(id, &[document], vec![approved(1, id, "a.md")], &scope).unwrap_err();
+
+        assert!(matches!(
+            error,
+            CandidateAssetSelectionError::ExcludedPublicDependency { .. }
+        ));
+        // The scope that excludes a path the document does not need changes nothing.
+        let other = PublicExclusionRules::new(["elsewhere/**"]).unwrap();
+        let document = analyzed("a.md", "![[public.png]]", vec![asset("public.png")]);
+        let candidates =
+            select_with_scope(id, &[document], vec![approved(1, id, "a.md")], &other).unwrap();
+        assert_eq!(
+            candidates.assets().collect::<Vec<_>>(),
+            [&path("public.png")]
+        );
     }
 
     #[test]

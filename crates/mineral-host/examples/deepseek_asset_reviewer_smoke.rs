@@ -22,8 +22,8 @@ use mineral_publisher::{
     workflow::{
         AssetHumanReviewReason, AssetProgramCheck, AssetReviewDisposition, AssetReviewRunId,
         AssetReviewWorkflow, AssetReviewWorkflowInput, CandidateAssetSet, NoHumanReviews,
-        PublicPolicyRun, SequentialAssetReviewRunIdGenerator, SequentialAssetReviews,
-        SequentialMarkdownReviews, SequentialReviewRunIdGenerator,
+        PublicExclusionRules, PublicPolicyRun, SequentialAssetReviewRunIdGenerator,
+        SequentialAssetReviews, SequentialMarkdownReviews, SequentialReviewRunIdGenerator,
     },
 };
 
@@ -72,6 +72,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         &markdown_reviewer,
         &markdown_store,
         &NoHumanReviews,
+        &PublicExclusionRules::empty(),
         &markdown_policy,
         &mut markdown_ids,
         SystemTime::now(),

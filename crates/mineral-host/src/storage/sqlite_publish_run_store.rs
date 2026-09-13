@@ -11,7 +11,7 @@ use crate::{
     workflow::ManagedRoot,
 };
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 /// Local SQLite persistence for immutable publication intents.
 pub struct SqlitePublishRunStore {
@@ -64,7 +64,13 @@ impl SqlitePublishRunStore {
                          ON publish_runs(remote_name, destination_ref, created_at_unix_ms, id);
                      CREATE INDEX publish_runs_by_creation
                          ON publish_runs(created_at_unix_ms, id);
-                     PRAGMA user_version = 4;
+                     CREATE TABLE publish_run_public_scope (
+                         publish_run_id INTEGER PRIMARY KEY
+                             REFERENCES publish_runs(id) ON DELETE CASCADE,
+                         rules_json TEXT NOT NULL,
+                         CHECK (length(rules_json) > 0)
+                     );
+                     PRAGMA user_version = 5;
                      COMMIT;",
                 ).map_err(SqlitePublishRunStoreError::Sqlite)?;
                 version = SCHEMA_VERSION;
@@ -172,6 +178,25 @@ impl SqlitePublishRunStore {
                 )
                 .map_err(SqlitePublishRunStoreError::Sqlite)?;
             version = 4;
+        }
+        if version == 4 {
+            // Additive: the public scope one attempt was decided under is provenance
+            // and lives beside the intent, never inside it, so freezing it cannot
+            // re-identify or re-interpret anything an earlier run published.
+            connection
+                .execute_batch(
+                    "BEGIN IMMEDIATE;
+                     CREATE TABLE publish_run_public_scope (
+                         publish_run_id INTEGER PRIMARY KEY
+                             REFERENCES publish_runs(id) ON DELETE CASCADE,
+                         rules_json TEXT NOT NULL,
+                         CHECK (length(rules_json) > 0)
+                     );
+                     PRAGMA user_version = 5;
+                     COMMIT;",
+                )
+                .map_err(SqlitePublishRunStoreError::Sqlite)?;
+            version = 5;
         }
         if version != SCHEMA_VERSION {
             return Err(SqlitePublishRunStoreError::UnsupportedSchemaVersion(
@@ -295,6 +320,47 @@ impl PublishRunStore for SqlitePublishRunStore {
              ORDER BY created_at_unix_ms ASC, id ASC",
             Some(target),
         )
+    }
+
+    fn save_public_scope(
+        &self,
+        id: PublishRunId,
+        rules: &[String],
+    ) -> Result<(), SqlitePublishRunStoreError> {
+        let encoded =
+            serde_json::to_string(rules).map_err(SqlitePublishRunStoreError::Serialization)?;
+        self.connection
+            .execute(
+                "INSERT OR IGNORE INTO publish_run_public_scope (publish_run_id, rules_json)
+                 VALUES (?1, ?2)",
+                params![integer("publish run ID", id.get())?, encoded],
+            )
+            .map_err(SqlitePublishRunStoreError::Sqlite)?;
+        Ok(())
+    }
+
+    fn public_scope(
+        &self,
+        id: PublishRunId,
+    ) -> Result<Option<Vec<String>>, SqlitePublishRunStoreError> {
+        let encoded: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT rules_json FROM publish_run_public_scope WHERE publish_run_id = ?1",
+                [integer("publish run ID", id.get())?],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(SqlitePublishRunStoreError::Sqlite)?;
+        let Some(encoded) = encoded else {
+            return Ok(None);
+        };
+        // A stored row is exactly the input that can be damaged: it is decoded
+        // strictly, so a corrupt scope is reported instead of silently becoming an
+        // empty one.
+        serde_json::from_str::<Vec<String>>(&encoded)
+            .map(Some)
+            .map_err(SqlitePublishRunStoreError::Serialization)
     }
 }
 
@@ -428,6 +494,8 @@ pub enum SqlitePublishRunStoreError {
     UnsupportedSchemaVersion(i64),
     ConflictingPublishRunId(PublishRunId),
     ValueOutOfRange(&'static str),
+    /// A frozen public scope could not be encoded or was stored unreadably.
+    Serialization(serde_json::Error),
     Persistence(String),
 }
 impl fmt::Display for SqlitePublishRunStoreError {
@@ -448,6 +516,9 @@ impl fmt::Display for SqlitePublishRunStoreError {
             Self::ValueOutOfRange(field) => {
                 write!(formatter, "{field} is outside SQLite's integer range")
             }
+            Self::Serialization(error) => {
+                write!(formatter, "frozen public scope is not readable: {error}")
+            }
             Self::Persistence(message) => formatter.write_str(message),
         }
     }
@@ -456,6 +527,7 @@ impl Error for SqlitePublishRunStoreError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Sqlite(error) => Some(error),
+            Self::Serialization(error) => Some(error),
             _ => None,
         }
     }
@@ -762,6 +834,37 @@ mod tests {
         assert_eq!(restored.commit_spec(), None);
     }
 
+    /// The public scope one attempt was decided under is frozen beside it, and a row
+    /// written before scopes were frozen reads as `None` rather than as empty.
+    #[test]
+    fn the_public_scope_of_an_attempt_is_frozen_beside_it() {
+        let directory = TestDirectory::new();
+        let database = directory.database();
+        let store = SqlitePublishRunStore::open(&database).unwrap();
+        let run = run(&directory, 1, "refs/heads/main", Some('b'), 10);
+        store.save(&run).unwrap();
+
+        // A row with no frozen scope is "unknown", not "empty".
+        assert_eq!(store.public_scope(run.id()).unwrap(), None);
+
+        store
+            .save_public_scope(run.id(), &["private/**".to_owned(), "secret.md".to_owned()])
+            .unwrap();
+        // Freezing is idempotent and never rewrites the first record.
+        store
+            .save_public_scope(run.id(), &["other/**".to_owned()])
+            .unwrap();
+        drop(store);
+
+        let reopened = SqlitePublishRunStore::open(&database).unwrap();
+        assert_eq!(
+            reopened.public_scope(run.id()).unwrap(),
+            Some(vec!["private/**".to_owned(), "secret.md".to_owned()])
+        );
+        // The frozen scope is provenance: it is not part of the intent it describes.
+        assert_eq!(reopened.get(run.id()).unwrap(), Some(run));
+    }
+
     #[test]
     fn a_reconstructible_run_survives_restart_with_its_frozen_spec() {
         let directory = TestDirectory::new();
@@ -901,7 +1004,7 @@ mod tests {
                 .connection
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
-            4
+            5
         );
         let stored_spec: Option<String> = reopened
             .connection
@@ -1013,7 +1116,7 @@ mod tests {
                 .connection
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
-            4
+            5
         );
         let noop = store.get(PublishRunId::new(1).unwrap()).unwrap().unwrap();
         let historical = store.get(PublishRunId::new(2).unwrap()).unwrap().unwrap();

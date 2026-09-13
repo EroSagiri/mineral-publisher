@@ -18,6 +18,7 @@ mod final_dependency_closure;
 mod human_review;
 mod public_policy_run;
 mod public_projection;
+mod public_scope;
 mod publish_plan;
 mod review_reuse;
 
@@ -76,6 +77,10 @@ pub use public_policy_run::{
 pub use public_projection::{
     AssetPublicationFacts, ManagedRoot, ProjectionEntry, ProjectionEntryKind, ProjectionTargetPath,
     ProjectionTargetPathError, PublicProjection, PublicProjectionError, PublicationFileMode,
+};
+pub use public_scope::{
+    PUBLIC_SCOPE_RULES_VERSION, PublicExclusionRule, PublicExclusionRuleError,
+    PublicExclusionRules, PublicScopeDecision, PublicScopeIdentity,
 };
 pub use publish_plan::{
     CurrentTargetEntry, CurrentTargetState, CurrentTargetStateError, PublishOperation, PublishPlan,

@@ -12,7 +12,8 @@ use crate::{
 };
 
 use super::{
-    HumanReviewKind, HumanReviewStore, HumanReviewSubject, ReviewReuseError, reuse_document_review,
+    HumanReviewKind, HumanReviewStore, HumanReviewSubject, PublicExclusionRules, ReviewReuseError,
+    reuse_document_review,
 };
 
 /// Decides how a batch of review candidates is executed.
@@ -355,6 +356,7 @@ impl PublicPolicyRun {
         reviewer: &R,
         review_run_store: &S,
         human_reviews: &H,
+        public_scope: &PublicExclusionRules,
         policy: &PolicyIdentity,
         id_generator: &mut I,
         created_at: SystemTime,
@@ -373,11 +375,14 @@ impl PublicPolicyRun {
         let mut analyses = Vec::new();
         let mut analysis_failures = Vec::new();
 
-        for file in snapshot
-            .files()
-            .iter()
-            .filter(|file| file.path().as_str().ends_with(".md"))
-        {
+        // Public scope is decided from the canonical path alone, and it is decided
+        // before anything else looks at the file: an excluded document is never
+        // analyzed, never filtered for privacy, and never reviewed. Its bytes are
+        // already in the immutable Snapshot, which is a source fact this stage must
+        // not change.
+        for file in snapshot.files().iter().filter(|file| {
+            file.path().as_str().ends_with(".md") && !public_scope.excludes(file.path())
+        }) {
             match analyzer.analyze(snapshot, file.path()) {
                 Ok(analysis) => analyses.push(analysis),
                 Err(error) => analysis_failures.push(error),

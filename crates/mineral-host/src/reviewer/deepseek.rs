@@ -1247,7 +1247,7 @@ mod tests {
         source::LocalSource,
         storage::{LocalContentStore, SqliteReviewRunStore},
         workflow::{
-            NoHumanReviews, PublicPolicyRun, SequentialMarkdownReviews,
+            NoHumanReviews, PublicExclusionRules, PublicPolicyRun, SequentialMarkdownReviews,
             SequentialReviewRunIdGenerator,
         },
     };
@@ -1525,6 +1525,7 @@ mod tests {
             reviewer,
             &store,
             &NoHumanReviews,
+            &PublicExclusionRules::empty(),
             &policy,
             &mut ids,
             SystemTime::now(),

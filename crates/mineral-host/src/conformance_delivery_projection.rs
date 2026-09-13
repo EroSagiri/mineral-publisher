@@ -233,6 +233,12 @@ fn config() -> AssetDeliveryConfig {
     AssetDeliveryConfig::new("https://assets.example.com").unwrap()
 }
 
+/// The live test publishes with an empty public scope: the whole fixture vault is
+/// in public scope, which is what these tests are about.
+fn live_public_scope() -> crate::workflow::PublicExclusionRules {
+    crate::workflow::PublicExclusionRules::empty()
+}
+
 /// The real bucket, when one is configured.
 ///
 /// The default test run never reads a credential and never opens a socket; this
@@ -811,6 +817,7 @@ fn a_live_bucket_receives_the_asset_before_a_real_git_compare_and_swap() {
     let first = GitPublicationApplication::prepare_and_publish(
         &projection,
         &snapshot,
+        &live_public_scope(),
         &config(),
         &repository.local,
         target_id.clone(),
@@ -872,6 +879,7 @@ fn a_live_bucket_receives_the_asset_before_a_real_git_compare_and_swap() {
     let second = GitPublicationApplication::prepare_and_publish(
         &projection,
         &snapshot,
+        &live_public_scope(),
         &config(),
         &repository.local,
         target_id,

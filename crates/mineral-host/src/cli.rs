@@ -42,8 +42,9 @@ use mineral_publisher::{
         AssetDeliveryConfig, AssetReviewCandidate, AssetReviewRunId, AssetReviewRunIdGenerator,
         AssetReviewRunStore, AssetReviewer, AssetReviewerError, AssetReviewerReport,
         ExplicitHumanReviewSelection, HumanReviewAttempt, HumanReviewDecision, HumanReviewId,
-        HumanReviewRecordError, HumanReviewResolution, PublicationApplication,
-        PublicationApplicationOutcome, PublicationApplicationRequest, ReviewRunIdGenerator,
+        HumanReviewRecordError, HumanReviewResolution, PublicExclusionRules,
+        PublicationApplication, PublicationApplicationOutcome, PublicationApplicationRequest,
+        ReviewRunIdGenerator,
     },
 };
 use serde::Deserialize;
@@ -73,6 +74,16 @@ assets:
   #   secret_access_key_env: MINERAL_R2_SECRET_ACCESS_KEY
   #   region: auto
   #   timeout_seconds: 300
+public:
+  # Source paths that stay in the Snapshot and in the content store but never enter
+  # the public candidate set: no privacy scan, no review, no publication.
+  exclude: []
+  # exclude:
+  #   - "private/**"
+  #   - "drafts/**"
+  #   - "secret.md"
+  #   - "notes/internal.md"
+  #   - "**/*.tmp"
 review:
   api_base_url: https://api.deepseek.com
   markdown_model: deepseek-flash
@@ -95,6 +106,10 @@ struct Config {
     /// delivery existed; publication fails closed when it is absent.
     #[serde(default)]
     assets: Option<AssetsConfig>,
+    /// Which source paths the public publication may consider. Absent means the
+    /// scope excludes nothing, which is exactly how every earlier workspace behaved.
+    #[serde(default)]
+    public: Option<PublicConfig>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -163,6 +178,18 @@ struct R2Config {
     #[serde(default)]
     timeout_seconds: Option<u64>,
 }
+/// The public publication scope.
+///
+/// The rules are validated while the workspace is loaded, so an unusable pattern
+/// stops the run before it can publish anything, and the canonical rules are what
+/// the publication records as its provenance.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PublicConfig {
+    #[serde(default)]
+    exclude: Vec<String>,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReviewConfig {
@@ -201,6 +228,12 @@ impl Workspace {
         config.source.path = absolute(base, &config.source.path)?;
         config.state.path = absolute(base, &config.state.path)?;
         config.git.repository = absolute(base, &config.git.repository)?;
+        // Public scope is validated with the rest of the configuration: an unusable
+        // rule must be reported before a publication is under way, not during one.
+        if let Some(public) = &config.public {
+            PublicExclusionRules::new(public.exclude.clone())
+                .map_err(|error| format!("public.exclude contains an unusable rule: {error}"))?;
+        }
         if let Some(assets) = &mut config.assets {
             // One target, chosen explicitly: a workspace that names both (or
             // neither) must fail before a publication picks one for it.
@@ -247,6 +280,15 @@ impl Workspace {
     fn delivery_db(&self) -> PathBuf {
         self.config.state.path.join("delivery-projections.sqlite3")
     }
+    /// The validated, canonical public scope for this workspace.
+    fn public_scope(&self) -> Result<PublicExclusionRules, Box<dyn Error>> {
+        let Some(public) = &self.config.public else {
+            return Ok(PublicExclusionRules::empty());
+        };
+        PublicExclusionRules::new(public.exclude.clone())
+            .map_err(|error| format!("public.exclude contains an unusable rule: {error}").into())
+    }
+
     fn asset_delivery(&self) -> Result<AssetDeliveryConfig, Box<dyn Error>> {
         Ok(AssetDeliveryConfig::new(
             self.assets()?.public_base_url.clone(),
@@ -415,6 +457,7 @@ fn publish(workspace: Workspace) -> Result<(), Box<dyn Error>> {
     let publish_runs = SqlitePublishRunStore::open(workspace.publish_db())?;
     let delivery_projections = SqliteDeliveryProjectionStore::open(workspace.delivery_db())?;
     let asset_target = workspace.asset_target()?;
+    let public_scope = workspace.public_scope()?;
     let asset_location = asset_target.description();
     let asset_observations = SqliteAssetObservationStore::open(workspace.asset_observations_db())?;
     let observations = SqliteRemoteObservationStore::open(workspace.observation_db())?;
@@ -456,6 +499,7 @@ fn publish(workspace: Workspace) -> Result<(), Box<dyn Error>> {
             &workspace.config.git.message,
         )?,
         human_reviews: ExplicitHumanReviewSelection::default(),
+        public_scope: &public_scope,
         asset_delivery: &workspace.asset_delivery()?,
     };
     // Runtime concerns stay in the composition root: wall-clock time and the
@@ -494,11 +538,15 @@ fn publish(workspace: Workspace) -> Result<(), Box<dyn Error>> {
         &asset_evaluator,
     )?;
     eprintln!("[4/4] Publication workflow finished.");
-    render_publication(outcome, &asset_location);
+    render_publication(outcome, &asset_location, &public_scope);
     Ok(())
 }
 
-fn render_publication(outcome: PublicationApplicationOutcome, asset_location: &str) {
+fn render_publication(
+    outcome: PublicationApplicationOutcome,
+    asset_location: &str,
+    public_scope: &PublicExclusionRules,
+) {
     match outcome {
         PublicationApplicationOutcome::NeedsHumanReview { trace } => {
             println!(
@@ -512,6 +560,7 @@ fn render_publication(outcome: PublicationApplicationOutcome, asset_location: &s
                 trace.asset_reviews().entries().len(),
                 trace.effective_reviews().pending_assets().len()
             );
+            println!("  public scope: {}", trace.public_scope());
             render_warnings(trace.markdown_reviews());
         }
         PublicationApplicationOutcome::Completed { trace, completed } => {
@@ -566,6 +615,11 @@ fn render_publication(outcome: PublicationApplicationOutcome, asset_location: &s
                 completed.publication_set().asset_paths().len(),
                 assets,
                 asset_location
+            );
+            println!(
+                "  public scope: {} ({} rule(s))",
+                trace.public_scope(),
+                public_scope.len()
             );
             if status == "noop" {
                 println!("  No changes to publish.");
@@ -1066,6 +1120,53 @@ mod tests {
                 }
             }
         }
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// `public.exclude` is parsed into validated core rules, and an absent section
+    /// means the empty scope every earlier workspace had.
+    #[test]
+    fn a_workspace_parses_its_public_scope() {
+        let directory =
+            std::env::temp_dir().join(format!("mineral-cli-public-scope-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+
+        // Absent: no exclusion at all.
+        let path = directory.join("absent.yml");
+        std::fs::write(&path, DEFAULT_CONFIG).unwrap();
+        let workspace = Workspace::load(path).unwrap();
+        assert!(workspace.public_scope().unwrap().is_empty());
+
+        // Configured: the rules are parsed, canonicalized and validated at load.
+        let configured = DEFAULT_CONFIG.replace(
+            "  exclude: []\n",
+            "  exclude:\n    - \"notes/internal.md\"\n    - \"private/**\"\n    - \"attachments/private.png\"\n    - \"**/*.tmp\"\n",
+        );
+        let path = directory.join("configured.yml");
+        std::fs::write(&path, configured).unwrap();
+        let scope = Workspace::load(path).unwrap().public_scope().unwrap();
+        assert_eq!(
+            scope.canonical(),
+            [
+                "**/*.tmp",
+                "attachments/private.png",
+                "notes/internal.md",
+                "private/**"
+            ]
+        );
+        assert!(scope.excludes(&mineral_core::domain::ContentPath::new("private/a.md").unwrap()));
+
+        // Malformed: refused while the workspace is loaded, not during a publication.
+        let malformed =
+            DEFAULT_CONFIG.replace("  exclude: []\n", "  exclude:\n    - \"../outside/**\"\n");
+        let path = directory.join("malformed.yml");
+        std::fs::write(&path, malformed).unwrap();
+        let error = Workspace::load(path)
+            .err()
+            .expect("an unusable rule must be refused")
+            .to_string();
+        assert!(error.contains("public.exclude"), "{error}");
+
         let _ = std::fs::remove_dir_all(&directory);
     }
 

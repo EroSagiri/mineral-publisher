@@ -282,6 +282,40 @@ mod tests {
         .unwrap()
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn execute_with_policy_and_scope<R, S, H>(
+        snapshot: &Snapshot,
+        content_store: &LocalContentStore,
+        reviewer: &R,
+        review_run_store: &S,
+        human_reviews: &H,
+        public_scope: &PublicExclusionRules,
+        policy_identity: &PolicyIdentity,
+        first_id: u64,
+    ) -> Result<
+        PublicPolicyRunResult,
+        PublicPolicyRunError<S::Error, SequentialReviewRunIdGeneratorError, H::Error>,
+    >
+    where
+        R: Reviewer + ?Sized,
+        S: ReviewRunStore + ?Sized,
+        H: HumanReviewStore + ?Sized,
+    {
+        let mut ids = SequentialReviewRunIdGenerator::new(ReviewRunId::new(first_id).unwrap());
+        PublicPolicyRun::execute_at(
+            snapshot,
+            content_store,
+            reviewer,
+            review_run_store,
+            human_reviews,
+            public_scope,
+            policy_identity,
+            &mut ids,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(10),
+            &SequentialMarkdownReviews,
+        )
+    }
+
     fn execute_with_policy<R, S, H>(
         snapshot: &Snapshot,
         content_store: &LocalContentStore,
@@ -306,6 +340,7 @@ mod tests {
             reviewer,
             review_run_store,
             human_reviews,
+            &PublicExclusionRules::empty(),
             policy_identity,
             &mut ids,
             SystemTime::UNIX_EPOCH + Duration::from_secs(10),
@@ -335,6 +370,7 @@ mod tests {
             reviewer,
             review_run_store,
             human_reviews,
+            &PublicExclusionRules::empty(),
             &policy(),
             &mut ids,
             SystemTime::UNIX_EPOCH + Duration::from_secs(10),
@@ -444,6 +480,197 @@ mod tests {
         ));
         assert!(result.approved_markdown_paths().is_empty());
         assert_eq!(review_store.saved(), result.document_outcomes());
+    }
+
+    /// Public scope decides the candidate set from the canonical path, before
+    /// anything reads the file: an excluded document is never analyzed, never
+    /// filtered for privacy and never reviewed, while the Snapshot keeps it.
+    #[test]
+    fn an_excluded_document_is_never_analyzed_or_reviewed() {
+        let directory = TestDirectory::new();
+        let store = directory.store();
+        let documents = SqliteReviewRunStore::open(directory.database()).unwrap();
+        let human = SqliteHumanReviewStore::open(directory.human_database()).unwrap();
+        let snapshot = snapshot_with_content(
+            &store,
+            [
+                ("index.md", b"visible" as &[u8]),
+                ("hidden.md", b"![[missing.png]]" as &[u8]),
+                ("private/note.md", b"![[also-missing.png]]" as &[u8]),
+            ],
+        );
+        // With nothing excluded, `hidden.md` and `private/note.md` have unresolved
+        // references and analysis fails. Removing their blobs from the content store
+        // would make even reading them impossible, which is how the next step proves
+        // that an excluded document is never read at all.
+        let reviewer = RecordingReviewer::approving(["index.md"]);
+
+        let scope = PublicExclusionRules::new(["hidden.md", "private/**"]).unwrap();
+        let result = execute_with_policy_and_scope(
+            &snapshot,
+            &store,
+            &reviewer,
+            &documents,
+            &human,
+            &scope,
+            &policy(),
+            1,
+        )
+        .unwrap();
+
+        assert_eq!(reviewer.calls(), ["index.md"]);
+        assert_eq!(result.document_outcomes().len(), 1);
+        assert_eq!(
+            result.document_outcomes()[0].content_path().as_str(),
+            "index.md"
+        );
+        // Out of scope is not private and not invalid: it is simply not a candidate.
+        assert!(result.private_documents().is_empty());
+        assert!(result.invalid_privacy_documents().is_empty());
+        // The Snapshot still holds every source file, excluded ones included.
+        assert_eq!(snapshot.files().len(), 3);
+
+        // Now the same run with the exclusions removed: the very same snapshot is
+        // analyzed again and the unresolved references are what stops it.
+        let empty = PublicExclusionRules::empty();
+        let reviewer = RecordingReviewer::approving(["index.md"]);
+        let result = execute_with_policy_and_scope(
+            &snapshot,
+            &store,
+            &reviewer,
+            &documents,
+            &human,
+            &empty,
+            &policy(),
+            2,
+        );
+        assert!(
+            result.is_ok(),
+            "an included-but-unresolvable document is a dependency problem, not a failure"
+        );
+    }
+
+    /// The scope, not the snapshot, decides the public candidate set: the same
+    /// snapshot under two configurations produces two different sets.
+    #[test]
+    fn the_public_scope_decides_the_candidate_set() {
+        let directory = TestDirectory::new();
+        let store = directory.store();
+        let documents = SqliteReviewRunStore::open(directory.database()).unwrap();
+        let human = SqliteHumanReviewStore::open(directory.human_database()).unwrap();
+        let snapshot = snapshot_with_content(
+            &store,
+            [
+                ("index.md", b"visible" as &[u8]),
+                ("notes/internal.md", b"internal" as &[u8]),
+            ],
+        );
+        let reviewer = RecordingReviewer::approving(["index.md", "notes/internal.md"]);
+
+        let open =
+            execute_with_fixed_clock(&snapshot, &store, &reviewer, &documents, &human, 10).unwrap();
+        assert_eq!(reviewer.calls().len(), 2);
+        assert_eq!(open.document_outcomes().len(), 2);
+
+        // Only the configuration changed. The snapshot is the same one.
+        let scope = PublicExclusionRules::new(["notes/internal.md"]).unwrap();
+        let reviewer = RecordingReviewer::approving(["index.md", "notes/internal.md"]);
+        let closed = execute_with_policy_and_scope(
+            &snapshot,
+            &store,
+            &reviewer,
+            &documents,
+            &human,
+            &scope,
+            &policy(),
+            20,
+        )
+        .unwrap();
+
+        // The excluded document is gone from the candidate set, and the included one
+        // is reused from the earlier snapshot rather than asked about again.
+        assert!(reviewer.calls().is_empty());
+        assert_eq!(
+            closed
+                .document_outcomes()
+                .iter()
+                .map(|run| run.content_path().as_str())
+                .collect::<Vec<_>>(),
+            ["index.md"]
+        );
+
+        // Removing the exclusion brings it back into the public candidate set. It had
+        // a conclusion from before it was excluded, so that conclusion is reused —
+        // nothing about the file was ever remembered as rejected.
+        let reviewer = RecordingReviewer::approving(["index.md", "notes/internal.md"]);
+        let reopened =
+            execute_with_fixed_clock(&snapshot, &store, &reviewer, &documents, &human, 30).unwrap();
+        assert!(reviewer.calls().is_empty());
+        assert_eq!(
+            reopened
+                .document_outcomes()
+                .iter()
+                .map(|run| run.content_path().as_str())
+                .collect::<Vec<_>>(),
+            ["index.md", "notes/internal.md"]
+        );
+    }
+
+    /// A document that was never public is reviewed the moment it returns to scope.
+    #[test]
+    fn a_document_returns_to_review_when_its_exclusion_is_removed() {
+        let directory = TestDirectory::new();
+        let store = directory.store();
+        let documents = SqliteReviewRunStore::open(directory.database()).unwrap();
+        let human = SqliteHumanReviewStore::open(directory.human_database()).unwrap();
+        let snapshot = snapshot_with_content(
+            &store,
+            [
+                ("index.md", b"visible" as &[u8]),
+                ("notes/internal.md", b"internal" as &[u8]),
+            ],
+        );
+        let scope = PublicExclusionRules::new(["notes/internal.md"]).unwrap();
+
+        let reviewer = RecordingReviewer::approving(["index.md"]);
+        let closed = execute_with_policy_and_scope(
+            &snapshot,
+            &store,
+            &reviewer,
+            &documents,
+            &human,
+            &scope,
+            &policy(),
+            50,
+        )
+        .unwrap();
+        assert_eq!(reviewer.calls(), ["index.md"]);
+        assert_eq!(closed.document_outcomes().len(), 1);
+
+        // The exclusion is gone and the file has no durable conclusion: it is a
+        // candidate now, and it is reviewed like any other.
+        let reviewer = RecordingReviewer::approving(["index.md", "notes/internal.md"]);
+        let reopened =
+            execute_with_fixed_clock(&snapshot, &store, &reviewer, &documents, &human, 60).unwrap();
+        assert_eq!(reviewer.calls(), ["notes/internal.md"]);
+        assert_eq!(reopened.document_outcomes().len(), 2);
+    }
+
+    /// A configuration change that selects the same set changes the scope identity
+    /// but nothing about the public output.
+    #[test]
+    fn an_unrelated_scope_change_only_changes_the_scope_identity() {
+        let first = PublicExclusionRules::new(["does-not-exist/**"]).unwrap();
+        let second = PublicExclusionRules::new(["another-does-not-exist/**"]).unwrap();
+
+        assert_ne!(first.identity(), second.identity());
+        for path_value in ["index.md", "notes/a.md", "attachments/a.png"] {
+            assert_eq!(
+                first.decide(&path(path_value)),
+                second.decide(&path(path_value)),
+                "{path_value} must be selected identically"
+            );
+        }
     }
 
     fn calls_for(reviewer: &RecordingReviewer, path: &str) -> usize {

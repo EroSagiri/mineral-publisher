@@ -7,6 +7,7 @@ use crate::{
     domain::{Snapshot, TimestampMillis},
     ports::BlobStore,
     runtime::SystemClock,
+    workflow::PublicExclusionRules,
     workflow::{
         AssetDeliveryConfig, DeliveryProjectionBuilder, DeliveryProjectionError,
         DeliveryProjectionStore, PublicProjection,
@@ -347,6 +348,7 @@ impl GitPublicationApplication {
     pub fn prepare_and_publish<P, D, T, S, G, O, R, I, B>(
         projection: &PublicProjection,
         snapshot: &Snapshot,
+        public_scope: &PublicExclusionRules,
         delivery_config: &AssetDeliveryConfig,
         repository: impl AsRef<Path>,
         target_id: PublishTargetId,
@@ -447,6 +449,19 @@ impl GitPublicationApplication {
         let publish_run = preparation.into_publish_run();
         publish_run_store
             .save(&publish_run)
+            .map_err(GitPublicationApplicationError::PublishRunPersistence)?;
+        // The scope this attempt was decided under is frozen beside the intent,
+        // never inside it: reproducibility of the audit must not change what the
+        // delivery identity already means.
+        publish_run_store
+            .save_public_scope(
+                publish_run.id(),
+                &public_scope
+                    .canonical()
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>(),
+            )
             .map_err(GitPublicationApplicationError::PublishRunPersistence)?;
         let remote = GitRemoteAdapter::new(repository.path())
             .map_err(GitPublicationApplicationError::RemoteAdapter)?;
@@ -850,6 +865,7 @@ mod tests {
         let result = GitPublicationApplication::prepare_and_publish(
             &projection,
             &snapshot,
+            &PublicExclusionRules::empty(),
             &delivery_config(),
             &repository.local,
             target_id(),
@@ -902,6 +918,7 @@ mod tests {
         let result = GitPublicationApplication::prepare_and_publish(
             &projection,
             &snapshot,
+            &PublicExclusionRules::empty(),
             &delivery_config(),
             &repository.local,
             target_id(),
@@ -954,6 +971,7 @@ mod tests {
         let result = GitPublicationApplication::prepare_and_publish(
             &projection,
             &snapshot,
+            &PublicExclusionRules::empty(),
             &delivery_config(),
             &repository.local,
             target_id(),
@@ -1013,6 +1031,7 @@ mod tests {
         let result = GitPublicationApplication::prepare_and_publish(
             &projection,
             &snapshot,
+            &PublicExclusionRules::empty(),
             &delivery_config(),
             &repository.local,
             target_id(),
@@ -1072,6 +1091,7 @@ mod tests {
         let result = GitPublicationApplication::prepare_and_publish(
             &projection,
             &snapshot,
+            &PublicExclusionRules::empty(),
             &delivery_config(),
             &repository.local,
             target_id(),
@@ -1162,6 +1182,7 @@ mod tests {
         let result = GitPublicationApplication::prepare_and_publish(
             &projection,
             &snapshot,
+            &PublicExclusionRules::empty(),
             &delivery_config(),
             &repository.local,
             target_id(),
@@ -1242,6 +1263,7 @@ mod tests {
         let result = GitPublicationApplication::prepare_and_publish(
             &projection,
             &snapshot,
+            &PublicExclusionRules::empty(),
             &delivery_config(),
             &repository.local,
             target_id(),
