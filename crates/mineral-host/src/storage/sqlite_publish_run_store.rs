@@ -1,0 +1,914 @@
+use std::{error::Error, fmt, path::Path};
+
+use rusqlite::{Connection, OptionalExtension, params, types::Type};
+
+use crate::{
+    domain::{Sha256, SnapshotId},
+    publisher::{
+        CommitSpecWire, GitCommitOid, GitRefTarget, PublishRun, PublishRunId, PublishRunStore,
+        PublishTargetId, RepositoryLocator,
+    },
+    workflow::ManagedRoot,
+};
+
+const SCHEMA_VERSION: i64 = 3;
+
+/// Local SQLite persistence for immutable publication intents.
+pub struct SqlitePublishRunStore {
+    connection: Connection,
+}
+
+impl SqlitePublishRunStore {
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, SqlitePublishRunStoreError> {
+        let connection = Connection::open(path).map_err(SqlitePublishRunStoreError::Sqlite)?;
+        connection
+            .execute_batch("PRAGMA foreign_keys = ON;")
+            .map_err(SqlitePublishRunStoreError::Sqlite)?;
+        let detected: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .map_err(SqlitePublishRunStoreError::Sqlite)?;
+        let mut version = detected;
+        match version {
+            0 => {
+                connection.execute_batch(
+                    "BEGIN IMMEDIATE;
+                     CREATE TABLE publish_runs (
+                         id INTEGER PRIMARY KEY CHECK (id > 0),
+                         snapshot_id INTEGER NOT NULL CHECK (snapshot_id > 0),
+                         projection_sha256 BLOB NOT NULL CHECK (length(projection_sha256) = 32),
+                         managed_root TEXT NOT NULL,
+                         repository_path TEXT NOT NULL,
+                         publish_target_id TEXT NOT NULL DEFAULT '',
+                         remote_name TEXT NOT NULL,
+                         destination_ref TEXT NOT NULL,
+                         base_commit TEXT NOT NULL,
+                         reviewed_tree TEXT NOT NULL,
+                         publication_kind TEXT NOT NULL CHECK (publication_kind IN ('noop', 'commit_ready')),
+                         commit_oid TEXT,
+                         created_at_unix_ms INTEGER NOT NULL CHECK (created_at_unix_ms >= 0),
+                         commit_spec TEXT,
+                         CHECK ((publication_kind = 'noop' AND commit_oid IS NULL)
+                             OR (publication_kind = 'commit_ready' AND commit_oid IS NOT NULL))
+                     );
+                     CREATE INDEX publish_runs_by_target
+                         ON publish_runs(remote_name, destination_ref, created_at_unix_ms, id);
+                     CREATE INDEX publish_runs_by_creation
+                         ON publish_runs(created_at_unix_ms, id);
+                     PRAGMA user_version = 3;
+                     COMMIT;",
+                ).map_err(SqlitePublishRunStoreError::Sqlite)?;
+                version = SCHEMA_VERSION;
+            }
+            // Schema 1 stored the target only as `remote_name`/`destination_ref`.
+            // Derive the same default the CLI derives (`{remote}:{ref}`) so rows
+            // written before this migration keep matching the runs written after
+            // it. `ADD COLUMN` requires a non-null default; the default is never
+            // read back as a valid identity because empty target IDs are rejected
+            // on load.
+            1 => {
+                connection
+                    .execute_batch(
+                        "BEGIN IMMEDIATE;
+                     ALTER TABLE publish_runs
+                         ADD COLUMN publish_target_id TEXT NOT NULL DEFAULT '';
+                     UPDATE publish_runs
+                         SET publish_target_id = remote_name || ':' || destination_ref
+                         WHERE publish_target_id = '';
+                     PRAGMA user_version = 2;
+                     COMMIT;",
+                    )
+                    .map_err(SqlitePublishRunStoreError::Sqlite)?;
+                version = 2;
+            }
+            _ => {}
+        }
+        if version == 2 {
+            // Additive: rows written before this migration keep a NULL
+            // `commit_spec`, which means "the runtime must still hold the commit
+            // object"; every row written from now on carries one. No CHECK is
+            // added here, because `ALTER TABLE` cannot express one — the
+            // "specification without a desired commit" state is rejected by
+            // `PublishRun` on both fresh and migrated databases alike.
+            connection
+                .execute_batch(
+                    "BEGIN IMMEDIATE;
+                     ALTER TABLE publish_runs ADD COLUMN commit_spec TEXT;
+                     PRAGMA user_version = 3;
+                     COMMIT;",
+                )
+                .map_err(SqlitePublishRunStoreError::Sqlite)?;
+            version = 3;
+        }
+        if version != SCHEMA_VERSION {
+            return Err(SqlitePublishRunStoreError::UnsupportedSchemaVersion(
+                detected,
+            ));
+        }
+        Ok(Self { connection })
+    }
+
+    fn load_many(
+        &self,
+        sql: &str,
+        target: Option<&GitRefTarget>,
+    ) -> Result<Vec<PublishRun>, SqlitePublishRunStoreError> {
+        let mut statement = self
+            .connection
+            .prepare(sql)
+            .map_err(SqlitePublishRunStoreError::Sqlite)?;
+        let rows = match target {
+            Some(target) => statement.query_map(
+                params![target.remote_name(), target.destination_ref()],
+                row_to_publish_run,
+            ),
+            None => statement.query_map([], row_to_publish_run),
+        }
+        .map_err(SqlitePublishRunStoreError::Sqlite)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(SqlitePublishRunStoreError::Sqlite)
+    }
+}
+
+impl PublishRunStore for SqlitePublishRunStore {
+    type Error = SqlitePublishRunStoreError;
+
+    fn save(&self, run: &PublishRun) -> Result<(), Self::Error> {
+        let (kind, commit_oid): (&str, Option<&str>) = match run.desired_commit() {
+            None => ("noop", None),
+            Some(commit_oid) => ("commit_ready", Some(commit_oid.as_str())),
+        };
+        let repository_path = run.repository().as_str();
+        let inserted = self
+            .connection
+            .execute(
+                "INSERT OR IGNORE INTO publish_runs (
+                 id, snapshot_id, projection_sha256, managed_root, repository_path,
+                 publish_target_id, remote_name, destination_ref, base_commit, reviewed_tree,
+                 publication_kind, commit_oid, created_at_unix_ms, commit_spec
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                params![
+                    integer("publish run ID", run.id().get())?,
+                    integer("snapshot ID", run.snapshot_id().get())?,
+                    run.projection_sha256().as_bytes().as_slice(),
+                    run.managed_root().as_str(),
+                    repository_path,
+                    run.target_id().as_str(),
+                    run.target().remote_name(),
+                    run.target().destination_ref(),
+                    run.base_commit(),
+                    run.reviewed_tree(),
+                    kind,
+                    commit_oid,
+                    integer("publish timestamp", run.created_at_unix_ms())?,
+                    run.commit_spec().map(CommitSpecWire::encode),
+                ],
+            )
+            .map_err(SqlitePublishRunStoreError::Sqlite)?;
+        if inserted == 1 {
+            return Ok(());
+        }
+        match self.get(run.id())? {
+            Some(stored) if stored == *run => Ok(()),
+            Some(_) => Err(SqlitePublishRunStoreError::ConflictingPublishRunId(
+                run.id(),
+            )),
+            None => Err(SqlitePublishRunStoreError::Persistence(
+                "publish run insert was ignored without an existing row".to_owned(),
+            )),
+        }
+    }
+
+    fn get(&self, id: PublishRunId) -> Result<Option<PublishRun>, Self::Error> {
+        self.connection
+            .query_row(
+                "SELECT id, snapshot_id, projection_sha256, managed_root, repository_path,
+                    publish_target_id, remote_name, destination_ref, base_commit, reviewed_tree,
+                    publication_kind, commit_oid, created_at_unix_ms, commit_spec
+             FROM publish_runs WHERE id = ?1",
+                [integer("publish run ID", id.get())?],
+                row_to_publish_run,
+            )
+            .optional()
+            .map_err(SqlitePublishRunStoreError::Sqlite)
+    }
+
+    fn list(&self) -> Result<Vec<PublishRun>, Self::Error> {
+        self.load_many(
+            "SELECT id, snapshot_id, projection_sha256, managed_root, repository_path,
+                    publish_target_id, remote_name, destination_ref, base_commit, reviewed_tree,
+                    publication_kind, commit_oid, created_at_unix_ms, commit_spec
+             FROM publish_runs ORDER BY created_at_unix_ms ASC, id ASC",
+            None,
+        )
+    }
+
+    fn list_for_target(&self, target: &GitRefTarget) -> Result<Vec<PublishRun>, Self::Error> {
+        self.load_many(
+            "SELECT id, snapshot_id, projection_sha256, managed_root, repository_path,
+                    publish_target_id, remote_name, destination_ref, base_commit, reviewed_tree,
+                    publication_kind, commit_oid, created_at_unix_ms, commit_spec
+             FROM publish_runs WHERE remote_name = ?1 AND destination_ref = ?2
+             ORDER BY created_at_unix_ms ASC, id ASC",
+            Some(target),
+        )
+    }
+}
+
+fn row_to_publish_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<PublishRun> {
+    let id = positive_id(row.get(0)?, 0, "publish run ID", PublishRunId::new)?;
+    let snapshot_id = positive_id(row.get(1)?, 1, "snapshot ID", SnapshotId::new)?;
+    let projection_sha256 = sha256_column(row, 2)?;
+    let managed_root = ManagedRoot::new(row.get::<_, String>(3)?)
+        .map_err(|error| conversion_error(3, Type::Text, error.to_string()))?;
+    let repository = RepositoryLocator::new(row.get::<_, String>(4)?)
+        .map_err(|error| conversion_error(4, Type::Text, error.to_string()))?;
+    let target_id = PublishTargetId::new(row.get::<_, String>(5)?)
+        .map_err(|error| conversion_error(5, Type::Text, error.to_string()))?;
+    let target = GitRefTarget::new(row.get::<_, String>(6)?, row.get::<_, String>(7)?)
+        .map_err(|error| conversion_error(6, Type::Text, error.to_string()))?;
+    let base_commit = row.get(8)?;
+    let reviewed_tree = row.get(9)?;
+    let kind: String = row.get(10)?;
+    let commit_oid: Option<String> = row.get(11)?;
+    let desired_commit = match (kind.as_str(), commit_oid) {
+        ("noop", None) => None,
+        ("commit_ready", Some(commit_oid)) => Some(
+            GitCommitOid::new(commit_oid)
+                .map_err(|error| conversion_error(11, Type::Text, error.to_string()))?,
+        ),
+        _ => {
+            return Err(conversion_error(
+                10,
+                Type::Text,
+                "publication kind does not match commit identity",
+            ));
+        }
+    };
+    let created_at_unix_ms = nonnegative(row.get(12)?, 12, "publish timestamp")?;
+    let commit_spec = match row.get::<_, Option<String>>(13)? {
+        None => None,
+        Some(encoded) => Some(
+            CommitSpecWire::decode(&encoded)
+                .map_err(|error| conversion_error(13, Type::Text, error.to_string()))?,
+        ),
+    };
+    PublishRun::rehydrate(
+        id,
+        snapshot_id,
+        projection_sha256,
+        managed_root,
+        target_id,
+        repository,
+        target,
+        base_commit,
+        reviewed_tree,
+        desired_commit,
+        commit_spec,
+        created_at_unix_ms,
+    )
+    .map_err(|error| conversion_error(0, Type::Text, error.to_string()))
+}
+
+fn integer(field: &'static str, value: u64) -> Result<i64, SqlitePublishRunStoreError> {
+    value
+        .try_into()
+        .map_err(|_| SqlitePublishRunStoreError::ValueOutOfRange(field))
+}
+fn positive_id<T, E>(
+    value: i64,
+    column: usize,
+    field: &'static str,
+    constructor: impl FnOnce(u64) -> Result<T, E>,
+) -> rusqlite::Result<T>
+where
+    E: fmt::Display,
+{
+    constructor(nonnegative(value, column, field)?)
+        .map_err(|error| conversion_error(column, Type::Integer, error.to_string()))
+}
+fn nonnegative(value: i64, column: usize, field: &str) -> rusqlite::Result<u64> {
+    value.try_into().map_err(|_| {
+        conversion_error(
+            column,
+            Type::Integer,
+            format!("{field} must be non-negative"),
+        )
+    })
+}
+fn sha256_column(row: &rusqlite::Row<'_>, column: usize) -> rusqlite::Result<Sha256> {
+    let bytes: Vec<u8> = row.get(column)?;
+    let bytes: [u8; 32] = bytes.try_into().map_err(|bytes: Vec<u8>| {
+        conversion_error(
+            column,
+            Type::Blob,
+            format!("SHA-256 must contain 32 bytes, got {}", bytes.len()),
+        )
+    })?;
+    Ok(Sha256::new(bytes))
+}
+fn conversion_error(column: usize, data_type: Type, message: impl Into<String>) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        column,
+        data_type,
+        Box::new(CorruptPublishRun(message.into())),
+    )
+}
+
+#[derive(Debug)]
+struct CorruptPublishRun(String);
+impl fmt::Display for CorruptPublishRun {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+impl Error for CorruptPublishRun {}
+
+#[derive(Debug)]
+pub enum SqlitePublishRunStoreError {
+    Sqlite(rusqlite::Error),
+    UnsupportedSchemaVersion(i64),
+    ConflictingPublishRunId(PublishRunId),
+    ValueOutOfRange(&'static str),
+    Persistence(String),
+}
+impl fmt::Display for SqlitePublishRunStoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Sqlite(error) => {
+                write!(formatter, "SQLite publish-run persistence failed: {error}")
+            }
+            Self::UnsupportedSchemaVersion(version) => write!(
+                formatter,
+                "unsupported publish-run schema version: {version}"
+            ),
+            Self::ConflictingPublishRunId(id) => write!(
+                formatter,
+                "publish run ID {} already stores a different fact",
+                id.get()
+            ),
+            Self::ValueOutOfRange(field) => {
+                write!(formatter, "{field} is outside SQLite's integer range")
+            }
+            Self::Persistence(message) => formatter.write_str(message),
+        }
+    }
+}
+impl Error for SqlitePublishRunStoreError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Sqlite(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        domain::TimestampMillis,
+        publisher::{GitCommitSpec, GitRepositoryIdentity, GitTreeOid},
+    };
+    use std::{
+        fs,
+        path::PathBuf,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    struct TestDirectory(PathBuf);
+    impl TestDirectory {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "mineral-publisher-publish-run-store-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+        fn database(&self) -> PathBuf {
+            self.0.join("publish-runs.sqlite3")
+        }
+    }
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    fn oid(value: char) -> String {
+        std::iter::repeat_n(value, 40).collect()
+    }
+    fn run(
+        directory: &TestDirectory,
+        id: u64,
+        target: &str,
+        commit: Option<char>,
+        time: u64,
+    ) -> PublishRun {
+        run_with_target_id(directory, id, target, target, commit, time)
+    }
+    fn run_with_target_id(
+        directory: &TestDirectory,
+        id: u64,
+        target: &str,
+        target_id: &str,
+        commit: Option<char>,
+        time: u64,
+    ) -> PublishRun {
+        let desired_commit = commit.map(|value| GitCommitOid::new(oid(value)).unwrap());
+        run_with(
+            directory,
+            id,
+            target,
+            target_id,
+            &oid('a'),
+            &oid('b'),
+            desired_commit,
+            None,
+            time,
+        )
+    }
+
+    /// The one specification that agrees with `run_with` about parent, tree, and
+    /// both times.
+    fn spec(base: &str, tree: &str, time: u64) -> GitCommitSpec {
+        let time = TimestampMillis::from_unix_millis(time);
+        GitCommitSpec::new(
+            GitCommitOid::new(base).unwrap(),
+            GitTreeOid::new(tree).unwrap(),
+            "Mineral Publisher",
+            "publisher@example.invalid",
+            time,
+            "Mineral Publisher",
+            "publisher@example.invalid",
+            time,
+            "Publish Mineral content",
+        )
+        .unwrap()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_with(
+        directory: &TestDirectory,
+        id: u64,
+        target: &str,
+        target_id: &str,
+        base_commit: &str,
+        reviewed_tree: &str,
+        desired_commit: Option<GitCommitOid>,
+        commit_spec: Option<GitCommitSpec>,
+        time: u64,
+    ) -> PublishRun {
+        PublishRun::rehydrate(
+            PublishRunId::new(id).unwrap(),
+            SnapshotId::new(7).unwrap(),
+            Sha256::new([9; 32]),
+            ManagedRoot::new("content").unwrap(),
+            PublishTargetId::new(target_id).unwrap(),
+            GitRepositoryIdentity::new(&directory.0)
+                .unwrap()
+                .locator()
+                .clone(),
+            GitRefTarget::new("origin", target).unwrap(),
+            base_commit.to_owned(),
+            reviewed_tree.to_owned(),
+            desired_commit,
+            commit_spec,
+            time,
+        )
+        .unwrap()
+    }
+
+    /// Writes a row directly, bypassing every Rust-side invariant, so the load
+    /// path can be shown to fail closed on facts it did not write itself.
+    #[allow(clippy::too_many_arguments)]
+    fn insert_raw(
+        connection: &Connection,
+        directory: &TestDirectory,
+        id: u64,
+        publication_kind: &str,
+        commit_oid: Option<&str>,
+        commit_spec: Option<&str>,
+        base_commit: &str,
+        reviewed_tree: &str,
+        time: u64,
+    ) {
+        connection
+            .execute(
+                "INSERT INTO publish_runs (
+                     id, snapshot_id, projection_sha256, managed_root, repository_path,
+                     publish_target_id, remote_name, destination_ref, base_commit, reviewed_tree,
+                     publication_kind, commit_oid, created_at_unix_ms, commit_spec
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                params![
+                    id as i64,
+                    7_i64,
+                    [9_u8; 32].as_slice(),
+                    "content",
+                    directory.0.to_str().unwrap(),
+                    "origin:refs/heads/main",
+                    "origin",
+                    "refs/heads/main",
+                    base_commit,
+                    reviewed_tree,
+                    publication_kind,
+                    commit_oid,
+                    time as i64,
+                    commit_spec,
+                ],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn created_and_noop_survive_restart_without_fabricating_a_commit() {
+        let directory = TestDirectory::new();
+        let database = directory.database();
+        let created = run(&directory, 1, "refs/heads/main", Some('c'), 10);
+        let noop = run(&directory, 2, "refs/heads/main", None, 11);
+        let store = SqlitePublishRunStore::open(&database).unwrap();
+        store.save(&created).unwrap();
+        store.save(&noop).unwrap();
+        drop(store);
+        let reopened = SqlitePublishRunStore::open(&database).unwrap();
+        assert_eq!(reopened.get(created.id()).unwrap(), Some(created));
+        assert_eq!(reopened.get(noop.id()).unwrap(), Some(noop));
+    }
+
+    #[test]
+    fn save_is_idempotent_but_conflicting_id_fails() {
+        let directory = TestDirectory::new();
+        let store = SqlitePublishRunStore::open(directory.database()).unwrap();
+        let first = run(&directory, 1, "refs/heads/main", Some('c'), 10);
+        store.save(&first).unwrap();
+        store.save(&first).unwrap();
+        let conflict = run(&directory, 1, "refs/heads/main", Some('d'), 10);
+        assert!(
+            matches!(store.save(&conflict), Err(SqlitePublishRunStoreError::ConflictingPublishRunId(id)) if id == first.id())
+        );
+    }
+
+    #[test]
+    fn multiple_attempts_and_targets_are_retained_in_stable_order() {
+        let directory = TestDirectory::new();
+        let store = SqlitePublishRunStore::open(directory.database()).unwrap();
+        let late = run(&directory, 2, "refs/heads/main", Some('c'), 20);
+        let first = run(&directory, 1, "refs/heads/main", Some('c'), 10);
+        let staging = run(&directory, 3, "refs/heads/staging", Some('c'), 10);
+        store.save(&late).unwrap();
+        store.save(&first).unwrap();
+        store.save(&staging).unwrap();
+        assert_eq!(
+            store.list().unwrap(),
+            vec![first.clone(), staging.clone(), late]
+        );
+        assert_eq!(
+            store.list_for_target(staging.target()).unwrap(),
+            vec![staging]
+        );
+    }
+
+    #[test]
+    fn publish_target_identity_is_independent_of_the_remote_and_ref() {
+        let directory = TestDirectory::new();
+        let store = SqlitePublishRunStore::open(directory.database()).unwrap();
+        let run = run_with_target_id(
+            &directory,
+            1,
+            "refs/heads/main",
+            "public-production",
+            Some('c'),
+            10,
+        );
+        store.save(&run).unwrap();
+        let restored = store.get(run.id()).unwrap().unwrap();
+        assert_eq!(restored.target_id().as_str(), "public-production");
+        assert_eq!(restored.target().remote_name(), "origin");
+        assert_eq!(restored, run);
+    }
+
+    #[test]
+    fn schema_one_rows_gain_the_derived_publish_target_id() {
+        let directory = TestDirectory::new();
+        let database = directory.database();
+        let projection = [9_u8; 32];
+        let base_commit = oid('a');
+        let reviewed_tree = oid('b');
+        let commit_oid = oid('c');
+        {
+            let connection = Connection::open(&database).unwrap();
+            connection
+                .execute_batch(
+                    "BEGIN IMMEDIATE;
+                     CREATE TABLE publish_runs (
+                         id INTEGER PRIMARY KEY CHECK (id > 0),
+                         snapshot_id INTEGER NOT NULL CHECK (snapshot_id > 0),
+                         projection_sha256 BLOB NOT NULL CHECK (length(projection_sha256) = 32),
+                         managed_root TEXT NOT NULL,
+                         repository_path TEXT NOT NULL,
+                         remote_name TEXT NOT NULL,
+                         destination_ref TEXT NOT NULL,
+                         base_commit TEXT NOT NULL,
+                         reviewed_tree TEXT NOT NULL,
+                         publication_kind TEXT NOT NULL CHECK (publication_kind IN ('noop', 'commit_ready')),
+                         commit_oid TEXT,
+                         created_at_unix_ms INTEGER NOT NULL CHECK (created_at_unix_ms >= 0),
+                         CHECK ((publication_kind = 'noop' AND commit_oid IS NULL)
+                             OR (publication_kind = 'commit_ready' AND commit_oid IS NOT NULL))
+                     );
+                     CREATE INDEX publish_runs_by_target
+                         ON publish_runs(remote_name, destination_ref, created_at_unix_ms, id);
+                     CREATE INDEX publish_runs_by_creation
+                         ON publish_runs(created_at_unix_ms, id);
+                     PRAGMA user_version = 1;
+                     COMMIT;",
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO publish_runs (
+                         id, snapshot_id, projection_sha256, managed_root, repository_path,
+                         remote_name, destination_ref, base_commit, reviewed_tree,
+                         publication_kind, commit_oid, created_at_unix_ms
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                    params![
+                        1_i64,
+                        7_i64,
+                        projection.as_slice(),
+                        "content",
+                        "C:/publication",
+                        "origin",
+                        "refs/heads/main",
+                        base_commit,
+                        reviewed_tree,
+                        "commit_ready",
+                        commit_oid,
+                        10_i64,
+                    ],
+                )
+                .unwrap();
+        }
+        let store = SqlitePublishRunStore::open(&database).unwrap();
+        let restored = store.get(PublishRunId::new(1).unwrap()).unwrap().unwrap();
+        assert_eq!(restored.target_id().as_str(), "origin:refs/heads/main");
+        assert_eq!(restored.repository().as_str(), "C:/publication");
+        assert_eq!(restored.target().destination_ref(), "refs/heads/main");
+        assert_eq!(restored.reviewed_tree(), reviewed_tree);
+        assert_eq!(restored.commit_spec(), None);
+    }
+
+    #[test]
+    fn a_reconstructible_run_survives_restart_with_its_frozen_spec() {
+        let directory = TestDirectory::new();
+        let database = directory.database();
+        let run = run_with(
+            &directory,
+            1,
+            "refs/heads/main",
+            "origin:refs/heads/main",
+            &oid('a'),
+            &oid('b'),
+            Some(GitCommitOid::new(oid('c')).unwrap()),
+            Some(spec(&oid('a'), &oid('b'), 10)),
+            10,
+        );
+        let store = SqlitePublishRunStore::open(&database).unwrap();
+        store.save(&run).unwrap();
+        drop(store);
+
+        let reopened = SqlitePublishRunStore::open(&database).unwrap();
+        let restored = reopened.get(run.id()).unwrap().unwrap();
+        assert_eq!(restored, run);
+        assert_eq!(
+            restored.commit_spec(),
+            Some(&spec(&oid('a'), &oid('b'), 10))
+        );
+        assert_eq!(
+            restored.desired_commit(),
+            Some(&GitCommitOid::new(oid('c')).unwrap())
+        );
+    }
+
+    /// §8: the migration that matters is upgrading a real database written by the
+    /// previous schema, not creating a fresh current one.
+    #[test]
+    fn a_real_version_two_database_upgrades_without_losing_or_inventing_a_spec() {
+        let directory = TestDirectory::new();
+        let database = directory.database();
+        let base_commit = oid('a');
+        let reviewed_tree = oid('b');
+        let historic_commit = oid('c');
+        {
+            let connection = Connection::open(&database).unwrap();
+            connection
+                .execute_batch(
+                    "BEGIN IMMEDIATE;
+                     CREATE TABLE publish_runs (
+                         id INTEGER PRIMARY KEY CHECK (id > 0),
+                         snapshot_id INTEGER NOT NULL CHECK (snapshot_id > 0),
+                         projection_sha256 BLOB NOT NULL CHECK (length(projection_sha256) = 32),
+                         managed_root TEXT NOT NULL,
+                         repository_path TEXT NOT NULL,
+                         publish_target_id TEXT NOT NULL DEFAULT '',
+                         remote_name TEXT NOT NULL,
+                         destination_ref TEXT NOT NULL,
+                         base_commit TEXT NOT NULL,
+                         reviewed_tree TEXT NOT NULL,
+                         publication_kind TEXT NOT NULL CHECK (publication_kind IN ('noop', 'commit_ready')),
+                         commit_oid TEXT,
+                         created_at_unix_ms INTEGER NOT NULL CHECK (created_at_unix_ms >= 0),
+                         CHECK ((publication_kind = 'noop' AND commit_oid IS NULL)
+                             OR (publication_kind = 'commit_ready' AND commit_oid IS NOT NULL))
+                     );
+                     CREATE INDEX publish_runs_by_target
+                         ON publish_runs(remote_name, destination_ref, created_at_unix_ms, id);
+                     CREATE INDEX publish_runs_by_creation
+                         ON publish_runs(created_at_unix_ms, id);
+                     PRAGMA user_version = 2;
+                     COMMIT;",
+                )
+                .unwrap();
+            for (id, kind, commit) in [
+                (1_i64, "noop", None),
+                (2_i64, "commit_ready", Some(historic_commit.as_str())),
+            ] {
+                connection
+                    .execute(
+                        "INSERT INTO publish_runs (
+                             id, snapshot_id, projection_sha256, managed_root, repository_path,
+                             publish_target_id, remote_name, destination_ref, base_commit,
+                             reviewed_tree, publication_kind, commit_oid, created_at_unix_ms
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                        params![
+                            id,
+                            7_i64,
+                            [9_u8; 32].as_slice(),
+                            "content",
+                            directory.0.to_str().unwrap(),
+                            "origin:refs/heads/main",
+                            "origin",
+                            "refs/heads/main",
+                            base_commit,
+                            reviewed_tree,
+                            kind,
+                            commit,
+                            id * 10,
+                        ],
+                    )
+                    .unwrap();
+            }
+        }
+
+        {
+            let store = SqlitePublishRunStore::open(&database).unwrap();
+            let noop = store.get(PublishRunId::new(1).unwrap()).unwrap().unwrap();
+            let historical = store.get(PublishRunId::new(2).unwrap()).unwrap().unwrap();
+
+            // The historical rows keep every field they had, gain no fabricated
+            // specification, and (Some, None) is a legal degraded shape rather
+            // than corruption.
+            assert_eq!(noop.desired_commit(), None);
+            assert_eq!(noop.commit_spec(), None);
+            assert_eq!(noop.created_at_unix_ms(), 10);
+            assert_eq!(
+                historical.desired_commit(),
+                Some(&GitCommitOid::new(historic_commit.clone()).unwrap())
+            );
+            assert_eq!(historical.commit_spec(), None);
+            assert_eq!(historical.base_commit(), base_commit);
+            assert_eq!(historical.reviewed_tree(), reviewed_tree);
+            assert_eq!(historical.created_at_unix_ms(), 20);
+            assert_eq!(historical.target_id().as_str(), "origin:refs/heads/main");
+            assert_eq!(historical.managed_root().as_str(), "content");
+        }
+
+        let reopened = SqlitePublishRunStore::open(&database).unwrap();
+        assert_eq!(
+            reopened
+                .connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            3
+        );
+        let stored_spec: Option<String> = reopened
+            .connection
+            .query_row(
+                "SELECT commit_spec FROM publish_runs WHERE id = 2",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_spec, None);
+        assert_eq!(
+            reopened.get(PublishRunId::new(2).unwrap()).unwrap(),
+            reopened.get(PublishRunId::new(2).unwrap()).unwrap()
+        );
+    }
+
+    /// §6.6.2: `(None, Some)` is never legal, even when it reaches the database
+    /// through something other than this store.
+    #[test]
+    fn a_stored_spec_without_a_desired_commit_fails_closed() {
+        let directory = TestDirectory::new();
+        let store = SqlitePublishRunStore::open(directory.database()).unwrap();
+        insert_raw(
+            &store.connection,
+            &directory,
+            1,
+            "noop",
+            None,
+            Some(&CommitSpecWire::encode(&spec(&oid('a'), &oid('b'), 10))),
+            &oid('a'),
+            &oid('b'),
+            10,
+        );
+
+        assert!(store.get(PublishRunId::new(1).unwrap()).is_err());
+    }
+
+    /// §7: a stored specification that disagrees with the run it belongs to is
+    /// rejected when the intent is loaded, not later.
+    #[test]
+    fn a_stored_spec_that_disagrees_with_its_run_fails_closed() {
+        let directory = TestDirectory::new();
+        let store = SqlitePublishRunStore::open(directory.database()).unwrap();
+        insert_raw(
+            &store.connection,
+            &directory,
+            1,
+            "commit_ready",
+            Some(&oid('c')),
+            // The specification freezes another reviewed tree.
+            Some(&CommitSpecWire::encode(&spec(&oid('a'), &oid('d'), 10))),
+            &oid('a'),
+            &oid('b'),
+            10,
+        );
+        insert_raw(
+            &store.connection,
+            &directory,
+            2,
+            "commit_ready",
+            Some(&oid('c')),
+            // spec built at another instant
+            Some(&CommitSpecWire::encode(&spec(&oid('a'), &oid('b'), 11))),
+            &oid('a'),
+            &oid('b'),
+            10,
+        );
+        insert_raw(
+            &store.connection,
+            &directory,
+            3,
+            "commit_ready",
+            Some(&oid('c')),
+            // spec built on another parent
+            Some(&CommitSpecWire::encode(&spec(&oid('d'), &oid('b'), 10))),
+            &oid('a'),
+            &oid('b'),
+            10,
+        );
+
+        for id in [1_u64, 2, 3] {
+            assert!(
+                store.get(PublishRunId::new(id).unwrap()).is_err(),
+                "accepted a disagreeing specification for run {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unreadable_stored_spec_fails_closed() {
+        let directory = TestDirectory::new();
+        let store = SqlitePublishRunStore::open(directory.database()).unwrap();
+        let usable = CommitSpecWire::encode(&spec(&oid('a'), &oid('b'), 10));
+        for (id, encoded) in [
+            (1_u64, "not json".to_owned()),
+            (2_u64, usable.replace("\"version\":1", "\"version\":2")),
+            (
+                3_u64,
+                usable.replace("\"message\"", "\"unexpected\":1,\"message\""),
+            ),
+        ] {
+            insert_raw(
+                &store.connection,
+                &directory,
+                id,
+                "commit_ready",
+                Some(&oid('c')),
+                Some(&encoded),
+                &oid('a'),
+                &oid('b'),
+                10,
+            );
+        }
+
+        for id in [1_u64, 2, 3] {
+            assert!(
+                store.get(PublishRunId::new(id).unwrap()).is_err(),
+                "accepted an unreadable specification for run {id}"
+            );
+        }
+    }
+}

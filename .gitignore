@@ -2,4 +2,4 @@
 /.env
 /.mineral
 /mineral.yaml
-examples/fixtures/deepseek_markdown_reviewer_smoke
+crates/mineral-host/examples/fixtures/deepseek_markdown_reviewer_smoke
