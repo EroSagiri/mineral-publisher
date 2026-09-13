@@ -124,6 +124,15 @@ review workflow 在调用 provider 之前先查该 subject 是否已有人工决
 NULL，语义仍是"只对当时那一次 attempt 生效"，不迁移、不放大），新决议同时记录
 identity 与引发它的 attempt。
 
+同一轮还修掉一个 durable identity 的漏洞：`delivery_sha256` 当初只哈希
+"交付的文本树 + 已发布资产"，却没有覆盖它自己存储的 snapshot provenance
+（`snapshot_id`、`managed_root`、每篇文档的 `source_path`/`source_sha256`）。于是
+"往 vault 里加一个与交付无关的文件"会换掉 snapshot id，而交付内容不变 → 同一把 key
+对应两个不同 payload → store（一把 key 只能对应一个 payload）只能 fail closed，
+真实工作区就是这样卡在 "could not persist the delivery projection"。现在不改动历史：
+identity 分两版，wire v1/v2 仍用旧函数（冻结 payload 已被测试钉住），新写入用
+覆盖全部字段的 v2 函数并写 wire v3。
+
 ### 2.3 已批准的 schema 变更
 
 `publish-runs.sqlite3`：`user_version 1 → 2`

@@ -364,6 +364,23 @@ pub struct DeliveryProjection {
     text: TextProjection,
     assets: AssetProjection,
     delivery_sha256: Sha256,
+    /// Which definition of [`Self::delivery_sha256`] this intent was identified by.
+    ///
+    /// The durable key is the intent's identity, so it has to cover every fact the
+    /// intent stores. Wire versions 1 and 2 hashed the delivered decisions but not
+    /// the snapshot provenance they were derived from, which let two different
+    /// payloads share one key. Those rows stay readable through `V1`; everything
+    /// built now uses `V2`.
+    identity: DeliveryIdentityVersion,
+}
+
+/// Which fields the canonical delivery identity is computed over.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DeliveryIdentityVersion {
+    /// Wire versions 1 and 2: the delivered text tree and assets only.
+    V1,
+    /// Wire version 3: every immutable fact the intent stores.
+    V2,
 }
 
 impl DeliveryProjection {
@@ -378,11 +395,60 @@ impl DeliveryProjection {
         text: TextProjection,
         assets: AssetProjection,
     ) -> Self {
-        let delivery_sha256 = delivery_projection_identity(
+        Self::assemble(
             source_projection_sha256,
-            text.projection_sha256(),
-            &assets,
-        );
+            snapshot_id,
+            managed_root,
+            text,
+            assets,
+            DeliveryIdentityVersion::V2,
+        )
+    }
+
+    /// Rebuilds an intent whose key was computed before the identity covered the
+    /// snapshot provenance it stores.
+    ///
+    /// Only the wire decoders for versions 1 and 2 use this: a durable row's
+    /// recorded identity must be reproduced exactly, or old publish runs would stop
+    /// being recoverable.
+    pub(crate) fn from_parts_with_legacy_identity(
+        source_projection_sha256: Sha256,
+        snapshot_id: SnapshotId,
+        managed_root: ManagedRoot,
+        text: TextProjection,
+        assets: AssetProjection,
+    ) -> Self {
+        Self::assemble(
+            source_projection_sha256,
+            snapshot_id,
+            managed_root,
+            text,
+            assets,
+            DeliveryIdentityVersion::V1,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn assemble(
+        source_projection_sha256: Sha256,
+        snapshot_id: SnapshotId,
+        managed_root: ManagedRoot,
+        text: TextProjection,
+        assets: AssetProjection,
+        identity: DeliveryIdentityVersion,
+    ) -> Self {
+        let delivery_sha256 = match identity {
+            DeliveryIdentityVersion::V1 => {
+                delivery_identity_v1(source_projection_sha256, text.projection_sha256(), &assets)
+            }
+            DeliveryIdentityVersion::V2 => delivery_identity_v2(
+                source_projection_sha256,
+                snapshot_id,
+                &managed_root,
+                &text,
+                &assets,
+            ),
+        };
         Self {
             source_projection_sha256,
             snapshot_id,
@@ -390,7 +456,13 @@ impl DeliveryProjection {
             text,
             assets,
             delivery_sha256,
+            identity,
         }
+    }
+
+    /// Which identity function produced [`Self::delivery_sha256`].
+    pub(crate) fn identity_version(&self) -> DeliveryIdentityVersion {
+        self.identity
     }
 
     pub fn source_projection_sha256(&self) -> Sha256 {
@@ -751,7 +823,11 @@ fn text_projection_identity(files: &[TextProjectionFile]) -> Sha256 {
     Sha256::new(hasher.finalize().into())
 }
 
-fn delivery_projection_identity(
+/// The original identity: the delivered text tree and the published assets.
+///
+/// Kept byte for byte, because durable rows written under it must keep decoding to
+/// the identity they recorded.
+fn delivery_identity_v1(
     source_projection_sha256: Sha256,
     text_projection_sha256: Sha256,
     assets: &AssetProjection,
@@ -778,6 +854,48 @@ fn delivery_projection_identity(
         hasher.update(url);
     }
     Sha256::new(hasher.finalize().into())
+}
+
+/// The current identity: every immutable fact the intent stores.
+///
+/// It is the durable key of an immutable intent, and a store relies on one key
+/// meaning one payload, so the snapshot the decision was derived from and each
+/// document's authored provenance are part of it. Two deliveries that publish the
+/// same bytes from different audited snapshots are different intents, and a
+/// document whose delivered bytes are unchanged while its source is not is a
+/// different intent too.
+fn delivery_identity_v2(
+    source_projection_sha256: Sha256,
+    snapshot_id: SnapshotId,
+    managed_root: &ManagedRoot,
+    text: &TextProjection,
+    assets: &AssetProjection,
+) -> Sha256 {
+    let mut hasher = Sha256Hasher::new();
+    hasher.update(b"mineral-publisher-delivery-projection-v2\0");
+    hasher.update(source_projection_sha256.as_bytes());
+    hasher.update(snapshot_id.get().to_be_bytes());
+    hash_length_prefixed(&mut hasher, managed_root.as_str());
+    hasher.update(text.projection_sha256().as_bytes());
+    for file in &text.files {
+        hash_length_prefixed(&mut hasher, file.source_path.as_str());
+        hasher.update(file.source_sha256.as_bytes());
+    }
+    for asset in &assets.assets {
+        hash_length_prefixed(&mut hasher, asset.logical_path.as_str());
+        hasher.update(asset.source_sha256.as_bytes());
+        hasher.update(asset.published_sha256.as_bytes());
+        hasher.update(asset.published_size.to_be_bytes());
+        hash_length_prefixed(&mut hasher, asset.published_content_type.as_str());
+        hash_length_prefixed(&mut hasher, asset.object_key.as_str());
+        hash_length_prefixed(&mut hasher, asset.public_url.as_str());
+    }
+    Sha256::new(hasher.finalize().into())
+}
+
+fn hash_length_prefixed(hasher: &mut Sha256Hasher, value: &str) {
+    hasher.update((value.len() as u64).to_be_bytes());
+    hasher.update(value.as_bytes());
 }
 
 #[derive(Debug)]

@@ -48,6 +48,7 @@ pub use asset_sanitization::{
     ImageSanitizationFormat, SanitizationTransformation, SanitizedAsset, SanitizedAssetSet,
 };
 pub use candidate_asset::{CandidateAsset, CandidateAssetSelectionError, CandidateAssetSet};
+pub(crate) use delivery_projection::DeliveryIdentityVersion;
 pub use delivery_projection::{
     AssetProjection, DeliveryProjection, DeliveryProjectionBuilder, DeliveryProjectionError,
     DeliveryProjectionStore, PublishedAsset, TextProjection, TextProjectionFile,

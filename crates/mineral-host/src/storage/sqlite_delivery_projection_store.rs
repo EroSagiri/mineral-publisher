@@ -262,6 +262,16 @@ mod tests {
     /// A real projection built through the production builder, with one rewritten
     /// document and one published asset.
     fn projection(document: &str, published_seed: u8) -> DeliveryProjection {
+        projection_with_unpublished(document, published_seed, None)
+    }
+
+    /// The same delivery, optionally published from a snapshot that also contains a
+    /// file nothing references.
+    fn projection_with_unpublished(
+        document: &str,
+        published_seed: u8,
+        unpublished: Option<&str>,
+    ) -> DeliveryProjection {
         let mut store = MemoryStore::default();
         let mut files = vec![SnapshotFile::new(
             path("a.md"),
@@ -275,8 +285,23 @@ mod tests {
             Sha256::new([published_seed; 32]),
             None,
         ));
+        if let Some(unpublished) = unpublished {
+            files.push(SnapshotFile::new(
+                path("unrelated.txt"),
+                unpublished.len() as u64,
+                store.insert(unpublished.as_bytes()),
+                None,
+            ));
+        }
+        // A snapshot identity is derived from the file set it captured, so a vault
+        // that also holds an unrelated file captures a different one.
+        let snapshot_id = if unpublished.is_some() {
+            SnapshotId::new(8).unwrap()
+        } else {
+            SnapshotId::new(7).unwrap()
+        };
         let snapshot = Snapshot::new(
-            SnapshotId::new(7).unwrap(),
+            snapshot_id,
             SystemTime::UNIX_EPOCH,
             SourceId::new("test").unwrap(),
             files,
@@ -322,6 +347,51 @@ mod tests {
             Some(projection)
         );
         assert_eq!(reopened.get(Sha256::new([0xaa; 32])).unwrap(), None);
+    }
+
+    /// The identity keys the payload, so two intents that publish the same bytes
+    /// from different snapshots are two rows — not a conflict.
+    ///
+    /// A real workspace hit the opposite: adding an unrelated file to the vault
+    /// changed the snapshot but not the delivered content, the identity did not
+    /// cover the snapshot, and the second publication could not be persisted at all.
+    #[test]
+    fn two_snapshots_of_the_same_delivery_are_two_intents() {
+        let directory = TestDirectory::new();
+        let store = SqliteDeliveryProjectionStore::open(directory.database()).unwrap();
+        let first = projection("body", 9);
+        let second = projection_with_unpublished("body", 9, Some("an unrelated file"));
+
+        assert_ne!(
+            first.snapshot_id(),
+            second.snapshot_id(),
+            "the snapshot really is a different one"
+        );
+        assert_eq!(
+            first.text().projection_sha256(),
+            second.text().projection_sha256(),
+            "the delivered text tree is identical"
+        );
+        assert_eq!(
+            first.assets().assets(),
+            second.assets().assets(),
+            "the delivered assets are identical"
+        );
+        assert_ne!(
+            first.delivery_sha256(),
+            second.delivery_sha256(),
+            "different audited inputs are different intents"
+        );
+
+        store.save(&first).unwrap();
+        store.save(&second).unwrap();
+        assert_eq!(
+            store.get(first.delivery_sha256()).unwrap(),
+            Some(first.clone())
+        );
+        assert_eq!(store.get(second.delivery_sha256()).unwrap(), Some(second));
+        // Saving either one again is still idempotent.
+        store.save(&first).unwrap();
     }
 
     #[test]

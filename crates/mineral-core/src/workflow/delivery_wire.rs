@@ -6,8 +6,8 @@ use crate::domain::{ContentPath, Sha256, SnapshotId};
 
 use super::{
     AssetContentType, AssetDeliveryConfig, AssetObjectKey, AssetProjection, AssetPublicBaseUrl,
-    AssetPublicFilename, AssetPublicUrl, DeliveryProjection, ManagedRoot, ProjectionTargetPath,
-    PublishedAsset, TextProjection, TextProjectionFile,
+    AssetPublicFilename, AssetPublicUrl, DeliveryIdentityVersion, DeliveryProjection, ManagedRoot,
+    ProjectionTargetPath, PublishedAsset, TextProjection, TextProjectionFile,
 };
 
 /// Versioned durable encoding of one immutable [`DeliveryProjection`].
@@ -17,8 +17,14 @@ use super::{
 /// delivery model changes shape, an old durable row must fail loudly instead of
 /// being silently bound to today's field set.
 ///
-/// Version 2 is what this engine writes, and it is version 1 plus one frozen
-/// presentation fact per asset:
+/// Version 3 is what this engine writes. Its fields are version 2's; what changed
+/// is the delivery identity those fields are hashed into. Versions 1 and 2 hashed
+/// the delivered text tree and the published assets but not the snapshot provenance
+/// the intent stores, so two different payloads could share one durable key — and a
+/// store that keys on that identity then had to refuse the second one. Version 3
+/// hashes every immutable fact, and older rows keep the identity they recorded.
+///
+/// Version 2 is version 1 plus one frozen presentation fact per asset:
 ///
 /// ```json
 /// {
@@ -51,9 +57,13 @@ pub struct DeliveryProjectionWire;
 
 impl DeliveryProjectionWire {
     /// The durable version this engine writes.
-    pub const VERSION: u32 = 2;
+    pub const VERSION: u32 = 3;
 
-    /// The durable version it still reads, and only in order to recover an intent
+    /// The filename-bearing version, whose identity left the snapshot provenance
+    /// out. Read-only.
+    pub const VERSION_2: u32 = 2;
+
+    /// The filename-less version. Read-only, and only in order to recover an intent
     /// published before S6.4.1.
     pub const LEGACY_VERSION: u32 = 1;
 
@@ -91,8 +101,15 @@ impl DeliveryProjectionWire {
             return serde_json::to_string(&wire)
                 .expect("a delivery projection is always representable as a JSON object");
         }
+        // A payload is written in the version whose identity function produced its
+        // key, so re-encoding a decoded row reproduces that row instead of silently
+        // re-identifying history.
+        let version = match projection.identity_version() {
+            DeliveryIdentityVersion::V1 => Self::VERSION_2,
+            DeliveryIdentityVersion::V2 => Self::VERSION,
+        };
         let wire = WireDeliveryProjectionV2 {
-            version: Self::VERSION,
+            version,
             delivery_sha256: projection.delivery_sha256().to_string(),
             source_projection_sha256: projection.source_projection_sha256().to_string(),
             snapshot_id: projection.snapshot_id().get(),
@@ -132,7 +149,8 @@ impl DeliveryProjectionWire {
             serde_json::from_str(value).map_err(|_| DeliveryProjectionWireError::Malformed)?;
         match probe.version {
             Self::LEGACY_VERSION => Self::decode_v1(value),
-            Self::VERSION => Self::decode_v2(value),
+            Self::VERSION_2 => Self::decode_filenames(value, DeliveryIdentityVersion::V1),
+            Self::VERSION => Self::decode_filenames(value, DeliveryIdentityVersion::V2),
             other => Err(DeliveryProjectionWireError::UnsupportedVersion(other)),
         }
     }
@@ -182,18 +200,26 @@ impl DeliveryProjectionWire {
             managed_root,
             text,
             assets,
+            DeliveryIdentityVersion::V1,
             &wire.delivery_sha256,
         )
     }
 
-    /// Rebuilds a version 2 payload, cross-checking every presentation fact.
+    /// Rebuilds a filename-bearing payload, cross-checking every presentation fact.
     ///
     /// The filename is not trusted because it is stored: it must be exactly the
     /// filename the frozen logical path and the frozen media type derive, and the
     /// stored key must be exactly the key that filename and the published digest
     /// produce. A payload that names the right digest under the wrong filename is
     /// a different delivery intent, not a recoverable one.
-    fn decode_v2(value: &str) -> Result<DeliveryProjection, DeliveryProjectionWireError> {
+    ///
+    /// Versions 2 and 3 share these fields; the caller states which identity
+    /// function the recorded key was computed with, because reproducing an old key
+    /// is the only way an old intent stays recoverable.
+    fn decode_filenames(
+        value: &str,
+        identity: DeliveryIdentityVersion,
+    ) -> Result<DeliveryProjection, DeliveryProjectionWireError> {
         let wire: WireDeliveryProjectionV2 =
             serde_json::from_str(value).map_err(|_| DeliveryProjectionWireError::Malformed)?;
         let (source_projection_sha256, snapshot_id, managed_root) = shared_facts(
@@ -248,6 +274,7 @@ impl DeliveryProjectionWire {
             managed_root,
             text,
             assets,
+            identity,
             &wire.delivery_sha256,
         )
     }
@@ -351,21 +378,33 @@ fn decode_text(
     Ok(text)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn finish(
     source_projection_sha256: Sha256,
     snapshot_id: SnapshotId,
     managed_root: ManagedRoot,
     text: TextProjection,
     assets: Vec<PublishedAsset>,
+    identity: DeliveryIdentityVersion,
     recorded_delivery_sha256: &str,
 ) -> Result<DeliveryProjection, DeliveryProjectionWireError> {
-    let projection = DeliveryProjection::from_parts(
-        source_projection_sha256,
-        snapshot_id,
-        managed_root,
-        text,
-        AssetProjection::from_assets(assets),
-    );
+    let assets = AssetProjection::from_assets(assets);
+    let projection = match identity {
+        DeliveryIdentityVersion::V1 => DeliveryProjection::from_parts_with_legacy_identity(
+            source_projection_sha256,
+            snapshot_id,
+            managed_root,
+            text,
+            assets,
+        ),
+        DeliveryIdentityVersion::V2 => DeliveryProjection::from_parts(
+            source_projection_sha256,
+            snapshot_id,
+            managed_root,
+            text,
+            assets,
+        ),
+    };
     let recorded_delivery_sha256 = sha256(recorded_delivery_sha256)?;
     if projection.delivery_sha256() != recorded_delivery_sha256 {
         return Err(
@@ -705,14 +744,14 @@ mod tests {
     }
 
     #[test]
-    fn version_two_pins_the_field_names_and_round_trips() {
+    fn version_three_pins_the_field_names_and_round_trips() {
         let (projection, _) = projection();
 
         let encoded = DeliveryProjectionWire::encode(&projection);
         let decoded = DeliveryProjectionWire::decode(&encoded).unwrap();
 
         assert_eq!(decoded, projection);
-        assert!(encoded.contains("\"version\":2"));
+        assert!(encoded.contains("\"version\":3"));
         assert!(encoded.contains("\"delivery_sha256\":"));
         assert!(encoded.contains("\"source_projection_sha256\":"));
         assert!(encoded.contains("\"published_content_type\":\"image/jpeg\""));
@@ -740,8 +779,138 @@ mod tests {
         let encoded = DeliveryProjectionWire::encode(&projection);
 
         assert_eq!(
-            DeliveryProjectionWire::decode(&encoded.replace("\"version\":2", "\"version\":3")),
-            Err(DeliveryProjectionWireError::UnsupportedVersion(3))
+            DeliveryProjectionWire::decode(&encoded.replace("\"version\":3", "\"version\":4")),
+            Err(DeliveryProjectionWireError::UnsupportedVersion(4))
+        );
+    }
+
+    /// The exact bytes this engine wrote once keys carried a filename, before the
+    /// delivery identity covered the snapshot provenance the payload stores.
+    ///
+    /// It is kept verbatim because a row already in someone's database has to keep
+    /// loading: its recorded identity was computed without the snapshot id, and the
+    /// decoder must reproduce that identity rather than today's.
+    const FROZEN_VERSION_TWO_PAYLOAD: &str = concat!(
+        "{\"version\":2,",
+        "\"delivery_sha256\":\"ab4637adf0fa30c1d637f75201d8f345f3bf976fd82d00c8e11e50727c35731b\",",
+        "\"source_projection_sha256\":\"e6a6a5a6a237f81d871a85086c3b4a445505ccd9429dce5fe0ecf26de5e6ebcd\",",
+        "\"snapshot_id\":7,\"managed_root\":\"content\",",
+        "\"text\":{",
+        "\"source_projection_sha256\":\"e6a6a5a6a237f81d871a85086c3b4a445505ccd9429dce5fe0ecf26de5e6ebcd\",",
+        "\"projection_sha256\":\"13a9eb9b718d839b4f028d61be87d9449d515ffeda3cc72ad4f58aa6dc7652ec\",",
+        "\"snapshot_id\":7,\"managed_root\":\"content\",",
+        "\"files\":[",
+        "{\"target_path\":\"content/a.md\",\"blob_sha256\":\"3f2f9417578b39902aa45f417c47fa52df8b2e3c5bc0cbffe95c2e8c2e22244e\",",
+        "\"source_path\":\"a.md\",\"source_sha256\":\"3a660235b7d958fb2f3b9d50fba11ba5e1c2b9c0063d58503f315174d0a33f7f\"},",
+        "{\"target_path\":\"content/notes/b.md\",\"blob_sha256\":\"3f2f9417578b39902aa45f417c47fa52df8b2e3c5bc0cbffe95c2e8c2e22244e\",",
+        "\"source_path\":\"notes/b.md\",\"source_sha256\":\"3a660235b7d958fb2f3b9d50fba11ba5e1c2b9c0063d58503f315174d0a33f7f\"}]},",
+        "\"assets\":[",
+        "{\"logical_path\":\"files/a.pdf\",",
+        "\"source_sha256\":\"0303030303030303030303030303030303030303030303030303030303030303\",",
+        "\"published_sha256\":\"0303030303030303030303030303030303030303030303030303030303030303\",",
+        "\"published_size\":200,\"published_content_type\":\"application/pdf\",\"public_filename\":\"a.pdf\",",
+        "\"object_key\":\"assets/sha256/03/0303030303030303030303030303030303030303030303030303030303030303/a.pdf\",",
+        "\"public_url\":\"https://assets.example.com/assets/sha256/03/0303030303030303030303030303030303030303030303030303030303030303/a.pdf\"},",
+        "{\"logical_path\":\"img/a.png\",",
+        "\"source_sha256\":\"0101010101010101010101010101010101010101010101010101010101010101\",",
+        "\"published_sha256\":\"0202020202020202020202020202020202020202020202020202020202020202\",",
+        "\"published_size\":4242,\"published_content_type\":\"image/jpeg\",\"public_filename\":\"a.jpg\",",
+        "\"object_key\":\"assets/sha256/02/0202020202020202020202020202020202020202020202020202020202020202/a.jpg\",",
+        "\"public_url\":\"https://assets.example.com/assets/sha256/02/0202020202020202020202020202020202020202020202020202020202020202/a.jpg\"}]}",
+    );
+
+    /// A version 2 row still decodes to the identity it recorded, and re-encodes as
+    /// version 2 rather than being silently re-identified under today's function.
+    #[test]
+    fn a_frozen_version_two_payload_keeps_its_recorded_identity() {
+        let decoded = DeliveryProjectionWire::decode(FROZEN_VERSION_TWO_PAYLOAD).unwrap();
+
+        assert_eq!(
+            decoded.delivery_sha256().to_string(),
+            "ab4637adf0fa30c1d637f75201d8f345f3bf976fd82d00c8e11e50727c35731b"
+        );
+        assert_eq!(
+            DeliveryProjectionWire::encode(&decoded),
+            FROZEN_VERSION_TWO_PAYLOAD
+        );
+    }
+
+    /// The identity is the durable key of an immutable intent, so it covers every
+    /// fact the intent stores.
+    ///
+    /// This is the failure a real workspace hit: publishing the same delivered
+    /// content from a new snapshot (an unrelated file had been added to the vault)
+    /// recomputed the same key for a different payload, and the store — which
+    /// promises one key, one payload — refused to persist it.
+    #[test]
+    fn the_identity_covers_the_snapshot_provenance() {
+        let (projection, _) = projection();
+        let other_snapshot = SnapshotId::new(8).unwrap();
+        let text = TextProjection::from_parts(
+            other_snapshot,
+            projection.managed_root().clone(),
+            projection.source_projection_sha256(),
+            projection.text().files().to_vec(),
+        );
+        let reidentified = DeliveryProjection::from_parts(
+            projection.source_projection_sha256(),
+            other_snapshot,
+            projection.managed_root().clone(),
+            text,
+            projection.assets().clone(),
+        );
+
+        assert_ne!(
+            reidentified.delivery_sha256(),
+            projection.delivery_sha256(),
+            "the same delivered bytes from another snapshot are another intent"
+        );
+        // Both payloads are valid on their own terms.
+        assert_eq!(
+            DeliveryProjectionWire::decode(&DeliveryProjectionWire::encode(&projection)).unwrap(),
+            projection
+        );
+        assert_eq!(
+            DeliveryProjectionWire::decode(&DeliveryProjectionWire::encode(&reidentified)).unwrap(),
+            reidentified
+        );
+    }
+
+    /// A document whose *delivered* bytes are unchanged but whose authored bytes are
+    /// not is a different intent as well.
+    #[test]
+    fn the_identity_covers_each_documents_authored_provenance() {
+        let (projection, _) = projection();
+        let mut files = projection.text().files().to_vec();
+        let first = &files[0];
+        files[0] = TextProjectionFile::from_parts(
+            first.target_path().clone(),
+            first.blob_sha256(),
+            first.source_path().clone(),
+            Sha256::new([0xee; 32]),
+        );
+        let reauthored = DeliveryProjection::from_parts(
+            projection.source_projection_sha256(),
+            projection.snapshot_id(),
+            projection.managed_root().clone(),
+            TextProjection::from_parts(
+                projection.snapshot_id(),
+                projection.managed_root().clone(),
+                projection.source_projection_sha256(),
+                files,
+            ),
+            projection.assets().clone(),
+        );
+
+        assert_eq!(
+            reauthored.text().projection_sha256(),
+            projection.text().projection_sha256(),
+            "the delivered tree is identical"
+        );
+        assert_ne!(
+            reauthored.delivery_sha256(),
+            projection.delivery_sha256(),
+            "the reviewed inputs are not"
         );
     }
 
