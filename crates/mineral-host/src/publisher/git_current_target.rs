@@ -478,12 +478,11 @@ mod tests {
         io::Write,
         process::{Command, Stdio},
         sync::atomic::{AtomicU64, Ordering},
-        time::SystemTime,
     };
 
     use crate::{
-        domain::{ContentPath, Snapshot, SnapshotFile, SnapshotId, SourceId},
-        workflow::{FinalPublicationSet, PublicProjection, PublishOperation, PublishPlan},
+        domain::{ContentPath, Sha256, SnapshotId},
+        workflow::{ManagedRoot, PublishOperation, PublishPlan, TextProjection},
     };
 
     use super::*;
@@ -900,25 +899,15 @@ mod tests {
         let current = read(&repository, &commit);
         let desired_a = Sha256::digest(b"BBB");
         let desired_new = Sha256::digest(b"CCC");
-        let snapshot = Snapshot::new(
+        let projection = TextProjection::from_parts_for_test(
             SnapshotId::new(1).unwrap(),
-            SystemTime::UNIX_EPOCH,
-            SourceId::new("test").unwrap(),
+            ManagedRoot::new("content").unwrap(),
+            Sha256::new([0; 32]),
             vec![
-                SnapshotFile::new(ContentPath::new("a.md").unwrap(), 3, desired_a, None),
-                SnapshotFile::new(ContentPath::new("new.md").unwrap(), 3, desired_new, None),
+                (ContentPath::new("a.md").unwrap(), desired_a),
+                (ContentPath::new("new.md").unwrap(), desired_new),
             ],
-        )
-        .unwrap();
-        let publication_set = FinalPublicationSet::from_parts_for_test(
-            SnapshotId::new(1).unwrap(),
-            vec![
-                ContentPath::new("a.md").unwrap(),
-                ContentPath::new("new.md").unwrap(),
-            ],
-            vec![],
         );
-        let projection = PublicProjection::build(&publication_set, &snapshot, root()).unwrap();
 
         let plan = PublishPlan::build(current.state(), &projection).unwrap();
 

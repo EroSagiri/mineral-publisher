@@ -20,6 +20,24 @@ pub struct AnalyzedMarkdown {
 }
 
 impl AnalyzedMarkdown {
+    /// Parses and resolves one Markdown document against the Snapshot it belongs to.
+    ///
+    /// This is the single definition of reference analysis. Every consumer that
+    /// needs to know what a reference points at — dependency scanning, delivery
+    /// rewriting, policy — goes through it, so two stages can never disagree
+    /// about the target of the same syntax.
+    pub fn analyze(file: SnapshotFile, markdown: &str, snapshot: &Snapshot) -> Self {
+        let frontmatter = MarkdownFrontmatterParser::parse(markdown);
+        let references = MarkdownReferenceParser::parse(markdown)
+            .into_iter()
+            .map(|reference| {
+                let resolution = ReferenceResolver::resolve(&reference, file.path(), snapshot);
+                ResolvedReference::new(reference, resolution)
+            })
+            .collect();
+        Self::with_frontmatter(file, frontmatter, references)
+    }
+
     pub fn with_frontmatter(
         file: SnapshotFile,
         frontmatter: FrontmatterParseResult,
@@ -126,20 +144,8 @@ impl<B: BlobStore> SnapshotMarkdownAnalyzer<B> {
                 source,
             }
         })?;
-        let frontmatter = MarkdownFrontmatterParser::parse(&markdown);
-        let references = MarkdownReferenceParser::parse(&markdown)
-            .into_iter()
-            .map(|reference| {
-                let resolution = ReferenceResolver::resolve(&reference, file.path(), snapshot);
-                ResolvedReference::new(reference, resolution)
-            })
-            .collect();
 
-        Ok(AnalyzedMarkdown::with_frontmatter(
-            file.clone(),
-            frontmatter,
-            references,
-        ))
+        Ok(AnalyzedMarkdown::analyze(file.clone(), &markdown, snapshot))
     }
 }
 

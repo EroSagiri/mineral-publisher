@@ -22,6 +22,6 @@ pub use remote_observation::{
     RemoteObservationStore, RemoteRefObservation,
 };
 pub use run::{
-    PublishRun, PublishRunError, PublishRunId, PublishRunIdError, PublishRunPublication,
-    PublishRunStore,
+    DeliveryProjectionBinding, PublishRun, PublishRunError, PublishRunId, PublishRunIdError,
+    PublishRunPublication, PublishRunStore,
 };

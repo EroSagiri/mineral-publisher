@@ -1,11 +1,24 @@
 use crate::domain::{ContentPath, Sha256, SnapshotId};
 
-use super::AssetReviewRunId;
+use super::{AssetContentType, AssetReviewRunId};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ImageSanitizationFormat {
     Jpeg,
     Png,
+}
+
+impl ImageSanitizationFormat {
+    /// The media type of the bytes this format produces.
+    ///
+    /// One definition of "what a re-encoded image actually is", so a re-encoded
+    /// asset can never keep advertising its source type.
+    pub fn media_type(self) -> &'static str {
+        match self {
+            Self::Jpeg => "image/jpeg",
+            Self::Png => "image/png",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -22,6 +35,7 @@ pub struct SanitizedAsset {
     source_sha256: Sha256,
     published_sha256: Sha256,
     published_size: u64,
+    published_content_type: AssetContentType,
     transformations: Vec<SanitizationTransformation>,
 }
 
@@ -37,6 +51,7 @@ impl SanitizedAsset {
         source_sha256: Sha256,
         published_sha256: Sha256,
         published_size: u64,
+        published_content_type: AssetContentType,
         transformations: Vec<SanitizationTransformation>,
     ) -> Self {
         Self {
@@ -45,6 +60,7 @@ impl SanitizedAsset {
             source_sha256,
             published_sha256,
             published_size,
+            published_content_type,
             transformations,
         }
     }
@@ -67,6 +83,11 @@ impl SanitizedAsset {
 
     pub fn published_size(&self) -> u64 {
         self.published_size
+    }
+
+    /// The media type of the bytes that will actually be served.
+    pub fn published_content_type(&self) -> &AssetContentType {
+        &self.published_content_type
     }
 
     pub fn transformations(&self) -> &[SanitizationTransformation] {

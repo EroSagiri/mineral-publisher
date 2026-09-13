@@ -305,7 +305,9 @@ mod tests {
         PublishRun::rehydrate(
             PublishRunId::new(7).unwrap(),
             SnapshotId::new(1).unwrap(),
-            Sha256::new([1; 32]),
+            Some(Sha256::new([1; 32])),
+            None,
+            None,
             ManagedRoot::new("content").unwrap(),
             PublishTargetId::new("origin:refs/heads/main").unwrap(),
             GitRepositoryIdentity::new(&directory.0)

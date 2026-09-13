@@ -1,6 +1,6 @@
 use std::error::Error;
 
-use crate::workflow::{ManagedRoot, PublicProjection};
+use crate::workflow::{ManagedRoot, TextProjection};
 
 use super::model::{
     CasOutcome, GitCommitOid, GitCommitSpec, GitCurrentTarget, GitRefTarget, LocalCommitState,
@@ -47,11 +47,16 @@ pub trait GitRepository {
         root: &ManagedRoot,
     ) -> Result<GitCurrentTarget, Self::Error>;
 
-    /// Materializes the complete projection and reports the exact tree it wrote.
+    /// Materializes the complete delivery text side and reports the exact tree it wrote.
+    ///
+    /// Only [`TextProjection`] crosses this boundary: binary assets are not part
+    /// of a Git target at all, so a runtime physically cannot stage one, and the
+    /// URL rewriting that produced these document bytes already happened in the
+    /// engine's delivery stage.
     fn materialize(
         &self,
         base: &GitCommitOid,
-        projection: &PublicProjection,
+        text: &TextProjection,
     ) -> Result<ReviewedGitTree, Self::Error>;
 
     /// Creates the commit object described by `spec` and reports its identity.

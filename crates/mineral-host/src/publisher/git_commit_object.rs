@@ -511,13 +511,13 @@ mod tests {
     };
 
     use crate::{
-        domain::{ContentPath, Snapshot, SnapshotFile, SnapshotId, SourceId},
+        domain::{ContentPath, Sha256, SnapshotId},
         publisher::{
-            GitProjectionMaterializer, GitRefTarget, GitRepositoryIdentity, PublishRun,
-            PublishRunId, PublishTargetId, ReviewedGitTree,
+            DeliveryProjectionBinding, GitProjectionMaterializer, GitRefTarget,
+            GitRepositoryIdentity, PublishRun, PublishRunId, PublishTargetId, ReviewedGitTree,
         },
         storage::LocalContentStore,
-        workflow::{FinalPublicationSet, ManagedRoot, PublicProjection},
+        workflow::{ManagedRoot, TextProjection},
     };
 
     use super::*;
@@ -597,35 +597,20 @@ mod tests {
         }
     }
 
-    fn projection(repository: &TestRepository, entries: &[(&str, &[u8])]) -> PublicProjection {
+    fn projection(repository: &TestRepository, entries: &[(&str, &[u8])]) -> TextProjection {
         let files = entries
             .iter()
             .map(|(path, bytes)| {
                 let sha256 = repository.store.store(bytes).unwrap();
-                SnapshotFile::new(
-                    ContentPath::new(*path).unwrap(),
-                    bytes.len() as u64,
-                    sha256,
-                    None,
-                )
+                (ContentPath::new(*path).unwrap(), sha256)
             })
             .collect::<Vec<_>>();
-        let snapshot = Snapshot::new(
+        TextProjection::from_parts_for_test(
             SnapshotId::new(7).unwrap(),
-            UNIX_EPOCH,
-            SourceId::new("test").unwrap(),
+            ManagedRoot::new("content").unwrap(),
+            Sha256::new([0; 32]),
             files,
         )
-        .unwrap();
-        let set = FinalPublicationSet::from_parts_for_test(
-            snapshot.id(),
-            entries
-                .iter()
-                .map(|(path, _)| ContentPath::new(*path).unwrap())
-                .collect(),
-            vec![],
-        );
-        PublicProjection::build(&set, &snapshot, ManagedRoot::new("content").unwrap()).unwrap()
     }
 
     fn reviewed(
@@ -742,6 +727,8 @@ mod tests {
                 .clone(),
             GitRefTarget::new("origin", "refs/heads/main").unwrap(),
             &reviewed,
+            // The reviewed tree's projection identity is the delivery text side.
+            &DeliveryProjectionBinding::new(Sha256::new([4; 32]), reviewed.projection_sha256()),
             Some(commit.clone()),
             Some(frozen.clone()),
             TimestampMillis::from_unix_millis(10_000),

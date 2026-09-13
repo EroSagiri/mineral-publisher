@@ -4,7 +4,7 @@ use sha2::{Digest, Sha256 as Sha256Hasher};
 
 use crate::domain::{Sha256, SnapshotId};
 
-use super::{ManagedRoot, ProjectionTargetPath, PublicProjection, PublicationFileMode};
+use super::{ManagedRoot, ProjectionTargetPath, PublicationFileMode, TextProjection};
 
 /// One observed file in the complete managed target subtree.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -131,9 +131,13 @@ pub struct PublishPlan {
 
 impl PublishPlan {
     /// Builds a pure identity-space diff without reading target files or projection blobs.
+    ///
+    /// The desired state is the delivery text side, because that is the only side
+    /// a Git target ever holds: the plan, the materialized tree and the reviewed
+    /// tree therefore all describe the same bytes.
     pub fn build(
         current: &CurrentTargetState,
-        projection: &PublicProjection,
+        projection: &TextProjection,
     ) -> Result<Self, PublishPlanError> {
         if current.managed_root() != projection.managed_root() {
             return Err(PublishPlanError::ManagedRootMismatch {
@@ -153,7 +157,7 @@ impl PublishPlan {
             })
             .collect::<BTreeMap<_, _>>();
         let desired_entries = projection
-            .entries()
+            .files()
             .iter()
             .map(|entry| {
                 (
@@ -344,12 +348,7 @@ impl Error for PublishPlanError {}
 
 #[cfg(test)]
 mod tests {
-    use std::time::SystemTime;
-
-    use crate::{
-        domain::{ContentPath, Snapshot, SnapshotFile, SourceId},
-        workflow::FinalPublicationSet,
-    };
+    use crate::domain::ContentPath;
 
     use super::*;
 
@@ -376,28 +375,16 @@ mod tests {
         .unwrap()
     }
 
-    fn projection(entries: &[(&str, Sha256)]) -> PublicProjection {
-        let snapshot = Snapshot::new(
+    fn projection(entries: &[(&str, Sha256)]) -> TextProjection {
+        TextProjection::from_parts_for_test(
             SnapshotId::new(1).unwrap(),
-            SystemTime::UNIX_EPOCH,
-            SourceId::new("test").unwrap(),
+            root(),
+            sha(0),
             entries
                 .iter()
-                .map(|(path, identity)| {
-                    SnapshotFile::new(ContentPath::new(*path).unwrap(), 1, *identity, None)
-                })
+                .map(|(path, identity)| (ContentPath::new(*path).unwrap(), *identity))
                 .collect(),
         )
-        .unwrap();
-        let publication_set = FinalPublicationSet::from_parts_for_test(
-            SnapshotId::new(1).unwrap(),
-            entries
-                .iter()
-                .map(|(path, _)| ContentPath::new(*path).unwrap())
-                .collect(),
-            vec![],
-        );
-        PublicProjection::build(&publication_set, &snapshot, root()).unwrap()
     }
 
     #[test]

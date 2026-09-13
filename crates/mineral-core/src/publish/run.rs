@@ -3,7 +3,7 @@ use std::{error::Error, fmt};
 use crate::{
     domain::{Sha256, SnapshotId, TimestampMillis},
     publication::git::{GitCommitOid, GitCommitSpec, GitRefTarget, ReviewedGitTree},
-    workflow::ManagedRoot,
+    workflow::{DeliveryProjection, ManagedRoot},
 };
 
 use super::{PublishTargetId, RepositoryLocator};
@@ -38,6 +38,49 @@ impl fmt::Display for PublishRunIdError {
 
 impl Error for PublishRunIdError {}
 
+/// The immutable delivery projection one publication intent is bound to.
+///
+/// `delivery_sha256` locates the durable delivery intent in a
+/// [`crate::workflow::DeliveryProjectionStore`]; `text_projection_sha256` is the
+/// canonical identity of the exact text tree that review covered. Storing both
+/// makes the run checkable from two directions: the projection it later recovers
+/// from must carry the recorded delivery identity, and its text side must be the
+/// very tree the run's `reviewed_tree` was materialized from.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DeliveryProjectionBinding {
+    delivery_sha256: Sha256,
+    text_projection_sha256: Sha256,
+}
+
+impl DeliveryProjectionBinding {
+    /// Binds one delivery projection and the text side inside it.
+    ///
+    /// This is the only constructor that reads both identities out of the same
+    /// value, so a caller cannot pair a delivery identity with another
+    /// projection's text identity by accident.
+    pub fn from_projection(projection: &DeliveryProjection) -> Self {
+        Self {
+            delivery_sha256: projection.delivery_sha256(),
+            text_projection_sha256: projection.text().projection_sha256(),
+        }
+    }
+
+    pub fn new(delivery_sha256: Sha256, text_projection_sha256: Sha256) -> Self {
+        Self {
+            delivery_sha256,
+            text_projection_sha256,
+        }
+    }
+
+    pub fn delivery_sha256(&self) -> Sha256 {
+        self.delivery_sha256
+    }
+
+    pub fn text_projection_sha256(&self) -> Sha256 {
+        self.text_projection_sha256
+    }
+}
+
 /// The immutable publication intent. A commit-ready intent is not evidence of remote success.
 ///
 /// `desired_commit` is the only commit fact an intent carries: `None` means this
@@ -65,7 +108,19 @@ impl Error for PublishRunIdError {}
 pub struct PublishRun {
     id: PublishRunId,
     snapshot_id: SnapshotId,
-    projection_sha256: Sha256,
+    /// The value rows written before this field was split stored in
+    /// `projection_sha256`.
+    ///
+    /// Its domain meaning is **not** recoverable from the value alone: rows written
+    /// by the S5 engine hold the `PublicProjection` identity, and rows written by
+    /// the S6.1 delivery path hold the `TextProjection` identity. It is therefore
+    /// kept as opaque audit metadata for historical rows, is never written by a
+    /// new run, and must not be compared with either identity.
+    legacy_projection_sha256: Option<Sha256>,
+    /// Identity of the exact text tree `reviewed_tree` was materialized from.
+    reviewed_text_projection_sha256: Option<Sha256>,
+    /// Identity of the durable delivery projection this run is bound to.
+    delivery_projection_sha256: Option<Sha256>,
     managed_root: ManagedRoot,
     target_id: PublishTargetId,
     repository: RepositoryLocator,
@@ -110,6 +165,7 @@ impl PublishRun {
         repository: RepositoryLocator,
         target: GitRefTarget,
         reviewed: &ReviewedGitTree,
+        delivery: &DeliveryProjectionBinding,
         desired_commit: Option<GitCommitOid>,
         commit_spec: Option<GitCommitSpec>,
         created_at: TimestampMillis,
@@ -117,10 +173,21 @@ impl PublishRun {
         if desired_commit.is_some() && commit_spec.is_none() {
             return Err(PublishRunError::DesiredCommitWithoutCommitSpec);
         }
+        // The reviewed tree the runtime materialized is the delivery text side; a
+        // binding that names another text identity would let the intent point at a
+        // projection this review never covered.
+        if delivery.text_projection_sha256() != reviewed.projection_sha256() {
+            return Err(PublishRunError::DeliveryTextProjectionMismatch {
+                reviewed_text_projection_sha256: reviewed.projection_sha256(),
+                bound_text_projection_sha256: delivery.text_projection_sha256(),
+            });
+        }
         Self::from_parts(
             id,
             reviewed.snapshot_id(),
-            reviewed.projection_sha256(),
+            None,
+            Some(delivery.text_projection_sha256()),
+            Some(delivery.delivery_sha256()),
             reviewed.managed_root().clone(),
             target_id,
             repository,
@@ -146,7 +213,9 @@ impl PublishRun {
     pub fn rehydrate(
         id: PublishRunId,
         snapshot_id: SnapshotId,
-        projection_sha256: Sha256,
+        legacy_projection_sha256: Option<Sha256>,
+        reviewed_text_projection_sha256: Option<Sha256>,
+        delivery_projection_sha256: Option<Sha256>,
         managed_root: ManagedRoot,
         target_id: PublishTargetId,
         repository: RepositoryLocator,
@@ -160,7 +229,9 @@ impl PublishRun {
         Self::from_parts(
             id,
             snapshot_id,
-            projection_sha256,
+            legacy_projection_sha256,
+            reviewed_text_projection_sha256,
+            delivery_projection_sha256,
             managed_root,
             target_id,
             repository,
@@ -184,7 +255,9 @@ impl PublishRun {
     fn from_parts(
         id: PublishRunId,
         snapshot_id: SnapshotId,
-        projection_sha256: Sha256,
+        legacy_projection_sha256: Option<Sha256>,
+        reviewed_text_projection_sha256: Option<Sha256>,
+        delivery_projection_sha256: Option<Sha256>,
         managed_root: ManagedRoot,
         target_id: PublishTargetId,
         repository: RepositoryLocator,
@@ -200,6 +273,11 @@ impl PublishRun {
         }
         if !is_oid(&reviewed_tree) {
             return Err(PublishRunError::InvalidReviewedTree);
+        }
+        // A delivery binding is atomic: a text identity without the projection that
+        // contains it (or the reverse) can satisfy nothing.
+        if reviewed_text_projection_sha256.is_some() != delivery_projection_sha256.is_some() {
+            return Err(PublishRunError::PartialDeliveryProjectionBinding);
         }
         // Deliberately not `desired_commit.is_some() == commit_spec.is_some()`:
         // intents persisted before the specification was stored carry no spec and
@@ -224,7 +302,9 @@ impl PublishRun {
         Ok(Self {
             id,
             snapshot_id,
-            projection_sha256,
+            legacy_projection_sha256,
+            reviewed_text_projection_sha256,
+            delivery_projection_sha256,
             managed_root,
             target_id,
             repository,
@@ -243,8 +323,32 @@ impl PublishRun {
     pub fn snapshot_id(&self) -> SnapshotId {
         self.snapshot_id
     }
-    pub fn projection_sha256(&self) -> Sha256 {
-        self.projection_sha256
+    /// Opaque audit metadata carried by rows written before the projection
+    /// identity was split; see the field documentation.
+    pub fn legacy_projection_sha256(&self) -> Option<Sha256> {
+        self.legacy_projection_sha256
+    }
+
+    /// The exact durable delivery projection this run must recover from.
+    ///
+    /// `None` means the run was written before delivery projections were captured,
+    /// so no durable delivery intent exists for it. That is an honest degraded
+    /// state, not corruption — but it is also not recoverable by guessing.
+    pub fn delivery_projection_binding(&self) -> Option<DeliveryProjectionBinding> {
+        match (
+            self.delivery_projection_sha256,
+            self.reviewed_text_projection_sha256,
+        ) {
+            (Some(delivery_sha256), Some(text_projection_sha256)) => Some(
+                DeliveryProjectionBinding::new(delivery_sha256, text_projection_sha256),
+            ),
+            _ => None,
+        }
+    }
+
+    /// Identity of the exact text tree this run reviewed, when it was captured.
+    pub fn reviewed_text_projection_sha256(&self) -> Option<Sha256> {
+        self.reviewed_text_projection_sha256
     }
     pub fn managed_root(&self) -> &ManagedRoot {
         &self.managed_root
@@ -263,6 +367,15 @@ impl PublishRun {
     }
     pub fn base_commit(&self) -> &str {
         &self.base_commit
+    }
+
+    /// The same base as a usable Git object identity.
+    ///
+    /// The constructors reject anything that is not an object ID, so this cannot
+    /// fail for an intent that exists.
+    pub fn base_commit_oid(&self) -> GitCommitOid {
+        GitCommitOid::new(self.base_commit.clone())
+            .expect("the publish run constructors reject a base commit that is not an object ID")
     }
     pub fn reviewed_tree(&self) -> &str {
         &self.reviewed_tree
@@ -309,6 +422,14 @@ pub enum PublishRunError {
     CommitSpecTreeMismatch,
     CommitSpecAuthorTimeMismatch,
     CommitSpecCommitterTimeMismatch,
+    /// The bound delivery projection's text side is not the tree that was
+    /// materialized for this review.
+    DeliveryTextProjectionMismatch {
+        reviewed_text_projection_sha256: Sha256,
+        bound_text_projection_sha256: Sha256,
+    },
+    /// Only one half of a delivery binding was stored.
+    PartialDeliveryProjectionBinding,
 }
 
 impl fmt::Display for PublishRunError {
@@ -335,6 +456,12 @@ impl fmt::Display for PublishRunError {
             Self::CommitSpecCommitterTimeMismatch => {
                 formatter.write_str("publish run commit specification committer time differs")
             }
+            Self::DeliveryTextProjectionMismatch { .. } => formatter.write_str(
+                "publish run is bound to a delivery projection whose text side is not the reviewed tree",
+            ),
+            Self::PartialDeliveryProjectionBinding => formatter.write_str(
+                "publish run stores only one half of its delivery projection binding",
+            ),
         }
     }
 }
@@ -363,15 +490,26 @@ mod tests {
         GitCommitOid::new(std::iter::repeat_n(value, 40).collect::<String>()).unwrap()
     }
 
+    /// The reviewed tree the delivery stage produced: its `projection_sha256` is
+    /// the text identity of the delivery projection below.
     fn reviewed(base: &str, tree: &str) -> ReviewedGitTree {
         ReviewedGitTree::from_parts(
             base,
             "9".repeat(40),
-            Sha256::new([7; 32]),
+            TEXT_SHA256,
             SnapshotId::new(4).unwrap(),
             tree,
             ManagedRoot::new("content").unwrap(),
         )
+    }
+
+    const TEXT_SHA256: Sha256 = Sha256::new([7; 32]);
+    const DELIVERY_SHA256: Sha256 = Sha256::new([8; 32]);
+
+    /// The binding a new intent must carry: the delivery projection, and the text
+    /// side inside it that equals the reviewed tree above.
+    fn binding() -> DeliveryProjectionBinding {
+        DeliveryProjectionBinding::new(DELIVERY_SHA256, TEXT_SHA256)
     }
 
     /// A newly created intent, built exactly the way the publication application
@@ -392,6 +530,7 @@ mod tests {
             RepositoryLocator::new("/srv/public-repo").unwrap(),
             GitRefTarget::new("origin", "refs/heads/main").unwrap(),
             &reviewed(&BASE.to_string().repeat(40), &TREE.to_string().repeat(40)),
+            &binding(),
             desired_commit,
             commit_spec,
             TimestampMillis::from_unix_millis(TIME),
@@ -427,7 +566,9 @@ mod tests {
         PublishRun::rehydrate(
             PublishRunId::new(1).unwrap(),
             SnapshotId::new(4).unwrap(),
-            Sha256::new([7; 32]),
+            Some(Sha256::new([6; 32])),
+            Some(TEXT_SHA256),
+            Some(DELIVERY_SHA256),
             ManagedRoot::new("content").unwrap(),
             PublishTargetId::new("origin:refs/heads/main").unwrap(),
             RepositoryLocator::new("/srv/public-repo").unwrap(),
@@ -445,7 +586,9 @@ mod tests {
         let run = run(Some(commit('c')));
 
         assert_eq!(run.snapshot_id(), SnapshotId::new(4).unwrap());
-        assert_eq!(run.projection_sha256(), Sha256::new([7; 32]));
+        assert_eq!(run.reviewed_text_projection_sha256(), Some(TEXT_SHA256));
+        assert_eq!(run.legacy_projection_sha256(), None);
+        assert_eq!(run.delivery_projection_binding(), Some(binding()));
         assert_eq!(run.managed_root().as_str(), "content");
         assert_eq!(run.base_commit(), "a".repeat(40));
         assert_eq!(run.reviewed_tree(), "b".repeat(40));
@@ -477,7 +620,11 @@ mod tests {
         let rehydrated = PublishRun::rehydrate(
             original.id(),
             original.snapshot_id(),
-            original.projection_sha256(),
+            original.legacy_projection_sha256(),
+            original.reviewed_text_projection_sha256(),
+            original
+                .delivery_projection_binding()
+                .map(|binding| binding.delivery_sha256()),
             original.managed_root().clone(),
             original.target_id().clone(),
             original.repository().clone(),
@@ -601,6 +748,105 @@ mod tests {
     }
 
     #[test]
+    fn a_new_intent_always_carries_the_delivery_binding_even_for_a_noop() {
+        let noop = run(None);
+        let commit_ready = run(Some(commit('c')));
+
+        for intent in [&noop, &commit_ready] {
+            assert_eq!(
+                intent.delivery_projection_binding(),
+                Some(DeliveryProjectionBinding::new(DELIVERY_SHA256, TEXT_SHA256)),
+                "every new intent must be able to recover its delivery projection"
+            );
+            assert_eq!(intent.reviewed_text_projection_sha256(), Some(TEXT_SHA256));
+            // A new intent never writes the opaque historical column.
+            assert_eq!(intent.legacy_projection_sha256(), None);
+        }
+    }
+
+    #[test]
+    fn a_new_intent_bound_to_another_text_projection_is_rejected() {
+        let error = PublishRun::from_reviewed_tree(
+            PublishRunId::new(1).unwrap(),
+            PublishTargetId::new("origin:refs/heads/main").unwrap(),
+            RepositoryLocator::new("/srv/public-repo").unwrap(),
+            GitRefTarget::new("origin", "refs/heads/main").unwrap(),
+            &reviewed(&BASE.to_string().repeat(40), &TREE.to_string().repeat(40)),
+            &DeliveryProjectionBinding::new(DELIVERY_SHA256, Sha256::new([9; 32])),
+            None,
+            None,
+            TimestampMillis::from_unix_millis(TIME),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            PublishRunError::DeliveryTextProjectionMismatch {
+                reviewed_text_projection_sha256: TEXT_SHA256,
+                bound_text_projection_sha256: Sha256::new([9; 32]),
+            }
+        );
+    }
+
+    #[test]
+    fn a_historical_intent_has_no_delivery_binding_and_keeps_its_opaque_hash() {
+        let historical = PublishRun::rehydrate(
+            PublishRunId::new(1).unwrap(),
+            SnapshotId::new(4).unwrap(),
+            Some(Sha256::new([6; 32])),
+            None,
+            None,
+            ManagedRoot::new("content").unwrap(),
+            PublishTargetId::new("origin:refs/heads/main").unwrap(),
+            RepositoryLocator::new("/srv/public-repo").unwrap(),
+            GitRefTarget::new("origin", "refs/heads/main").unwrap(),
+            BASE.to_string().repeat(40),
+            TREE.to_string().repeat(40),
+            Some(commit('c')),
+            Some(spec()),
+            TIME,
+        )
+        .unwrap();
+
+        assert_eq!(historical.delivery_projection_binding(), None);
+        assert_eq!(historical.reviewed_text_projection_sha256(), None);
+        assert_eq!(
+            historical.legacy_projection_sha256(),
+            Some(Sha256::new([6; 32]))
+        );
+        // The legacy column is opaque: it is not comparable with either identity.
+        assert_ne!(
+            historical.legacy_projection_sha256(),
+            historical.reviewed_text_projection_sha256()
+        );
+    }
+
+    #[test]
+    fn half_a_delivery_binding_is_never_legal() {
+        for (text, delivery) in [(Some(TEXT_SHA256), None), (None, Some(DELIVERY_SHA256))] {
+            let error = PublishRun::rehydrate(
+                PublishRunId::new(1).unwrap(),
+                SnapshotId::new(4).unwrap(),
+                None,
+                text,
+                delivery,
+                ManagedRoot::new("content").unwrap(),
+                PublishTargetId::new("origin:refs/heads/main").unwrap(),
+                RepositoryLocator::new("/srv/public-repo").unwrap(),
+                GitRefTarget::new("origin", "refs/heads/main").unwrap(),
+                BASE.to_string().repeat(40),
+                TREE.to_string().repeat(40),
+                None,
+                None,
+                TIME,
+            )
+            .unwrap_err();
+
+            assert_eq!(error, PublishRunError::PartialDeliveryProjectionBinding);
+        }
+    }
+
+    #[test]
     fn unusable_reviewed_identities_are_rejected() {
         let error = PublishRun::from_reviewed_tree(
             PublishRunId::new(1).unwrap(),
@@ -608,6 +854,7 @@ mod tests {
             RepositoryLocator::new("/srv/public-repo").unwrap(),
             GitRefTarget::new("origin", "refs/heads/main").unwrap(),
             &reviewed("not-a-commit", &"b".repeat(40)),
+            &binding(),
             None,
             None,
             TimestampMillis::UNIX_EPOCH,
@@ -621,6 +868,7 @@ mod tests {
             RepositoryLocator::new("/srv/public-repo").unwrap(),
             GitRefTarget::new("origin", "refs/heads/main").unwrap(),
             &reviewed(&"a".repeat(40), ""),
+            &binding(),
             None,
             None,
             TimestampMillis::UNIX_EPOCH,

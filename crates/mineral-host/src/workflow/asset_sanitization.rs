@@ -8,9 +8,9 @@ use crate::{
 };
 
 use super::{
-    ActualAssetType, AssetCheckFinding, AssetCheckResult, AssetReviewRunId, CheckedAsset,
-    EffectiveReviewDecision, EffectiveReviewSet, ImageDimensions, ImageSanitizationFormat,
-    SanitizationTransformation, SanitizedAsset, SanitizedAssetSet,
+    ActualAssetType, AssetCheckFinding, AssetCheckResult, AssetContentType, AssetReviewRunId,
+    CheckedAsset, EffectiveReviewDecision, EffectiveReviewSet, ImageDimensions,
+    ImageSanitizationFormat, SanitizationTransformation, SanitizedAsset, SanitizedAssetSet,
     asset_program_check::{check_image, detect_actual_type},
 };
 
@@ -124,12 +124,15 @@ impl<S: BlobStore> AssetSanitizer<S> {
         let needs_reencode = source_findings.iter().any(is_metadata_finding)
             || checked.findings().iter().any(is_metadata_finding);
         if !needs_reencode {
+            // Published unchanged: the media type is the one the program check
+            // actually detected in these very bytes.
             return Ok(SanitizedAsset::from_parts(
                 path.clone(),
                 review_run_id,
                 file.sha256(),
                 file.sha256(),
                 file.size(),
+                published_content_type(path, checked, format, false)?,
                 vec![SanitizationTransformation::Identity],
             ));
         }
@@ -174,12 +177,35 @@ impl<S: BlobStore> AssetSanitizer<S> {
             file.sha256(),
             published_sha256,
             usize_to_u64(published.len()),
+            // Re-encoded: the published media type is the encoder's output format,
+            // never the type the source bytes happened to have.
+            published_content_type(path, checked, format, true)?,
             vec![
                 SanitizationTransformation::StripMetadata,
                 SanitizationTransformation::ReencodeImage { format },
             ],
         ))
     }
+}
+
+/// The media type of the bytes sanitization is about to publish.
+fn published_content_type(
+    path: &ContentPath,
+    checked: &CheckedAsset,
+    format: ImageSanitizationFormat,
+    reencoded: bool,
+) -> Result<AssetContentType, AssetSanitizationError> {
+    let media_type = if reencoded {
+        format.media_type().to_owned()
+    } else {
+        checked
+            .actual_type()
+            .media_type()
+            .map(str::to_owned)
+            .ok_or_else(|| AssetSanitizationError::PublishedContentTypeUnavailable(path.clone()))?
+    };
+    AssetContentType::new(media_type)
+        .map_err(|_| AssetSanitizationError::PublishedContentTypeUnavailable(path.clone()))
 }
 
 fn checked_assets_by_path(
@@ -433,6 +459,7 @@ pub enum AssetSanitizationError {
         source: ContentStoreError,
     },
     PublishedContentMismatch(ContentPath),
+    PublishedContentTypeUnavailable(ContentPath),
 }
 
 impl fmt::Display for AssetSanitizationError {
@@ -523,6 +550,10 @@ impl fmt::Display for AssetSanitizationError {
             Self::PublishedContentMismatch(path) => {
                 write!(formatter, "stored sanitized image bytes changed: {path}")
             }
+            Self::PublishedContentTypeUnavailable(path) => write!(
+                formatter,
+                "could not determine the published media type of the sanitized bytes: {path}"
+            ),
         }
     }
 }
@@ -832,6 +863,67 @@ mod tests {
         let mut findings = Vec::new();
         check_image(&published, &mut findings).unwrap();
         assert!(!findings.contains(&AssetCheckFinding::XmpMetadataPresent));
+    }
+
+    /// The published media type is a fact about the bytes sanitization actually
+    /// produced, never the label the vault path or the source bytes carried.
+    #[test]
+    fn published_content_type_describes_the_final_representation() {
+        // Published unchanged: the type the program check detected in the bytes.
+        let store = TestStore::default();
+        let (snapshot, reviews, checks) = fixture(
+            snapshot_id(11),
+            vec![(
+                "clean.png",
+                png(),
+                EffectiveReviewDecision::Approved,
+                vec![],
+            )],
+            &store,
+        );
+        let identity = AssetSanitizer::with_content_store(store.clone())
+            .sanitize(&reviews, &checks, &snapshot)
+            .unwrap();
+        let asset = identity.get(&path("clean.png")).unwrap();
+        assert!(asset.is_identity());
+        assert_eq!(asset.published_content_type().as_str(), "image/png");
+
+        // Re-encoded: the encoder's output format. The fixture's source label is
+        // `image/jpg`, so keeping it would prove the source type leaked through.
+        let store = TestStore::default();
+        let (snapshot, reviews, checks) = fixture(
+            snapshot_id(12),
+            vec![(
+                "photo.jpg",
+                jpeg_with_gps_exif(),
+                EffectiveReviewDecision::Approved,
+                vec![AssetCheckFinding::GpsMetadataPresent],
+            )],
+            &store,
+        );
+        let reencoded = AssetSanitizer::with_content_store(store.clone())
+            .sanitize(&reviews, &checks, &snapshot)
+            .unwrap();
+        let asset = reencoded.get(&path("photo.jpg")).unwrap();
+        assert_eq!(
+            asset.transformations(),
+            [
+                SanitizationTransformation::StripMetadata,
+                SanitizationTransformation::ReencodeImage {
+                    format: ImageSanitizationFormat::Jpeg
+                }
+            ]
+        );
+        assert_eq!(asset.published_content_type().as_str(), "image/jpeg");
+        assert_ne!(
+            asset.published_content_type().as_str(),
+            "image/jpg",
+            "the source type must not be published as the final representation"
+        );
+        assert_eq!(
+            asset.published_size(),
+            u64::try_from(store.0.blobs.borrow()[&asset.published_sha256()].len()).unwrap()
+        );
     }
 
     #[test]

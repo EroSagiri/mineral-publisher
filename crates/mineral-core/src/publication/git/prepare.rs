@@ -2,8 +2,11 @@ use std::{error::Error, fmt};
 
 use crate::{
     domain::{Sha256, TimestampMillis},
-    publish::{PublishRun, PublishRunError, PublishRunId, PublishTargetId, RepositoryLocator},
-    workflow::{PublicProjection, PublishPlan, PublishPlanError},
+    publish::{
+        DeliveryProjectionBinding, PublishRun, PublishRunError, PublishRunId, PublishTargetId,
+        RepositoryLocator,
+    },
+    workflow::{PublishPlan, PublishPlanError, TextProjection},
 };
 
 use super::{
@@ -26,8 +29,18 @@ pub struct GitPublicationPrepareRequest<'a> {
     /// Opaque locator the runtime resolves; the engine only stores it.
     pub repository: &'a RepositoryLocator,
     pub target: &'a GitRefTarget,
-    /// The complete state the target must end up holding.
-    pub projection: &'a PublicProjection,
+    /// The complete delivery text side the target must end up holding.
+    ///
+    /// The engine hands over the already-built [`TextProjection`], so the runtime
+    /// never sees the delivery rules: which assets exist, where they live, and
+    /// which URLs replaced which references were all decided upstream.
+    pub text_projection: &'a TextProjection,
+    /// The exact durable delivery projection this attempt is delivering.
+    ///
+    /// The runtime carried it from the delivery stage; the engine checks that the
+    /// binding and the text side it is about to materialize describe the same
+    /// tree before anything is read or written.
+    pub delivery: DeliveryProjectionBinding,
     /// The base the target currently holds, as the runtime observed it.
     pub observed_base: &'a GitCommitOid,
     /// V1 uses one identity for both the author and the committer.
@@ -81,8 +94,21 @@ impl GitPublicationPreparer {
         repository: &R,
         request: &GitPublicationPrepareRequest<'_>,
     ) -> Result<GitPublicationPreparation, GitPublicationPrepareError<R::Error>> {
+        // The binding and the text side must agree before any repository fact is
+        // read: a run that pointed at another projection would otherwise be
+        // discovered only after a materialization had already happened.
+        if request.delivery.text_projection_sha256() != request.text_projection.projection_sha256()
+        {
+            return Err(GitPublicationPrepareError::DeliveryTextProjectionMismatch {
+                text_projection_sha256: request.text_projection.projection_sha256(),
+                bound_text_projection_sha256: request.delivery.text_projection_sha256(),
+            });
+        }
         let current = repository
-            .read_current(request.observed_base, request.projection.managed_root())
+            .read_current(
+                request.observed_base,
+                request.text_projection.managed_root(),
+            )
             .map_err(GitPublicationPrepareError::CurrentTarget)?;
         let resolved_base = GitCommitOid::new(current.base_commit())
             .map_err(|_| GitPublicationPrepareError::ResolvedBaseInvalid)?;
@@ -93,10 +119,10 @@ impl GitPublicationPreparer {
             });
         }
 
-        let plan = PublishPlan::build(current.state(), request.projection)
+        let plan = PublishPlan::build(current.state(), request.text_projection)
             .map_err(GitPublicationPrepareError::PublishPlan)?;
         let reviewed = repository
-            .materialize(&resolved_base, request.projection)
+            .materialize(&resolved_base, request.text_projection)
             .map_err(GitPublicationPrepareError::Materialization)?;
         if reviewed.base_commit() != resolved_base.as_str() {
             return Err(GitPublicationPrepareError::MaterializedBaseMismatch {
@@ -155,6 +181,7 @@ impl GitPublicationPreparer {
             request.repository.clone(),
             request.target.clone(),
             reviewed,
+            &request.delivery,
             desired_commit,
             commit_spec,
             request.created_at,
@@ -173,6 +200,11 @@ pub enum GitPublicationPrepareError<PortError: Error> {
     CurrentTarget(PortError),
     /// The commit the runtime resolved is not a usable object identity.
     ResolvedBaseInvalid,
+    /// The delivery binding and the text side do not describe the same tree.
+    DeliveryTextProjectionMismatch {
+        text_projection_sha256: Sha256,
+        bound_text_projection_sha256: Sha256,
+    },
     /// The runtime resolved a different base than the one it observed.
     ResolvedBaseMismatch {
         expected: GitCommitOid,
@@ -206,6 +238,9 @@ impl<PortError: Error> fmt::Display for GitPublicationPrepareError<PortError> {
             Self::ResolvedBaseInvalid => {
                 formatter.write_str("the resolved Git base is not a usable commit identity")
             }
+            Self::DeliveryTextProjectionMismatch { .. } => formatter.write_str(
+                "the delivery binding names another text projection than the one being prepared",
+            ),
             Self::ResolvedBaseMismatch { expected, .. } => write!(
                 formatter,
                 "the resolved Git base is not the observed base {}",
@@ -251,6 +286,7 @@ impl<PortError: Error + 'static> Error for GitPublicationPrepareError<PortError>
             Self::CommitSpec(error) => Some(error),
             Self::PublishRun(error) => Some(error),
             Self::ResolvedBaseInvalid
+            | Self::DeliveryTextProjectionMismatch { .. }
             | Self::ResolvedBaseMismatch { .. }
             | Self::MaterializedBaseMismatch { .. }
             | Self::PlanReviewedTreeMismatch => None,
@@ -260,14 +296,14 @@ impl<PortError: Error + 'static> Error for GitPublicationPrepareError<PortError>
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::Cell, error::Error, fmt, time::SystemTime};
+    use std::{cell::Cell, error::Error, fmt};
 
     use crate::{
-        domain::{ContentPath, Sha256, Snapshot, SnapshotFile, SnapshotId, SourceId},
+        domain::{ContentPath, Sha256, SnapshotId},
         publication::git::{GitCurrentTarget, LocalCommitState},
         workflow::{
-            CurrentTargetEntry, CurrentTargetState, FinalPublicationSet, ManagedRoot,
-            ProjectionTargetPath,
+            CurrentTargetEntry, CurrentTargetState, ManagedRoot, ProjectionTargetPath,
+            TextProjection,
         },
     };
 
@@ -287,27 +323,15 @@ mod tests {
         ManagedRoot::new("content").unwrap()
     }
 
-    /// A projection whose single document is the [1; 32] blob, so a current state
-    /// can be made to match it or to differ from it.
-    fn projection() -> PublicProjection {
-        let snapshot = Snapshot::new(
+    /// A text projection whose single document is the [1; 32] blob, so a current
+    /// state can be made to match it or to differ from it.
+    fn projection() -> TextProjection {
+        TextProjection::from_parts_for_test(
             SnapshotId::new(7).unwrap(),
-            SystemTime::UNIX_EPOCH,
-            SourceId::new("test").unwrap(),
-            vec![SnapshotFile::new(
-                ContentPath::new("note.md").unwrap(),
-                3,
-                Sha256::new([1; 32]),
-                None,
-            )],
+            managed_root(),
+            Sha256::new([1; 32]),
+            vec![(ContentPath::new("note.md").unwrap(), Sha256::new([1; 32]))],
         )
-        .unwrap();
-        let set = FinalPublicationSet::from_parts_for_test(
-            snapshot.id(),
-            vec![ContentPath::new("note.md").unwrap()],
-            vec![],
-        );
-        PublicProjection::build(&set, &snapshot, managed_root()).unwrap()
     }
 
     fn current_state(blob_sha256: [u8; 32]) -> CurrentTargetState {
@@ -329,11 +353,13 @@ mod tests {
         current_state([1; 32])
     }
 
+    /// The fact a runtime reports after materializing [`projection`]: its
+    /// projection identity is that projection's text identity.
     fn reviewed(base: char, base_tree: char, tree: char) -> ReviewedGitTree {
         ReviewedGitTree::from_parts(
             oid(base),
             oid(base_tree),
-            Sha256::new([1; 32]),
+            projection().projection_sha256(),
             SnapshotId::new(7).unwrap(),
             oid(tree),
             managed_root(),
@@ -367,7 +393,7 @@ mod tests {
     impl Fixture {
         fn request<'a>(
             &'a self,
-            projection: &'a PublicProjection,
+            text_projection: &'a TextProjection,
             observed_base: &'a GitCommitOid,
         ) -> GitPublicationPrepareRequest<'a> {
             GitPublicationPrepareRequest {
@@ -375,7 +401,11 @@ mod tests {
                 target_id: &self.target_id,
                 repository: &self.repository,
                 target: &self.target,
-                projection,
+                text_projection,
+                delivery: DeliveryProjectionBinding::new(
+                    Sha256::new([9; 32]),
+                    text_projection.projection_sha256(),
+                ),
                 observed_base,
                 author_name: &self.author_name,
                 author_email: &self.author_email,
@@ -495,7 +525,7 @@ mod tests {
         fn materialize(
             &self,
             _: &GitCommitOid,
-            _: &PublicProjection,
+            _: &TextProjection,
         ) -> Result<ReviewedGitTree, Self::Error> {
             self.materialize_calls.set(self.materialize_calls.get() + 1);
             self.reviewed.clone()
@@ -598,6 +628,52 @@ mod tests {
         );
         assert_eq!(repository.materialize_calls(), 0);
         assert_eq!(repository.create_commit_calls(), 0);
+    }
+
+    #[test]
+    fn a_binding_that_names_another_text_projection_fails_closed_before_reading_anything() {
+        let fixture = fixture();
+        let projection = projection();
+        let base = observed_base();
+        let repository = FakeRepository::real_change();
+        let mut request = fixture.request(&projection, &base);
+        request.delivery =
+            DeliveryProjectionBinding::new(Sha256::new([2; 32]), Sha256::new([3; 32]));
+
+        assert_eq!(
+            GitPublicationPreparer::prepare(&repository, &request),
+            Err(GitPublicationPrepareError::DeliveryTextProjectionMismatch {
+                text_projection_sha256: projection.projection_sha256(),
+                bound_text_projection_sha256: Sha256::new([3; 32]),
+            })
+        );
+        assert_eq!(repository.read_current_calls(), 0);
+        assert_eq!(repository.materialize_calls(), 0);
+        assert_eq!(repository.create_commit_calls(), 0);
+    }
+
+    #[test]
+    fn the_intent_is_bound_to_the_delivery_projection_that_was_prepared() {
+        let fixture = fixture();
+        let projection = projection();
+        let base = observed_base();
+        let repository = FakeRepository::real_change();
+        let request = fixture.request(&projection, &base);
+
+        let preparation = GitPublicationPreparer::prepare(&repository, &request).unwrap();
+        let run = preparation.publish_run();
+
+        assert_eq!(
+            run.delivery_projection_binding(),
+            Some(DeliveryProjectionBinding::new(
+                request.delivery.delivery_sha256(),
+                projection.projection_sha256()
+            ))
+        );
+        assert_eq!(
+            run.reviewed_text_projection_sha256(),
+            Some(projection.projection_sha256())
+        );
     }
 
     #[test]

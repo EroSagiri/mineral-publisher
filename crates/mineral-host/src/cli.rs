@@ -30,14 +30,15 @@ use mineral_publisher::{
     runtime::{HostAssetReviews, HostMarkdownReviews},
     source::LocalSource,
     storage::{
-        LocalContentStore, SqliteAssetReviewRunStore, SqliteHumanReviewStore,
-        SqlitePublishRunStore, SqliteRemoteObservationStore, SqliteReviewRunStore,
+        LocalContentStore, SqliteAssetReviewRunStore, SqliteDeliveryProjectionStore,
+        SqliteHumanReviewStore, SqlitePublishRunStore, SqliteRemoteObservationStore,
+        SqliteReviewRunStore,
     },
     workflow::{
-        AssetReviewCandidate, AssetReviewRunId, AssetReviewRunIdGenerator, AssetReviewRunStore,
-        AssetReviewer, AssetReviewerError, AssetReviewerReport, ExplicitHumanReviewSelection,
-        HumanReviewDecision, HumanReviewId, HumanReviewRecordError, HumanReviewResolution,
-        HumanReviewStore, HumanReviewSubject, PublicationApplication,
+        AssetDeliveryConfig, AssetReviewCandidate, AssetReviewRunId, AssetReviewRunIdGenerator,
+        AssetReviewRunStore, AssetReviewer, AssetReviewerError, AssetReviewerReport,
+        ExplicitHumanReviewSelection, HumanReviewDecision, HumanReviewId, HumanReviewRecordError,
+        HumanReviewResolution, HumanReviewStore, HumanReviewSubject, PublicationApplication,
         PublicationApplicationOutcome, PublicationApplicationRequest, ReviewRunIdGenerator,
     },
 };
@@ -56,6 +57,8 @@ git:
   author_name: Mineral Publisher
   author_email: publisher@example.invalid
   message: Publish Mineral content
+assets:
+  public_base_url: https://assets.example.com
 review:
   api_base_url: https://api.deepseek.com
   markdown_model: deepseek-flash
@@ -73,6 +76,11 @@ struct Config {
     state: StateConfig,
     git: GitConfig,
     review: ReviewConfig,
+    /// Where delivered binary assets are served from. Optional in the file so
+    /// `status`, `doctor` and `review` keep working for workspaces created before
+    /// delivery existed; publication fails closed when it is absent.
+    #[serde(default)]
+    assets: Option<AssetsConfig>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -110,6 +118,12 @@ impl GitConfig {
         };
         Ok(PublishTargetId::new(identity)?)
     }
+}
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AssetsConfig {
+    /// Absolute HTTPS base URL every published asset URL is built from.
+    public_base_url: String,
 }
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -171,6 +185,16 @@ impl Workspace {
     }
     fn observation_db(&self) -> PathBuf {
         self.config.state.path.join("remote-observations.sqlite3")
+    }
+    fn delivery_db(&self) -> PathBuf {
+        self.config.state.path.join("delivery-projections.sqlite3")
+    }
+    fn asset_delivery(&self) -> Result<AssetDeliveryConfig, Box<dyn Error>> {
+        let assets =
+            self.config.assets.as_ref().ok_or(
+                "assets.public_base_url must be configured before publishing binary assets",
+            )?;
+        Ok(AssetDeliveryConfig::new(assets.public_base_url.clone())?)
     }
 }
 
@@ -246,6 +270,7 @@ fn open_stores(workspace: &Workspace) -> Result<(), Box<dyn Error>> {
     SqliteHumanReviewStore::open(workspace.human_db())?;
     SqlitePublishRunStore::open(workspace.publish_db())?;
     SqliteRemoteObservationStore::open(workspace.observation_db())?;
+    SqliteDeliveryProjectionStore::open(workspace.delivery_db())?;
     Ok(())
 }
 
@@ -287,6 +312,7 @@ fn publish(workspace: Workspace) -> Result<(), Box<dyn Error>> {
     let asset_runs = SqliteAssetReviewRunStore::open(workspace.asset_db())?;
     let human = SqliteHumanReviewStore::open(workspace.human_db())?;
     let publish_runs = SqlitePublishRunStore::open(workspace.publish_db())?;
+    let delivery_projections = SqliteDeliveryProjectionStore::open(workspace.delivery_db())?;
     let observations = SqliteRemoteObservationStore::open(workspace.observation_db())?;
     let markdown_reviewer = LazyMarkdownReviewer {
         config: workspace.config.review.clone(),
@@ -326,6 +352,7 @@ fn publish(workspace: Workspace) -> Result<(), Box<dyn Error>> {
             &workspace.config.git.message,
         )?,
         human_reviews: ExplicitHumanReviewSelection::default(),
+        asset_delivery: &workspace.asset_delivery()?,
     };
     // Runtime concerns stay in the composition root: wall-clock time and the
     // review execution strategy are supplied to the application, never read by it.
@@ -348,6 +375,7 @@ fn publish(workspace: Workspace) -> Result<(), Box<dyn Error>> {
         &asset_runs,
         &human,
         &publish_runs,
+        &delivery_projections,
         &observations,
         &mut document_ids,
         &mut asset_ids,
@@ -393,10 +421,11 @@ fn render_publication(outcome: PublicationApplicationOutcome) {
                 }
             };
             println!(
-                "Publication\n  status: {status}\n  run: {}\n  snapshot: {}\n  projection: {}\n  markdown: {}\n  assets: {}",
+                "Publication\n  status: {status}\n  run: {}\n  snapshot: {}\n  projection: {}\n  delivery: {}\n  markdown: {}\n  assets: {}",
                 publication.publish_run_id().get(),
                 trace.snapshot().id().get(),
                 completed.projection().projection_sha256(),
+                publication.delivery_sha256(),
                 completed.publication_set().markdown_paths().len(),
                 completed.publication_set().asset_paths().len()
             );
@@ -646,6 +675,7 @@ fn doctor(workspace: Workspace) -> Result<(), Box<dyn Error>> {
             workspace.human_db(),
             workspace.publish_db(),
             workspace.observation_db(),
+            workspace.delivery_db(),
         ]
         .iter()
         .all(|path| path.is_file()),

@@ -11,7 +11,7 @@ use crate::{
     workflow::ManagedRoot,
 };
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 /// Local SQLite persistence for immutable publication intents.
 pub struct SqlitePublishRunStore {
@@ -35,7 +35,15 @@ impl SqlitePublishRunStore {
                      CREATE TABLE publish_runs (
                          id INTEGER PRIMARY KEY CHECK (id > 0),
                          snapshot_id INTEGER NOT NULL CHECK (snapshot_id > 0),
-                         projection_sha256 BLOB NOT NULL CHECK (length(projection_sha256) = 32),
+                         legacy_projection_sha256 BLOB
+                             CHECK (legacy_projection_sha256 IS NULL
+                                 OR length(legacy_projection_sha256) = 32),
+                         reviewed_text_projection_sha256 BLOB
+                             CHECK (reviewed_text_projection_sha256 IS NULL
+                                 OR length(reviewed_text_projection_sha256) = 32),
+                         delivery_projection_sha256 BLOB
+                             CHECK (delivery_projection_sha256 IS NULL
+                                 OR length(delivery_projection_sha256) = 32),
                          managed_root TEXT NOT NULL,
                          repository_path TEXT NOT NULL,
                          publish_target_id TEXT NOT NULL DEFAULT '',
@@ -48,13 +56,15 @@ impl SqlitePublishRunStore {
                          created_at_unix_ms INTEGER NOT NULL CHECK (created_at_unix_ms >= 0),
                          commit_spec TEXT,
                          CHECK ((publication_kind = 'noop' AND commit_oid IS NULL)
-                             OR (publication_kind = 'commit_ready' AND commit_oid IS NOT NULL))
+                             OR (publication_kind = 'commit_ready' AND commit_oid IS NOT NULL)),
+                         CHECK ((reviewed_text_projection_sha256 IS NULL)
+                             = (delivery_projection_sha256 IS NULL))
                      );
                      CREATE INDEX publish_runs_by_target
                          ON publish_runs(remote_name, destination_ref, created_at_unix_ms, id);
                      CREATE INDEX publish_runs_by_creation
                          ON publish_runs(created_at_unix_ms, id);
-                     PRAGMA user_version = 3;
+                     PRAGMA user_version = 4;
                      COMMIT;",
                 ).map_err(SqlitePublishRunStoreError::Sqlite)?;
                 version = SCHEMA_VERSION;
@@ -99,6 +109,70 @@ impl SqlitePublishRunStore {
                 .map_err(SqlitePublishRunStoreError::Sqlite)?;
             version = 3;
         }
+        if version == 3 {
+            // Additive in effect, but the identity must be split explicitly rather
+            // than reinterpreted: `projection_sha256` held the S5 `PublicProjection`
+            // identity for older rows and the S6.1 `TextProjection` identity for
+            // newer ones, so the column is renamed to say that its value is opaque
+            // historical metadata, and the two identities this engine can actually
+            // reason about get columns of their own. Historical rows keep the old
+            // bytes under the honest name and are left with no delivery binding —
+            // an explicit "no durable delivery projection", never a guessed one.
+            connection
+                .execute_batch(
+                    "BEGIN IMMEDIATE;
+                     CREATE TABLE publish_runs_v4 (
+                         id INTEGER PRIMARY KEY CHECK (id > 0),
+                         snapshot_id INTEGER NOT NULL CHECK (snapshot_id > 0),
+                         legacy_projection_sha256 BLOB
+                             CHECK (legacy_projection_sha256 IS NULL
+                                 OR length(legacy_projection_sha256) = 32),
+                         reviewed_text_projection_sha256 BLOB
+                             CHECK (reviewed_text_projection_sha256 IS NULL
+                                 OR length(reviewed_text_projection_sha256) = 32),
+                         delivery_projection_sha256 BLOB
+                             CHECK (delivery_projection_sha256 IS NULL
+                                 OR length(delivery_projection_sha256) = 32),
+                         managed_root TEXT NOT NULL,
+                         repository_path TEXT NOT NULL,
+                         publish_target_id TEXT NOT NULL DEFAULT '',
+                         remote_name TEXT NOT NULL,
+                         destination_ref TEXT NOT NULL,
+                         base_commit TEXT NOT NULL,
+                         reviewed_tree TEXT NOT NULL,
+                         publication_kind TEXT NOT NULL CHECK (publication_kind IN ('noop', 'commit_ready')),
+                         commit_oid TEXT,
+                         created_at_unix_ms INTEGER NOT NULL CHECK (created_at_unix_ms >= 0),
+                         commit_spec TEXT,
+                         CHECK ((publication_kind = 'noop' AND commit_oid IS NULL)
+                             OR (publication_kind = 'commit_ready' AND commit_oid IS NOT NULL)),
+                         CHECK ((reviewed_text_projection_sha256 IS NULL)
+                             = (delivery_projection_sha256 IS NULL))
+                     );
+                     INSERT INTO publish_runs_v4 (
+                         id, snapshot_id, legacy_projection_sha256,
+                         reviewed_text_projection_sha256, delivery_projection_sha256,
+                         managed_root, repository_path, publish_target_id, remote_name,
+                         destination_ref, base_commit, reviewed_tree, publication_kind,
+                         commit_oid, created_at_unix_ms, commit_spec
+                     )
+                     SELECT id, snapshot_id, projection_sha256, NULL, NULL,
+                         managed_root, repository_path, publish_target_id, remote_name,
+                         destination_ref, base_commit, reviewed_tree, publication_kind,
+                         commit_oid, created_at_unix_ms, commit_spec
+                     FROM publish_runs;
+                     DROP TABLE publish_runs;
+                     ALTER TABLE publish_runs_v4 RENAME TO publish_runs;
+                     CREATE INDEX publish_runs_by_target
+                         ON publish_runs(remote_name, destination_ref, created_at_unix_ms, id);
+                     CREATE INDEX publish_runs_by_creation
+                         ON publish_runs(created_at_unix_ms, id);
+                     PRAGMA user_version = 4;
+                     COMMIT;",
+                )
+                .map_err(SqlitePublishRunStoreError::Sqlite)?;
+            version = 4;
+        }
         if version != SCHEMA_VERSION {
             return Err(SqlitePublishRunStoreError::UnsupportedSchemaVersion(
                 detected,
@@ -142,14 +216,21 @@ impl PublishRunStore for SqlitePublishRunStore {
             .connection
             .execute(
                 "INSERT OR IGNORE INTO publish_runs (
-                 id, snapshot_id, projection_sha256, managed_root, repository_path,
-                 publish_target_id, remote_name, destination_ref, base_commit, reviewed_tree,
-                 publication_kind, commit_oid, created_at_unix_ms, commit_spec
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                 id, snapshot_id, legacy_projection_sha256,
+                 reviewed_text_projection_sha256, delivery_projection_sha256,
+                 managed_root, repository_path, publish_target_id, remote_name,
+                 destination_ref, base_commit, reviewed_tree, publication_kind,
+                 commit_oid, created_at_unix_ms, commit_spec
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
                 params![
                     integer("publish run ID", run.id().get())?,
                     integer("snapshot ID", run.snapshot_id().get())?,
-                    run.projection_sha256().as_bytes().as_slice(),
+                    run.legacy_projection_sha256()
+                        .map(|identity| identity.as_bytes().to_vec()),
+                    run.reviewed_text_projection_sha256()
+                        .map(|identity| identity.as_bytes().to_vec()),
+                    run.delivery_projection_binding()
+                        .map(|binding| binding.delivery_sha256().as_bytes().to_vec()),
                     run.managed_root().as_str(),
                     repository_path,
                     run.target_id().as_str(),
@@ -181,9 +262,10 @@ impl PublishRunStore for SqlitePublishRunStore {
     fn get(&self, id: PublishRunId) -> Result<Option<PublishRun>, Self::Error> {
         self.connection
             .query_row(
-                "SELECT id, snapshot_id, projection_sha256, managed_root, repository_path,
-                    publish_target_id, remote_name, destination_ref, base_commit, reviewed_tree,
-                    publication_kind, commit_oid, created_at_unix_ms, commit_spec
+                "SELECT id, snapshot_id, legacy_projection_sha256,
+                    reviewed_text_projection_sha256, delivery_projection_sha256, managed_root,
+                    repository_path, publish_target_id, remote_name, destination_ref, base_commit,
+                    reviewed_tree, publication_kind, commit_oid, created_at_unix_ms, commit_spec
              FROM publish_runs WHERE id = ?1",
                 [integer("publish run ID", id.get())?],
                 row_to_publish_run,
@@ -194,9 +276,10 @@ impl PublishRunStore for SqlitePublishRunStore {
 
     fn list(&self) -> Result<Vec<PublishRun>, Self::Error> {
         self.load_many(
-            "SELECT id, snapshot_id, projection_sha256, managed_root, repository_path,
-                    publish_target_id, remote_name, destination_ref, base_commit, reviewed_tree,
-                    publication_kind, commit_oid, created_at_unix_ms, commit_spec
+            "SELECT id, snapshot_id, legacy_projection_sha256,
+                    reviewed_text_projection_sha256, delivery_projection_sha256, managed_root,
+                    repository_path, publish_target_id, remote_name, destination_ref, base_commit,
+                    reviewed_tree, publication_kind, commit_oid, created_at_unix_ms, commit_spec
              FROM publish_runs ORDER BY created_at_unix_ms ASC, id ASC",
             None,
         )
@@ -204,9 +287,10 @@ impl PublishRunStore for SqlitePublishRunStore {
 
     fn list_for_target(&self, target: &GitRefTarget) -> Result<Vec<PublishRun>, Self::Error> {
         self.load_many(
-            "SELECT id, snapshot_id, projection_sha256, managed_root, repository_path,
-                    publish_target_id, remote_name, destination_ref, base_commit, reviewed_tree,
-                    publication_kind, commit_oid, created_at_unix_ms, commit_spec
+            "SELECT id, snapshot_id, legacy_projection_sha256,
+                    reviewed_text_projection_sha256, delivery_projection_sha256, managed_root,
+                    repository_path, publish_target_id, remote_name, destination_ref, base_commit,
+                    reviewed_tree, publication_kind, commit_oid, created_at_unix_ms, commit_spec
              FROM publish_runs WHERE remote_name = ?1 AND destination_ref = ?2
              ORDER BY created_at_unix_ms ASC, id ASC",
             Some(target),
@@ -217,45 +301,49 @@ impl PublishRunStore for SqlitePublishRunStore {
 fn row_to_publish_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<PublishRun> {
     let id = positive_id(row.get(0)?, 0, "publish run ID", PublishRunId::new)?;
     let snapshot_id = positive_id(row.get(1)?, 1, "snapshot ID", SnapshotId::new)?;
-    let projection_sha256 = sha256_column(row, 2)?;
-    let managed_root = ManagedRoot::new(row.get::<_, String>(3)?)
-        .map_err(|error| conversion_error(3, Type::Text, error.to_string()))?;
-    let repository = RepositoryLocator::new(row.get::<_, String>(4)?)
-        .map_err(|error| conversion_error(4, Type::Text, error.to_string()))?;
-    let target_id = PublishTargetId::new(row.get::<_, String>(5)?)
+    let legacy_projection_sha256 = optional_sha256_column(row, 2)?;
+    let reviewed_text_projection_sha256 = optional_sha256_column(row, 3)?;
+    let delivery_projection_sha256 = optional_sha256_column(row, 4)?;
+    let managed_root = ManagedRoot::new(row.get::<_, String>(5)?)
         .map_err(|error| conversion_error(5, Type::Text, error.to_string()))?;
-    let target = GitRefTarget::new(row.get::<_, String>(6)?, row.get::<_, String>(7)?)
+    let repository = RepositoryLocator::new(row.get::<_, String>(6)?)
         .map_err(|error| conversion_error(6, Type::Text, error.to_string()))?;
-    let base_commit = row.get(8)?;
-    let reviewed_tree = row.get(9)?;
-    let kind: String = row.get(10)?;
-    let commit_oid: Option<String> = row.get(11)?;
+    let target_id = PublishTargetId::new(row.get::<_, String>(7)?)
+        .map_err(|error| conversion_error(7, Type::Text, error.to_string()))?;
+    let target = GitRefTarget::new(row.get::<_, String>(8)?, row.get::<_, String>(9)?)
+        .map_err(|error| conversion_error(8, Type::Text, error.to_string()))?;
+    let base_commit = row.get(10)?;
+    let reviewed_tree = row.get(11)?;
+    let kind: String = row.get(12)?;
+    let commit_oid: Option<String> = row.get(13)?;
     let desired_commit = match (kind.as_str(), commit_oid) {
         ("noop", None) => None,
         ("commit_ready", Some(commit_oid)) => Some(
             GitCommitOid::new(commit_oid)
-                .map_err(|error| conversion_error(11, Type::Text, error.to_string()))?,
+                .map_err(|error| conversion_error(13, Type::Text, error.to_string()))?,
         ),
         _ => {
             return Err(conversion_error(
-                10,
+                12,
                 Type::Text,
                 "publication kind does not match commit identity",
             ));
         }
     };
-    let created_at_unix_ms = nonnegative(row.get(12)?, 12, "publish timestamp")?;
-    let commit_spec = match row.get::<_, Option<String>>(13)? {
+    let created_at_unix_ms = nonnegative(row.get(14)?, 14, "publish timestamp")?;
+    let commit_spec = match row.get::<_, Option<String>>(15)? {
         None => None,
         Some(encoded) => Some(
             CommitSpecWire::decode(&encoded)
-                .map_err(|error| conversion_error(13, Type::Text, error.to_string()))?,
+                .map_err(|error| conversion_error(15, Type::Text, error.to_string()))?,
         ),
     };
     PublishRun::rehydrate(
         id,
         snapshot_id,
-        projection_sha256,
+        legacy_projection_sha256,
+        reviewed_text_projection_sha256,
+        delivery_projection_sha256,
         managed_root,
         target_id,
         repository,
@@ -267,6 +355,17 @@ fn row_to_publish_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<PublishRun> {
         created_at_unix_ms,
     )
     .map_err(|error| conversion_error(0, Type::Text, error.to_string()))
+}
+
+/// A nullable SHA-256 column: `NULL` means the fact was never captured.
+fn optional_sha256_column(
+    row: &rusqlite::Row<'_>,
+    column: usize,
+) -> rusqlite::Result<Option<Sha256>> {
+    match row.get::<_, Option<Vec<u8>>>(column)? {
+        None => Ok(None),
+        Some(_) => sha256_column(row, column).map(Some),
+    }
 }
 
 fn integer(field: &'static str, value: u64) -> Result<i64, SqlitePublishRunStoreError> {
@@ -367,7 +466,7 @@ mod tests {
     use super::*;
     use crate::{
         domain::TimestampMillis,
-        publisher::{GitCommitSpec, GitRepositoryIdentity, GitTreeOid},
+        publisher::{DeliveryProjectionBinding, GitCommitSpec, GitRepositoryIdentity, GitTreeOid},
     };
     use std::{
         fs,
@@ -463,7 +562,9 @@ mod tests {
         PublishRun::rehydrate(
             PublishRunId::new(id).unwrap(),
             SnapshotId::new(7).unwrap(),
-            Sha256::new([9; 32]),
+            Some(Sha256::new([9; 32])),
+            None,
+            None,
             ManagedRoot::new("content").unwrap(),
             PublishTargetId::new(target_id).unwrap(),
             GitRepositoryIdentity::new(&directory.0)
@@ -497,14 +598,17 @@ mod tests {
         connection
             .execute(
                 "INSERT INTO publish_runs (
-                     id, snapshot_id, projection_sha256, managed_root, repository_path,
-                     publish_target_id, remote_name, destination_ref, base_commit, reviewed_tree,
-                     publication_kind, commit_oid, created_at_unix_ms, commit_spec
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                     id, snapshot_id, legacy_projection_sha256,
+                     reviewed_text_projection_sha256, delivery_projection_sha256, managed_root,
+                     repository_path, publish_target_id, remote_name, destination_ref, base_commit,
+                     reviewed_tree, publication_kind, commit_oid, created_at_unix_ms, commit_spec
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
                 params![
                     id as i64,
                     7_i64,
                     [9_u8; 32].as_slice(),
+                    Option::<Vec<u8>>::None,
+                    Option::<Vec<u8>>::None,
                     "content",
                     directory.0.to_str().unwrap(),
                     "origin:refs/heads/main",
@@ -781,6 +885,14 @@ mod tests {
             assert_eq!(historical.created_at_unix_ms(), 20);
             assert_eq!(historical.target_id().as_str(), "origin:refs/heads/main");
             assert_eq!(historical.managed_root().as_str(), "content");
+            // The old opaque hash survives under an honest name, and the two
+            // identities this engine can reason about stay absent rather than being
+            // guessed from it.
+            for run in [&noop, &historical] {
+                assert_eq!(run.legacy_projection_sha256(), Some(Sha256::new([9; 32])));
+                assert_eq!(run.reviewed_text_projection_sha256(), None);
+                assert_eq!(run.delivery_projection_binding(), None);
+            }
         }
 
         let reopened = SqlitePublishRunStore::open(&database).unwrap();
@@ -789,7 +901,7 @@ mod tests {
                 .connection
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
-            3
+            4
         );
         let stored_spec: Option<String> = reopened
             .connection
@@ -803,6 +915,231 @@ mod tests {
         assert_eq!(
             reopened.get(PublishRunId::new(2).unwrap()).unwrap(),
             reopened.get(PublishRunId::new(2).unwrap()).unwrap()
+        );
+    }
+
+    /// §7: the migration that matters is upgrading a real database written by the
+    /// schema in production, not creating a fresh current one. Version 3 is the
+    /// shape this engine last wrote before delivery projections existed, and its
+    /// `projection_sha256` is ambiguous by construction — the public identity for
+    /// S5 rows, the text identity for S6.1 rows. The migration must not try to
+    /// decide which one a row holds.
+    #[test]
+    fn a_real_version_three_database_splits_the_ambiguous_projection_identity() {
+        let directory = TestDirectory::new();
+        let database = directory.database();
+        let base_commit = oid('a');
+        let reviewed_tree = oid('b');
+        let historic_commit = oid('c');
+        // One row per era: the value below is deliberately the same bytes for both,
+        // because the point is that the schema cannot tell them apart.
+        let ambiguous = [0x5a_u8; 32];
+        {
+            let connection = Connection::open(&database).unwrap();
+            connection
+                .execute_batch(
+                    "BEGIN IMMEDIATE;
+                     CREATE TABLE publish_runs (
+                         id INTEGER PRIMARY KEY CHECK (id > 0),
+                         snapshot_id INTEGER NOT NULL CHECK (snapshot_id > 0),
+                         projection_sha256 BLOB NOT NULL CHECK (length(projection_sha256) = 32),
+                         managed_root TEXT NOT NULL,
+                         repository_path TEXT NOT NULL,
+                         publish_target_id TEXT NOT NULL DEFAULT '',
+                         remote_name TEXT NOT NULL,
+                         destination_ref TEXT NOT NULL,
+                         base_commit TEXT NOT NULL,
+                         reviewed_tree TEXT NOT NULL,
+                         publication_kind TEXT NOT NULL CHECK (publication_kind IN ('noop', 'commit_ready')),
+                         commit_oid TEXT,
+                         created_at_unix_ms INTEGER NOT NULL CHECK (created_at_unix_ms >= 0),
+                         commit_spec TEXT,
+                         CHECK ((publication_kind = 'noop' AND commit_oid IS NULL)
+                             OR (publication_kind = 'commit_ready' AND commit_oid IS NOT NULL))
+                     );
+                     CREATE INDEX publish_runs_by_target
+                         ON publish_runs(remote_name, destination_ref, created_at_unix_ms, id);
+                     CREATE INDEX publish_runs_by_creation
+                         ON publish_runs(created_at_unix_ms, id);
+                     PRAGMA user_version = 3;
+                     COMMIT;",
+                )
+                .unwrap();
+            for (id, kind, commit, spec) in [
+                (1_i64, "noop", None, None),
+                (
+                    2_i64,
+                    "commit_ready",
+                    Some(historic_commit.as_str()),
+                    Some(CommitSpecWire::encode(&spec(
+                        &base_commit,
+                        &reviewed_tree,
+                        20,
+                    ))),
+                ),
+            ] {
+                connection
+                    .execute(
+                        "INSERT INTO publish_runs (
+                             id, snapshot_id, projection_sha256, managed_root, repository_path,
+                             publish_target_id, remote_name, destination_ref, base_commit,
+                             reviewed_tree, publication_kind, commit_oid, created_at_unix_ms,
+                             commit_spec
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                        params![
+                            id,
+                            7_i64,
+                            ambiguous.as_slice(),
+                            "content",
+                            directory.0.to_str().unwrap(),
+                            "origin:refs/heads/main",
+                            "origin",
+                            "refs/heads/main",
+                            base_commit,
+                            reviewed_tree,
+                            kind,
+                            commit,
+                            id * 10,
+                            spec,
+                        ],
+                    )
+                    .unwrap();
+            }
+        }
+
+        let store = SqlitePublishRunStore::open(&database).unwrap();
+        assert_eq!(
+            store
+                .connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            4
+        );
+        let noop = store.get(PublishRunId::new(1).unwrap()).unwrap().unwrap();
+        let historical = store.get(PublishRunId::new(2).unwrap()).unwrap().unwrap();
+
+        // Every pre-existing field is unchanged.
+        assert_eq!(noop.snapshot_id(), SnapshotId::new(7).unwrap());
+        assert_eq!(noop.desired_commit(), None);
+        assert_eq!(noop.created_at_unix_ms(), 10);
+        assert_eq!(historical.base_commit(), base_commit);
+        assert_eq!(historical.reviewed_tree(), reviewed_tree);
+        assert_eq!(
+            historical.desired_commit(),
+            Some(&GitCommitOid::new(historic_commit.clone()).unwrap())
+        );
+        assert_eq!(
+            historical.commit_spec(),
+            Some(&spec(&base_commit, &reviewed_tree, 20))
+        );
+        assert_eq!(historical.created_at_unix_ms(), 20);
+
+        // The old value is preserved as opaque metadata, and neither interpreted
+        // identity is fabricated from it.
+        for run in [&noop, &historical] {
+            assert_eq!(run.legacy_projection_sha256(), Some(Sha256::new(ambiguous)));
+            assert_eq!(run.reviewed_text_projection_sha256(), None);
+            assert_eq!(run.delivery_projection_binding(), None);
+        }
+
+        // Nothing was invented in the delivery projection store; a historical run
+        // simply has no durable delivery intent, which is a degraded but honest
+        // state rather than corruption.
+        let columns: Vec<String> = store
+            .connection
+            .prepare("SELECT name FROM pragma_table_info('publish_runs')")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(columns.contains(&"legacy_projection_sha256".to_owned()));
+        assert!(columns.contains(&"reviewed_text_projection_sha256".to_owned()));
+        assert!(columns.contains(&"delivery_projection_sha256".to_owned()));
+        assert!(!columns.contains(&"projection_sha256".to_owned()));
+
+        // Reopening is idempotent.
+        drop(store);
+        let reopened = SqlitePublishRunStore::open(&database).unwrap();
+        assert_eq!(
+            reopened.get(PublishRunId::new(2).unwrap()).unwrap(),
+            Some(historical)
+        );
+    }
+
+    #[test]
+    fn a_new_run_round_trips_its_delivery_binding() {
+        let directory = TestDirectory::new();
+        let database = directory.database();
+        let binding =
+            DeliveryProjectionBinding::new(Sha256::new([0x11; 32]), Sha256::new([0x22; 32]));
+        let run = PublishRun::rehydrate(
+            PublishRunId::new(1).unwrap(),
+            SnapshotId::new(7).unwrap(),
+            None,
+            Some(binding.text_projection_sha256()),
+            Some(binding.delivery_sha256()),
+            ManagedRoot::new("content").unwrap(),
+            PublishTargetId::new("origin:refs/heads/main").unwrap(),
+            GitRepositoryIdentity::new(&directory.0)
+                .unwrap()
+                .locator()
+                .clone(),
+            GitRefTarget::new("origin", "refs/heads/main").unwrap(),
+            oid('a'),
+            oid('b'),
+            None,
+            None,
+            10,
+        )
+        .unwrap();
+        let store = SqlitePublishRunStore::open(&database).unwrap();
+        store.save(&run).unwrap();
+        drop(store);
+
+        let reopened = SqlitePublishRunStore::open(&database).unwrap();
+        let restored = reopened.get(run.id()).unwrap().unwrap();
+
+        assert_eq!(restored, run);
+        assert_eq!(restored.delivery_projection_binding(), Some(binding));
+        assert_eq!(restored.legacy_projection_sha256(), None);
+    }
+
+    /// The schema itself refuses half a binding, so no adapter can create the
+    /// state the domain model calls illegal.
+    #[test]
+    fn the_schema_refuses_half_a_delivery_binding() {
+        let directory = TestDirectory::new();
+        let store = SqlitePublishRunStore::open(directory.database()).unwrap();
+
+        let error = store
+            .connection
+            .execute(
+                "INSERT INTO publish_runs (
+                     id, snapshot_id, legacy_projection_sha256,
+                     reviewed_text_projection_sha256, delivery_projection_sha256, managed_root,
+                     repository_path, publish_target_id, remote_name, destination_ref, base_commit,
+                     reviewed_tree, publication_kind, commit_oid, created_at_unix_ms, commit_spec
+                 ) VALUES (?1, ?2, NULL, ?3, NULL, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'noop', NULL, ?11, NULL)",
+                params![
+                    1_i64,
+                    7_i64,
+                    [1_u8; 32].as_slice(),
+                    "content",
+                    directory.0.to_str().unwrap(),
+                    "origin:refs/heads/main",
+                    "origin",
+                    "refs/heads/main",
+                    oid('a'),
+                    oid('b'),
+                    10_i64,
+                ],
+            )
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("CHECK"),
+            "the schema accepted half a delivery binding: {error}"
         );
     }
 

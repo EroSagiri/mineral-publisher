@@ -4,7 +4,7 @@ use sha2::{Digest, Sha256 as Sha256Hasher};
 
 use crate::domain::{ContentPath, Sha256, Snapshot, SnapshotFile, SnapshotId};
 
-use super::FinalPublicationSet;
+use super::{AssetContentType, FinalPublicationSet};
 
 /// A canonical path relative to the publication target root.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -53,7 +53,8 @@ impl ManagedRoot {
         self.0.is_none()
     }
 
-    fn target_for(
+    /// The canonical target path one source path occupies under this root.
+    pub fn target_for(
         &self,
         source_path: &ContentPath,
     ) -> Result<ProjectionTargetPath, ProjectionTargetPathError> {
@@ -83,6 +84,36 @@ pub enum PublicationFileMode {
     Executable,
 }
 
+/// The immutable publication facts of one asset's published bytes.
+///
+/// These travel with the published blob identity they describe, so a later stage
+/// can never pair a size or a media type with different bytes than the ones the
+/// sanitizer actually produced.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AssetPublicationFacts {
+    published_size: u64,
+    published_content_type: AssetContentType,
+}
+
+impl AssetPublicationFacts {
+    pub fn new(published_size: u64, published_content_type: AssetContentType) -> Self {
+        Self {
+            published_size,
+            published_content_type,
+        }
+    }
+
+    /// Length of the published bytes, in bytes.
+    pub fn published_size(&self) -> u64 {
+        self.published_size
+    }
+
+    /// Media type of the published bytes, as determined by sanitization.
+    pub fn published_content_type(&self) -> &AssetContentType {
+        &self.published_content_type
+    }
+}
+
 /// One exact blob at one exact path in the complete desired target tree.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProjectionEntry {
@@ -91,6 +122,11 @@ pub struct ProjectionEntry {
     kind: ProjectionEntryKind,
     source_path: ContentPath,
     source_sha256: Sha256,
+    /// Present exactly when `kind` is [`ProjectionEntryKind::Asset`].
+    ///
+    /// The only constructor is [`PublicProjection::build`], which always fills it
+    /// in for an asset entry and never for a document.
+    asset_publication: Option<AssetPublicationFacts>,
 }
 
 impl ProjectionEntry {
@@ -118,6 +154,11 @@ impl ProjectionEntry {
     /// The immutable Snapshot identity from which this entry was derived.
     pub fn source_sha256(&self) -> Sha256 {
         self.source_sha256
+    }
+
+    /// The published bytes' immutable facts, for an asset entry.
+    pub fn asset_publication(&self) -> Option<&AssetPublicationFacts> {
+        self.asset_publication.as_ref()
     }
 }
 
@@ -161,6 +202,7 @@ impl PublicProjection {
                     kind: ProjectionEntryKind::Markdown,
                     source_path: path.clone(),
                     source_sha256: file.sha256(),
+                    asset_publication: None,
                 },
             )?;
         }
@@ -183,6 +225,10 @@ impl PublicProjection {
                     kind: ProjectionEntryKind::Asset,
                     source_path: path.clone(),
                     source_sha256: asset.source_sha256(),
+                    asset_publication: Some(AssetPublicationFacts::new(
+                        asset.published_size(),
+                        asset.published_content_type().clone(),
+                    )),
                 },
             )?;
         }
@@ -389,6 +435,7 @@ mod tests {
             source,
             published,
             1,
+            AssetContentType::new("image/png").unwrap(),
             if source == published {
                 vec![SanitizationTransformation::Identity]
             } else {
@@ -443,6 +490,50 @@ mod tests {
         assert_eq!(entry.blob_sha256(), published);
         assert_eq!(entry.source_sha256(), source);
         assert_eq!(entry.kind(), ProjectionEntryKind::Asset);
+    }
+
+    #[test]
+    fn asset_entries_carry_the_published_publication_facts() {
+        let source = hash(1);
+        let published = hash(2);
+        let snapshot = snapshot(1, &[("notes/a.md", hash(3)), ("attachments/a.png", source)]);
+        let set = publication_set(
+            1,
+            &["notes/a.md"],
+            vec![SanitizedAsset::from_parts(
+                path("attachments/a.png"),
+                AssetReviewRunId::new(1).unwrap(),
+                source,
+                published,
+                4_242,
+                AssetContentType::new("image/jpeg").unwrap(),
+                vec![SanitizationTransformation::StripMetadata],
+            )],
+        );
+
+        let projection = PublicProjection::build(&set, &snapshot, root()).unwrap();
+        let asset = projection
+            .entries()
+            .iter()
+            .find(|entry| entry.kind() == ProjectionEntryKind::Asset)
+            .unwrap();
+        let facts = asset.asset_publication().unwrap();
+
+        assert_eq!(facts.published_size(), 4_242);
+        assert_eq!(facts.published_content_type().as_str(), "image/jpeg");
+        assert_eq!(asset.blob_sha256(), published);
+        assert_eq!(asset.source_sha256(), source);
+    }
+
+    #[test]
+    fn document_entries_carry_no_asset_publication_facts() {
+        let markdown_sha = hash(1);
+        let snapshot = snapshot(1, &[("notes/a.md", markdown_sha)]);
+        let set = publication_set(1, &["notes/a.md"], vec![]);
+
+        let projection = PublicProjection::build(&set, &snapshot, root()).unwrap();
+
+        assert!(projection.entries()[0].asset_publication().is_none());
     }
 
     #[test]

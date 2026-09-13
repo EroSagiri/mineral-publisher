@@ -5,11 +5,14 @@
 //! clocks, stores and network adapters.
 
 mod asset_check;
+mod asset_delivery;
 mod asset_policy;
 mod asset_review_run;
 mod asset_review_workflow;
 mod asset_sanitization;
 mod candidate_asset;
+mod delivery_projection;
+mod delivery_wire;
 mod effective_review_set;
 mod final_dependency_closure;
 mod human_review;
@@ -20,6 +23,10 @@ mod publish_plan;
 pub use asset_check::{
     ActualAssetType, AssetCheckFinding, AssetCheckResult, AssetInspector, CheckedAsset,
     ImageDimensions,
+};
+pub use asset_delivery::{
+    ASSET_OBJECT_KEY_PREFIX, AssetContentType, AssetContentTypeError, AssetDeliveryConfig,
+    AssetDeliveryConfigError, AssetObjectKey, AssetPublicBaseUrl, AssetPublicUrl,
 };
 pub use asset_policy::{
     AssetHumanReviewReason, AssetPolicy, AssetPolicyDecision, AssetPolicyOutcome,
@@ -40,6 +47,11 @@ pub use asset_sanitization::{
     ImageSanitizationFormat, SanitizationTransformation, SanitizedAsset, SanitizedAssetSet,
 };
 pub use candidate_asset::{CandidateAsset, CandidateAssetSelectionError, CandidateAssetSet};
+pub use delivery_projection::{
+    AssetProjection, DeliveryProjection, DeliveryProjectionBuilder, DeliveryProjectionError,
+    DeliveryProjectionStore, PublishedAsset, TextProjection, TextProjectionFile,
+};
+pub use delivery_wire::{DeliveryProjectionWire, DeliveryProjectionWireError};
 pub use effective_review_set::{
     EffectiveAssetReview, EffectiveDocumentDecision, EffectiveDocumentReview, EffectiveReviewSet,
     EffectiveReviewSetError,
@@ -58,7 +70,7 @@ pub use public_policy_run::{
     SequentialReviewRunIdGenerator, SequentialReviewRunIdGeneratorError,
 };
 pub use public_projection::{
-    ManagedRoot, ProjectionEntry, ProjectionEntryKind, ProjectionTargetPath,
+    AssetPublicationFacts, ManagedRoot, ProjectionEntry, ProjectionEntryKind, ProjectionTargetPath,
     ProjectionTargetPathError, PublicProjection, PublicProjectionError, PublicationFileMode,
 };
 pub use publish_plan::{

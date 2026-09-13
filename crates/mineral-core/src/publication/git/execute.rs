@@ -1,16 +1,18 @@
 use std::{error::Error, fmt};
 
 use crate::{
+    domain::Sha256,
     ports::Clock,
     publication::git::{
         CasOutcome, GitCommitFacts, GitCommitOid, GitRemote, GitRepository, LocalCommitState,
         RefUpdate,
     },
     publish::{
-        PublishReconciliation, PublishReconciliationError, PublishRun, PublishRunId,
-        PublishRunStore, RemoteObservationIdGenerator, RemoteObservationStore,
+        DeliveryProjectionBinding, PublishReconciliation, PublishReconciliationError, PublishRun,
+        PublishRunId, PublishRunStore, RemoteObservationIdGenerator, RemoteObservationStore,
         RemoteRefObservation,
     },
+    workflow::DeliveryProjectionStore,
 };
 
 /// The explicit outcome of one recovery-safe publication execution.
@@ -78,9 +80,10 @@ pub struct GitPublicationExecutor;
 
 impl GitPublicationExecutor {
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
-    pub fn execute<P, O, I, R, M, C>(
+    pub fn execute<P, D, O, I, R, M, C>(
         publish_run_id: PublishRunId,
         publish_run_store: &P,
+        delivery_projections: &D,
         observation_store: &O,
         observation_ids: &mut I,
         repository: &R,
@@ -88,10 +91,11 @@ impl GitPublicationExecutor {
         clock: &C,
     ) -> Result<
         GitPublicationExecution,
-        GitPublicationExecuteError<P::Error, O::Error, I::Error, R::Error, M::Error>,
+        GitPublicationExecuteError<P::Error, D::Error, O::Error, I::Error, R::Error, M::Error>,
     >
     where
         P: PublishRunStore,
+        D: DeliveryProjectionStore,
         O: RemoteObservationStore,
         I: RemoteObservationIdGenerator,
         R: GitRepository,
@@ -157,7 +161,12 @@ impl GitPublicationExecutor {
             .desired_commit()
             .cloned()
             .expect("reconciliation only asks to push for a run with a desired commit");
-        Self::ensure_desired_commit::<P, O, I, R, M>(repository, &run, &desired_commit)?;
+        Self::ensure_desired_commit::<P, D, O, I, R, M>(
+            repository,
+            delivery_projections,
+            &run,
+            &desired_commit,
+        )?;
 
         // Exactly one compare-and-swap, with the expected previous value stated
         // explicitly: no implementation may approximate it with "push if
@@ -239,14 +248,28 @@ impl GitPublicationExecutor {
     /// persisted before specifications were stored cannot be rebuilt at all, and
     /// inventing one from current configuration is precisely what the durable
     /// model forbids, so that case fails closed instead.
+    ///
+    /// A commit object needs its tree to exist, and a runtime that lost its object
+    /// database lost the tree too. When the run binds a durable delivery
+    /// projection, the reviewed tree is rebuilt from that projection and its
+    /// identity is checked before the commit is recreated — so the tree that
+    /// becomes public is provably the tree that was reviewed, not merely a tree
+    /// that happens to still exist. A run written before delivery projections were
+    /// captured has nothing to rebuild from; it degrades to the older behaviour
+    /// and fails closed if its tree is gone.
     #[allow(clippy::type_complexity)]
-    fn ensure_desired_commit<P, O, I, R, M>(
+    fn ensure_desired_commit<P, D, O, I, R, M>(
         repository: &R,
+        delivery_projections: &D,
         run: &PublishRun,
         desired_commit: &GitCommitOid,
-    ) -> Result<(), GitPublicationExecuteError<P::Error, O::Error, I::Error, R::Error, M::Error>>
+    ) -> Result<
+        (),
+        GitPublicationExecuteError<P::Error, D::Error, O::Error, I::Error, R::Error, M::Error>,
+    >
     where
         P: PublishRunStore,
+        D: DeliveryProjectionStore,
         O: RemoteObservationStore,
         I: RemoteObservationIdGenerator,
         R: GitRepository,
@@ -257,7 +280,7 @@ impl GitPublicationExecutor {
             .map_err(GitPublicationExecuteError::LocalCommitInspection)?
         {
             LocalCommitState::Present(facts) => {
-                Self::verify_commit_facts::<P, O, I, R, M>(run, desired_commit, &facts)
+                Self::verify_commit_facts::<P, D, O, I, R, M>(run, desired_commit, &facts)
             }
             LocalCommitState::Missing => {
                 let Some(spec) = run.commit_spec() else {
@@ -265,6 +288,14 @@ impl GitPublicationExecutor {
                         desired_commit: desired_commit.clone(),
                     });
                 };
+                if let Some(binding) = run.delivery_projection_binding() {
+                    Self::rematerialize_reviewed_tree::<P, D, O, I, R, M>(
+                        repository,
+                        delivery_projections,
+                        run,
+                        &binding,
+                    )?;
+                }
                 let recreated = repository
                     .create_commit(spec)
                     .map_err(GitPublicationExecuteError::CommitCreation)?;
@@ -279,7 +310,7 @@ impl GitPublicationExecutor {
                     .map_err(GitPublicationExecuteError::LocalCommitInspection)?
                 {
                     LocalCommitState::Present(facts) => {
-                        Self::verify_commit_facts::<P, O, I, R, M>(run, desired_commit, &facts)
+                        Self::verify_commit_facts::<P, D, O, I, R, M>(run, desired_commit, &facts)
                     }
                     LocalCommitState::Missing => {
                         Err(GitPublicationExecuteError::ReconstructedCommitAbsent {
@@ -291,16 +322,84 @@ impl GitPublicationExecutor {
         }
     }
 
+    /// Rebuilds the reviewed tree from the run's own durable delivery projection.
+    ///
+    /// This is the only recovery input: the engine loads exactly the projection the
+    /// intent bound, refuses anything the store returns under another identity, and
+    /// requires the rebuilt tree to be the tree the intent recorded. Current
+    /// configuration is never consulted, and a projection that disagrees with the
+    /// run is an error rather than something to prefer.
+    #[allow(clippy::type_complexity)]
+    fn rematerialize_reviewed_tree<P, D, O, I, R, M>(
+        repository: &R,
+        delivery_projections: &D,
+        run: &PublishRun,
+        binding: &DeliveryProjectionBinding,
+    ) -> Result<
+        (),
+        GitPublicationExecuteError<P::Error, D::Error, O::Error, I::Error, R::Error, M::Error>,
+    >
+    where
+        P: PublishRunStore,
+        D: DeliveryProjectionStore,
+        O: RemoteObservationStore,
+        I: RemoteObservationIdGenerator,
+        R: GitRepository,
+        M: GitRemote,
+    {
+        let delivery = delivery_projections
+            .get(binding.delivery_sha256())
+            .map_err(GitPublicationExecuteError::DeliveryProjectionLoad)?
+            .ok_or(GitPublicationExecuteError::DeliveryProjectionNotFound {
+                id: binding.delivery_sha256(),
+            })?;
+        // The store answered under a key; the projection has to prove the key.
+        if delivery.delivery_sha256() != binding.delivery_sha256() {
+            return Err(
+                GitPublicationExecuteError::DeliveryProjectionIdentityMismatch {
+                    expected: binding.delivery_sha256(),
+                    actual: delivery.delivery_sha256(),
+                },
+            );
+        }
+        if delivery.text().projection_sha256() != binding.text_projection_sha256() {
+            return Err(GitPublicationExecuteError::DeliveryTextProjectionMismatch {
+                expected: binding.text_projection_sha256(),
+                actual: delivery.text().projection_sha256(),
+            });
+        }
+        let rebuilt = repository
+            .materialize(&run.base_commit_oid(), delivery.text())
+            .map_err(GitPublicationExecuteError::Rematerialization)?;
+        if rebuilt.base_commit() != run.base_commit() {
+            return Err(GitPublicationExecuteError::RematerializedBaseMismatch {
+                expected: run.base_commit().to_owned(),
+                actual: rebuilt.base_commit().to_owned(),
+            });
+        }
+        if rebuilt.tree_oid() != run.reviewed_tree() {
+            return Err(GitPublicationExecuteError::RematerializedTreeMismatch {
+                expected: run.reviewed_tree().to_owned(),
+                actual: rebuilt.tree_oid().to_owned(),
+            });
+        }
+        Ok(())
+    }
+
     /// The `reviewed tree == committed tree` invariant, plus the parent that makes
     /// the commit a child of the base the intent observed.
     #[allow(clippy::type_complexity)]
-    fn verify_commit_facts<P, O, I, R, M>(
+    fn verify_commit_facts<P, D, O, I, R, M>(
         run: &PublishRun,
         desired_commit: &GitCommitOid,
         facts: &GitCommitFacts,
-    ) -> Result<(), GitPublicationExecuteError<P::Error, O::Error, I::Error, R::Error, M::Error>>
+    ) -> Result<
+        (),
+        GitPublicationExecuteError<P::Error, D::Error, O::Error, I::Error, R::Error, M::Error>,
+    >
     where
         P: PublishRunStore,
+        D: DeliveryProjectionStore,
         O: RemoteObservationStore,
         I: RemoteObservationIdGenerator,
         R: GitRepository,
@@ -330,9 +429,37 @@ impl GitPublicationExecutor {
 
 /// Errors that stopped one execution from producing a durable, meaningful outcome.
 #[derive(Debug)]
-pub enum GitPublicationExecuteError<P: Error, O: Error, I: Error, R: Error, M: Error> {
+pub enum GitPublicationExecuteError<P: Error, D: Error, O: Error, I: Error, R: Error, M: Error> {
     PublishRunLoad(P),
     PublishRunNotFound(PublishRunId),
+    /// The runtime could not read its durable delivery projections.
+    DeliveryProjectionLoad(D),
+    /// The run binds a delivery projection that was never captured.
+    DeliveryProjectionNotFound {
+        id: Sha256,
+    },
+    /// The store returned a projection that is not the one the key names.
+    DeliveryProjectionIdentityMismatch {
+        expected: Sha256,
+        actual: Sha256,
+    },
+    /// The loaded projection's text side is not the text tree the run recorded.
+    DeliveryTextProjectionMismatch {
+        expected: Sha256,
+        actual: Sha256,
+    },
+    /// The runtime could not rebuild the reviewed tree from the stored projection.
+    Rematerialization(R),
+    /// The rebuilt tree belongs to another base than the intent observed.
+    RematerializedBaseMismatch {
+        expected: String,
+        actual: String,
+    },
+    /// The rebuilt tree is not the tree the intent recorded.
+    RematerializedTreeMismatch {
+        expected: String,
+        actual: String,
+    },
     ObservationId(I),
     ClockUnavailable,
     InitialObservation(M),
@@ -379,8 +506,8 @@ pub enum GitPublicationExecuteError<P: Error, O: Error, I: Error, R: Error, M: E
     UnexpectedNoopReconciliation,
 }
 
-impl<P: Error, O: Error, I: Error, R: Error, M: Error> fmt::Display
-    for GitPublicationExecuteError<P, O, I, R, M>
+impl<P: Error, D: Error, O: Error, I: Error, R: Error, M: Error> fmt::Display
+    for GitPublicationExecuteError<P, D, O, I, R, M>
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -388,6 +515,31 @@ impl<P: Error, O: Error, I: Error, R: Error, M: Error> fmt::Display
             Self::PublishRunNotFound(id) => {
                 write!(formatter, "publish run {} was not found", id.get())
             }
+            Self::DeliveryProjectionLoad(_) => {
+                formatter.write_str("could not load the durable delivery projection")
+            }
+            Self::DeliveryProjectionNotFound { id } => write!(
+                formatter,
+                "the delivery projection {id} this run is bound to was never captured"
+            ),
+            Self::DeliveryProjectionIdentityMismatch { expected, actual } => write!(
+                formatter,
+                "the delivery projection store returned {actual} for the requested {expected}"
+            ),
+            Self::DeliveryTextProjectionMismatch { expected, actual } => write!(
+                formatter,
+                "the durable delivery projection carries text identity {actual}, not the reviewed {expected}"
+            ),
+            Self::Rematerialization(_) => formatter
+                .write_str("could not rebuild the reviewed tree from the delivery projection"),
+            Self::RematerializedBaseMismatch { expected, actual } => write!(
+                formatter,
+                "the rebuilt tree belongs to base {actual}, not {expected}"
+            ),
+            Self::RematerializedTreeMismatch { expected, actual } => write!(
+                formatter,
+                "the rebuilt reviewed tree is {actual}, not {expected}"
+            ),
             Self::ObservationId(_) => {
                 formatter.write_str("could not allocate remote observation ID")
             }
@@ -466,15 +618,18 @@ impl<P: Error, O: Error, I: Error, R: Error, M: Error> fmt::Display
 
 impl<
     P: Error + 'static,
+    D: Error + 'static,
     O: Error + 'static,
     I: Error + 'static,
     R: Error + 'static,
     M: Error + 'static,
-> Error for GitPublicationExecuteError<P, O, I, R, M>
+> Error for GitPublicationExecuteError<P, D, O, I, R, M>
 {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::PublishRunLoad(error) => Some(error),
+            Self::DeliveryProjectionLoad(error) => Some(error),
+            Self::Rematerialization(error) => Some(error),
             Self::ObservationId(error) => Some(error),
             Self::InitialObservation(error) => Some(error),
             Self::InitialObservationPersistence(error) => Some(error),
@@ -486,6 +641,11 @@ impl<
             Self::PostObservationPersistence(error) => Some(error),
             Self::PublishRunNotFound(_)
             | Self::ClockUnavailable
+            | Self::DeliveryProjectionNotFound { .. }
+            | Self::DeliveryProjectionIdentityMismatch { .. }
+            | Self::DeliveryTextProjectionMismatch { .. }
+            | Self::RematerializedBaseMismatch { .. }
+            | Self::RematerializedTreeMismatch { .. }
             | Self::LegacyCommitNotReconstructible { .. }
             | Self::ReconstructedCommitMismatch { .. }
             | Self::ReconstructedCommitAbsent { .. }
@@ -509,7 +669,7 @@ mod tests {
     };
 
     use crate::{
-        domain::{Sha256, SnapshotId, TimestampMillis},
+        domain::{ContentPath, Sha256, SnapshotId, TimestampMillis},
         publication::git::{
             GitCommitSpec, GitCurrentTarget, GitRefTarget, GitTreeOid, RemoteRefState,
             ReviewedGitTree,
@@ -517,7 +677,7 @@ mod tests {
         publish::{
             PublishTargetId, RemoteObservationId, RemoteObservationIdError, RepositoryLocator,
         },
-        workflow::{ManagedRoot, PublicProjection},
+        workflow::{AssetProjection, DeliveryProjection, ManagedRoot, TextProjection},
     };
 
     use super::*;
@@ -560,7 +720,9 @@ mod tests {
         PublishRun::rehydrate(
             PublishRunId::new(1).unwrap(),
             SnapshotId::new(1).unwrap(),
-            Sha256::new([1; 32]),
+            Some(Sha256::new([1; 32])),
+            None,
+            None,
             ManagedRoot::new("content").unwrap(),
             PublishTargetId::new("origin:refs/heads/main").unwrap(),
             RepositoryLocator::new("/srv/public-repo").unwrap(),
@@ -576,6 +738,54 @@ mod tests {
 
     fn ready_intent() -> PublishRun {
         intent(Some(oid(DESIRED)), Some(spec()))
+    }
+
+    /// A real delivery projection whose text side is one document.
+    fn delivery_projection(seed: u8) -> DeliveryProjection {
+        let source_projection_sha256 = Sha256::new([seed; 32]);
+        let text = TextProjection::from_parts_for_test(
+            SnapshotId::new(1).unwrap(),
+            ManagedRoot::new("content").unwrap(),
+            source_projection_sha256,
+            vec![(
+                ContentPath::new("note.md").unwrap(),
+                Sha256::new([seed.wrapping_add(1); 32]),
+            )],
+        );
+        DeliveryProjection::from_parts(
+            source_projection_sha256,
+            SnapshotId::new(1).unwrap(),
+            ManagedRoot::new("content").unwrap(),
+            text,
+            AssetProjection::from_assets(Vec::new()),
+        )
+    }
+
+    /// A persisted intent bound to one delivery projection, with an optional
+    /// override for the recorded text identity.
+    fn bound_intent(
+        projection: &DeliveryProjection,
+        recorded_text: Option<Sha256>,
+        desired_commit: Option<GitCommitOid>,
+        commit_spec: Option<GitCommitSpec>,
+    ) -> PublishRun {
+        PublishRun::rehydrate(
+            PublishRunId::new(1).unwrap(),
+            SnapshotId::new(1).unwrap(),
+            None,
+            Some(recorded_text.unwrap_or_else(|| projection.text().projection_sha256())),
+            Some(projection.delivery_sha256()),
+            ManagedRoot::new("content").unwrap(),
+            PublishTargetId::new("origin:refs/heads/main").unwrap(),
+            RepositoryLocator::new("/srv/public-repo").unwrap(),
+            GitRefTarget::new("origin", "refs/heads/main").unwrap(),
+            oid(BASE).as_str().to_owned(),
+            oid(REVIEWED_TREE).as_str().to_owned(),
+            desired_commit,
+            commit_spec,
+            TIME,
+        )
+        .unwrap()
     }
 
     fn present(value: char) -> RemoteRefState {
@@ -778,9 +988,12 @@ mod tests {
     struct FakeGitRepository {
         observed: RefCell<Vec<Result<LocalCommitState, PortFailure>>>,
         create_result: RefCell<Result<GitCommitOid, PortFailure>>,
+        materialized: RefCell<Result<ReviewedGitTree, PortFailure>>,
         inspect_commit_calls: Cell<u32>,
         create_commit_calls: Cell<u32>,
+        materialize_calls: Cell<u32>,
         created_specs: RefCell<Vec<GitCommitSpec>>,
+        materialized_texts: RefCell<Vec<TextProjection>>,
     }
 
     impl FakeGitRepository {
@@ -788,10 +1001,44 @@ mod tests {
             Self {
                 observed: RefCell::new(observations),
                 create_result: RefCell::new(Ok(oid(DESIRED))),
+                // Recovery only materializes when the intent binds a durable
+                // projection, so an unexpected call must be loud.
+                materialized: RefCell::new(Err(PortFailure(
+                    "execution materialized without a delivery projection",
+                ))),
                 inspect_commit_calls: Cell::new(0),
                 create_commit_calls: Cell::new(0),
+                materialize_calls: Cell::new(0),
                 created_specs: RefCell::new(Vec::new()),
+                materialized_texts: RefCell::new(Vec::new()),
             }
+        }
+
+        fn with_materialized_tree(mut self, base: char, reviewed_tree: char) -> Self {
+            self.materialized = RefCell::new(Ok(ReviewedGitTree::from_parts(
+                oid(base).as_str(),
+                oid('9').as_str(),
+                Sha256::new([1; 32]),
+                SnapshotId::new(1).unwrap(),
+                oid(reviewed_tree).as_str(),
+                ManagedRoot::new("content").unwrap(),
+            )));
+            self
+        }
+
+        fn with_materialization_error(mut self) -> Self {
+            self.materialized = RefCell::new(Err(PortFailure(
+                "reviewed tree could not be rebuilt from the delivery projection",
+            )));
+            self
+        }
+
+        fn materialize_calls(&self) -> u32 {
+            self.materialize_calls.get()
+        }
+
+        fn materialized_texts(&self) -> Vec<TextProjection> {
+            self.materialized_texts.borrow().clone()
         }
 
         fn present(parent: char, reviewed_tree: char) -> Self {
@@ -864,9 +1111,11 @@ mod tests {
         fn materialize(
             &self,
             _: &GitCommitOid,
-            _: &PublicProjection,
+            text: &TextProjection,
         ) -> Result<ReviewedGitTree, Self::Error> {
-            unreachable!("execution never materializes a projection")
+            self.materialize_calls.set(self.materialize_calls.get() + 1);
+            self.materialized_texts.borrow_mut().push(text.clone());
+            self.materialized.borrow().clone()
         }
 
         fn create_commit(&self, spec: &GitCommitSpec) -> Result<GitCommitOid, Self::Error> {
@@ -886,13 +1135,73 @@ mod tests {
     type Failure = GitPublicationExecuteError<
         Infallible,
         PortFailure,
+        PortFailure,
         RemoteObservationIdError,
         PortFailure,
         PortFailure,
     >;
 
+    /// A delivery projection store whose answer the test chooses, so the recovery
+    /// sequence can be shown to depend on durable facts and nothing else.
+    #[derive(Default)]
+    struct FakeDeliveryProjections {
+        stored: RefCell<std::collections::HashMap<Sha256, DeliveryProjection>>,
+        substituted: RefCell<Option<DeliveryProjection>>,
+        fail_load: Cell<bool>,
+        get_calls: Cell<u32>,
+    }
+
+    impl FakeDeliveryProjections {
+        fn with(self, projection: DeliveryProjection) -> Self {
+            self.stored
+                .borrow_mut()
+                .insert(projection.delivery_sha256(), projection);
+            self
+        }
+
+        /// Answers every request with this projection, whatever identity was asked
+        /// for: a store that violates its own contract.
+        fn substituting(projection: DeliveryProjection) -> Self {
+            Self {
+                substituted: RefCell::new(Some(projection)),
+                ..Self::default()
+            }
+        }
+
+        fn rejecting() -> Self {
+            Self {
+                fail_load: Cell::new(true),
+                ..Self::default()
+            }
+        }
+
+        fn get_calls(&self) -> u32 {
+            self.get_calls.get()
+        }
+    }
+
+    impl DeliveryProjectionStore for FakeDeliveryProjections {
+        type Error = PortFailure;
+
+        fn save(&self, _: &DeliveryProjection) -> Result<(), Self::Error> {
+            unreachable!("execution never stores a delivery projection")
+        }
+
+        fn get(&self, id: Sha256) -> Result<Option<DeliveryProjection>, Self::Error> {
+            self.get_calls.set(self.get_calls.get() + 1);
+            if self.fail_load.get() {
+                return Err(PortFailure("delivery projection load failed"));
+            }
+            if let Some(substituted) = self.substituted.borrow().clone() {
+                return Ok(Some(substituted));
+            }
+            Ok(self.stored.borrow().get(&id).cloned())
+        }
+    }
+
     struct Harness {
         runs: FakePublishRuns,
+        deliveries: FakeDeliveryProjections,
         observations: FakeObservations,
         ids: TestIds,
         repository: FakeGitRepository,
@@ -911,6 +1220,7 @@ mod tests {
                     Some(run) => FakePublishRuns::with(run),
                     None => FakePublishRuns::empty(),
                 },
+                deliveries: FakeDeliveryProjections::default(),
                 observations: FakeObservations::default(),
                 ids: TestIds::Sequential(1),
                 repository,
@@ -922,6 +1232,7 @@ mod tests {
         fn execute(&mut self) -> Result<GitPublicationExecution, Failure> {
             let Harness {
                 runs,
+                deliveries,
                 observations,
                 ids,
                 repository,
@@ -931,6 +1242,7 @@ mod tests {
             GitPublicationExecutor::execute(
                 PublishRunId::new(1).unwrap(),
                 runs,
+                deliveries,
                 observations,
                 ids,
                 repository,
@@ -1169,7 +1481,256 @@ mod tests {
             harness.execute(),
             Err(GitPublicationExecuteError::CommitCreation(_))
         ));
+        // Nothing was invented: this intent bound no delivery projection, so the
+        // store is never asked for one.
+        assert_eq!(harness.deliveries.get_calls(), 0);
+        assert_eq!(harness.repository.materialize_calls(), 0);
         assert_eq!(harness.remote.compare_and_swap_calls(), 0);
+    }
+
+    /// §10: the object database is gone, so the reviewed tree must be rebuilt from
+    /// the run's own durable delivery projection before the commit can be.
+    #[test]
+    fn a_lost_commit_and_tree_are_rebuilt_from_the_persisted_delivery_projection() {
+        let projection = delivery_projection(4);
+        let mut harness = Harness::new(
+            Some(bound_intent(
+                &projection,
+                None,
+                Some(oid(DESIRED)),
+                Some(spec()),
+            )),
+            // `missing_then_rebuilt` reports the commit absent, then present with
+            // the reviewed tree after the recreation.
+            FakeGitRepository::missing_then_rebuilt().with_materialized_tree(BASE, REVIEWED_TREE),
+            vec![present(BASE), present(DESIRED)],
+        );
+        harness.deliveries = FakeDeliveryProjections::default().with(projection.clone());
+
+        let execution = harness.execute().unwrap();
+        let GitPublicationExecution::Published { cas_outcome, .. } = execution else {
+            panic!("expected a published execution, got {execution:?}");
+        };
+
+        assert_eq!(cas_outcome, CasOutcome::Updated);
+        assert_eq!(harness.deliveries.get_calls(), 1);
+        assert_eq!(harness.repository.materialize_calls(), 1);
+        assert_eq!(
+            harness.repository.materialized_texts(),
+            vec![projection.text().clone()],
+            "recovery materializes exactly the stored text side"
+        );
+        assert_eq!(harness.repository.create_commit_calls(), 1);
+        assert_eq!(harness.remote.compare_and_swap_calls(), 1);
+    }
+
+    #[test]
+    fn a_delivery_projection_that_was_never_captured_fails_closed() {
+        let projection = delivery_projection(4);
+        let mut harness = Harness::new(
+            Some(bound_intent(
+                &projection,
+                None,
+                Some(oid(DESIRED)),
+                Some(spec()),
+            )),
+            FakeGitRepository::missing().with_materialized_tree(BASE, REVIEWED_TREE),
+            vec![present(BASE)],
+        );
+
+        assert!(matches!(
+            harness.execute(),
+            Err(GitPublicationExecuteError::DeliveryProjectionNotFound { .. })
+        ));
+        assert_eq!(harness.deliveries.get_calls(), 1);
+        assert_eq!(harness.repository.materialize_calls(), 0);
+        assert_eq!(harness.repository.create_commit_calls(), 0);
+        assert_eq!(harness.remote.compare_and_swap_calls(), 0);
+    }
+
+    #[test]
+    fn a_delivery_projection_store_failure_fails_closed() {
+        let projection = delivery_projection(4);
+        let mut harness = Harness::new(
+            Some(bound_intent(
+                &projection,
+                None,
+                Some(oid(DESIRED)),
+                Some(spec()),
+            )),
+            FakeGitRepository::missing().with_materialized_tree(BASE, REVIEWED_TREE),
+            vec![present(BASE)],
+        );
+        harness.deliveries = FakeDeliveryProjections::rejecting();
+
+        assert!(matches!(
+            harness.execute(),
+            Err(GitPublicationExecuteError::DeliveryProjectionLoad(_))
+        ));
+        assert_eq!(harness.repository.create_commit_calls(), 0);
+        assert_eq!(harness.remote.compare_and_swap_calls(), 0);
+    }
+
+    #[test]
+    fn a_store_that_answers_with_another_projection_fails_closed() {
+        let projection = delivery_projection(4);
+        let mut harness = Harness::new(
+            Some(bound_intent(
+                &projection,
+                None,
+                Some(oid(DESIRED)),
+                Some(spec()),
+            )),
+            FakeGitRepository::missing().with_materialized_tree(BASE, REVIEWED_TREE),
+            vec![present(BASE)],
+        );
+        // The store hands back a projection whose own identity is another one.
+        harness.deliveries = FakeDeliveryProjections::substituting(delivery_projection(5));
+
+        assert!(matches!(
+            harness.execute(),
+            Err(GitPublicationExecuteError::DeliveryProjectionIdentityMismatch { .. })
+        ));
+        assert_eq!(harness.repository.materialize_calls(), 0);
+        assert_eq!(harness.repository.create_commit_calls(), 0);
+        assert_eq!(harness.remote.compare_and_swap_calls(), 0);
+    }
+
+    #[test]
+    fn a_projection_whose_text_side_is_not_the_reviewed_tree_fails_closed() {
+        let projection = delivery_projection(4);
+        let mut harness = Harness::new(
+            Some(bound_intent(
+                &projection,
+                // The run recorded another text identity than the stored one.
+                Some(Sha256::new([0xee; 32])),
+                Some(oid(DESIRED)),
+                Some(spec()),
+            )),
+            FakeGitRepository::missing().with_materialized_tree(BASE, REVIEWED_TREE),
+            vec![present(BASE)],
+        );
+        harness.deliveries = FakeDeliveryProjections::default().with(projection);
+
+        assert!(matches!(
+            harness.execute(),
+            Err(GitPublicationExecuteError::DeliveryTextProjectionMismatch { .. })
+        ));
+        assert_eq!(harness.repository.materialize_calls(), 0);
+        assert_eq!(harness.repository.create_commit_calls(), 0);
+        assert_eq!(harness.remote.compare_and_swap_calls(), 0);
+    }
+
+    #[test]
+    fn a_tree_that_does_not_reproduce_the_reviewed_tree_fails_closed() {
+        let projection = delivery_projection(4);
+        let mut harness = Harness::new(
+            Some(bound_intent(
+                &projection,
+                None,
+                Some(oid(DESIRED)),
+                Some(spec()),
+            )),
+            // The projection rebuilds, but not into the tree the intent recorded.
+            FakeGitRepository::missing().with_materialized_tree(BASE, 'f'),
+            vec![present(BASE)],
+        );
+        harness.deliveries = FakeDeliveryProjections::default().with(projection);
+
+        assert!(matches!(
+            harness.execute(),
+            Err(GitPublicationExecuteError::RematerializedTreeMismatch { .. })
+        ));
+        assert_eq!(harness.repository.materialize_calls(), 1);
+        assert_eq!(harness.repository.create_commit_calls(), 0);
+        assert_eq!(harness.remote.compare_and_swap_calls(), 0);
+    }
+
+    #[test]
+    fn a_tree_rebuilt_on_another_base_fails_closed() {
+        let projection = delivery_projection(4);
+        let mut harness = Harness::new(
+            Some(bound_intent(
+                &projection,
+                None,
+                Some(oid(DESIRED)),
+                Some(spec()),
+            )),
+            FakeGitRepository::missing().with_materialized_tree('d', REVIEWED_TREE),
+            vec![present(BASE)],
+        );
+        harness.deliveries = FakeDeliveryProjections::default().with(projection);
+
+        assert!(matches!(
+            harness.execute(),
+            Err(GitPublicationExecuteError::RematerializedBaseMismatch { .. })
+        ));
+        assert_eq!(harness.repository.create_commit_calls(), 0);
+        assert_eq!(harness.remote.compare_and_swap_calls(), 0);
+    }
+
+    #[test]
+    fn a_runtime_that_cannot_rematerialize_fails_closed() {
+        let projection = delivery_projection(4);
+        let mut harness = Harness::new(
+            Some(bound_intent(
+                &projection,
+                None,
+                Some(oid(DESIRED)),
+                Some(spec()),
+            )),
+            FakeGitRepository::missing().with_materialization_error(),
+            vec![present(BASE)],
+        );
+        harness.deliveries = FakeDeliveryProjections::default().with(projection);
+
+        assert!(matches!(
+            harness.execute(),
+            Err(GitPublicationExecuteError::Rematerialization(_))
+        ));
+        assert_eq!(harness.repository.create_commit_calls(), 0);
+        assert_eq!(harness.remote.compare_and_swap_calls(), 0);
+    }
+
+    /// A run written before delivery projections were captured has nothing to
+    /// rebuild from, so it must not be forced through the store at all.
+    #[test]
+    fn a_legacy_intent_never_consults_the_delivery_projection_store() {
+        let mut harness = Harness::new(
+            Some(ready_intent()),
+            FakeGitRepository::missing_then_rebuilt(),
+            vec![present(BASE), present(DESIRED)],
+        );
+
+        let execution = harness.execute().unwrap();
+
+        assert!(execution.is_satisfied());
+        assert_eq!(harness.deliveries.get_calls(), 0);
+        assert_eq!(harness.repository.materialize_calls(), 0);
+        assert_eq!(harness.repository.create_commit_calls(), 1);
+    }
+
+    /// An intent whose commit is still present needs no recovery at all.
+    #[test]
+    fn a_present_commit_never_consults_the_delivery_projection_store() {
+        let projection = delivery_projection(4);
+        let mut harness = Harness::new(
+            Some(bound_intent(
+                &projection,
+                None,
+                Some(oid(DESIRED)),
+                Some(spec()),
+            )),
+            FakeGitRepository::present(BASE, REVIEWED_TREE),
+            vec![present(BASE), present(DESIRED)],
+        );
+
+        let execution = harness.execute().unwrap();
+
+        assert!(execution.is_satisfied());
+        assert_eq!(harness.deliveries.get_calls(), 0);
+        assert_eq!(harness.repository.materialize_calls(), 0);
+        assert_eq!(harness.repository.create_commit_calls(), 0);
     }
 
     #[test]

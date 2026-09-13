@@ -20,11 +20,12 @@ use crate::{
 };
 
 use super::{
-    AssetProgramCheck, AssetReviewEvaluator, AssetReviewRunIdGenerator, AssetReviewRunStore,
-    AssetReviewWorkflow, AssetReviewWorkflowInput, AssetReviewWorkflowResult, AssetReviewer,
-    AssetSanitizer, CandidateAssetSet, EffectiveReviewSet, FinalPublicationSet, HumanReviewRecord,
-    HumanReviewStore, HumanReviewSubject, ManagedRoot, MarkdownReviewEvaluator, PublicPolicyRun,
-    PublicPolicyRunResult, PublicProjection, ReviewRunIdGenerator,
+    AssetDeliveryConfig, AssetProgramCheck, AssetReviewEvaluator, AssetReviewRunIdGenerator,
+    AssetReviewRunStore, AssetReviewWorkflow, AssetReviewWorkflowInput, AssetReviewWorkflowResult,
+    AssetReviewer, AssetSanitizer, CandidateAssetSet, DeliveryProjectionStore, EffectiveReviewSet,
+    FinalPublicationSet, HumanReviewRecord, HumanReviewStore, HumanReviewSubject, ManagedRoot,
+    MarkdownReviewEvaluator, PublicPolicyRun, PublicPolicyRunResult, PublicProjection,
+    ReviewRunIdGenerator,
 };
 
 /// Caller-selected, durable human decisions.  The application never discovers
@@ -59,6 +60,9 @@ pub struct PublicationApplicationRequest<'a> {
     pub target: GitRefTarget,
     pub commit_metadata: &'a GitCommitMetadata,
     pub human_reviews: ExplicitHumanReviewSelection,
+    /// Where delivered binary assets will be served from. This is a frozen
+    /// input: the application never reads configuration or the environment.
+    pub asset_delivery: &'a AssetDeliveryConfig,
 }
 
 #[derive(Clone, Debug)]
@@ -158,7 +162,7 @@ impl Error for PublicationApplicationError {
 pub struct PublicationApplication;
 impl PublicationApplication {
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
-    pub fn run<R, AR, D, A, H, P, O, DI, AI, PI, OI, B>(
+    pub fn run<R, AR, D, A, H, P, DP, O, DI, AI, PI, OI, B>(
         request: PublicationApplicationRequest<'_>,
         content_store: &B,
         markdown_reviewer: &R,
@@ -167,6 +171,7 @@ impl PublicationApplication {
         asset_runs: &A,
         human_store: &H,
         publish_runs: &P,
+        delivery_projections: &DP,
         observations: &O,
         document_ids: &mut DI,
         asset_ids: &mut AI,
@@ -183,6 +188,7 @@ impl PublicationApplication {
         A: AssetReviewRunStore + ?Sized,
         H: HumanReviewStore + ?Sized,
         P: PublishRunStore,
+        DP: DeliveryProjectionStore,
         O: RemoteObservationStore,
         DI: ReviewRunIdGenerator + ?Sized,
         AI: AssetReviewRunIdGenerator + ?Sized,
@@ -193,6 +199,7 @@ impl PublicationApplication {
         A::Error: 'static,
         H::Error: 'static,
         P::Error: 'static,
+        DP::Error: 'static,
         O::Error: 'static,
         DI::Error: 'static,
         AI::Error: 'static,
@@ -286,12 +293,15 @@ impl PublicationApplication {
         .map_err(|e| stage("public projection", e))?;
         let publication = GitPublicationApplication::prepare_and_publish(
             &projection,
+            request.snapshot,
+            request.asset_delivery,
             request.repository,
             request.target_id,
             request.target,
             request.commit_metadata,
             content_store,
             publish_runs,
+            delivery_projections,
             observations,
             publish_ids,
             observation_ids,

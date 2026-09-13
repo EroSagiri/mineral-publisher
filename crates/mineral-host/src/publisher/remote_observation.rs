@@ -96,7 +96,9 @@ mod tests {
             PublishRun::rehydrate(
                 PublishRunId::new(1).unwrap(),
                 SnapshotId::new(1).unwrap(),
-                Sha256::new([1; 32]),
+                Some(Sha256::new([1; 32])),
+                None,
+                None,
                 ManagedRoot::new("content").unwrap(),
                 PublishTargetId::new(format!("origin:{destination_ref}")).unwrap(),
                 GitRepositoryIdentity::new(&self.local)

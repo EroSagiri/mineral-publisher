@@ -9,7 +9,8 @@ use std::{
 use crate::{
     ports::{BlobStore, ContentStoreError},
     workflow::{
-        CurrentTargetEntry, CurrentTargetState, ManagedRoot, PublicProjection, PublicationFileMode,
+        CurrentTargetEntry, CurrentTargetState, ManagedRoot, PublicationFileMode, TextProjection,
+        TextProjectionFile,
     },
 };
 
@@ -17,7 +18,7 @@ use super::{GitCurrentTargetAdapter, GitCurrentTargetError, ReviewedGitTree};
 
 static NEXT_TEMPORARY_INDEX: AtomicU64 = AtomicU64::new(1);
 
-/// Materializes a complete `PublicProjection` into a detached, isolated Git index.
+/// Materializes the delivery text side into a detached, isolated Git index.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct GitProjectionMaterializer;
 
@@ -25,25 +26,22 @@ impl GitProjectionMaterializer {
     pub fn materialize<B: BlobStore>(
         repository: impl AsRef<Path>,
         base_commit: &str,
-        projection: &PublicProjection,
+        text: &TextProjection,
         content_store: &B,
     ) -> Result<ReviewedGitTree, GitProjectionMaterializationError> {
         let repository = repository.as_ref();
 
         // Resolve exactly once. Every later command is pinned to this object ID.
-        let current = GitCurrentTargetAdapter::read(
-            repository,
-            base_commit,
-            projection.managed_root().clone(),
-        )
-        .map_err(GitProjectionMaterializationError::BaseCommit)?;
+        let current =
+            GitCurrentTargetAdapter::read(repository, base_commit, text.managed_root().clone())
+                .map_err(GitProjectionMaterializationError::BaseCommit)?;
         let base_commit = current.base_commit().to_owned();
         let base_tree_oid = resolve_tree(repository, &base_commit)?;
 
         // Verify every desired CAS object before mutating even the repository's
         // unreachable object set or creating the temporary index.
-        let blobs = projection
-            .entries()
+        let blobs = text
+            .files()
             .iter()
             .map(|entry| {
                 content_store
@@ -62,7 +60,7 @@ impl GitProjectionMaterializer {
             &temporary_index.index_path,
             &base_commit,
             &base_tree_oid,
-            projection,
+            text,
             &blobs,
         );
         match (operation, temporary_index.cleanup()) {
@@ -84,8 +82,8 @@ fn materialize_with_index(
     index_path: &Path,
     base_commit: &str,
     base_tree_oid: &str,
-    projection: &PublicProjection,
-    blobs: &[(&crate::workflow::ProjectionEntry, Vec<u8>)],
+    text: &TextProjection,
+    blobs: &[(&TextProjectionFile, Vec<u8>)],
 ) -> Result<ReviewedGitTree, GitProjectionMaterializationError> {
     git_with_index(
         repository,
@@ -95,7 +93,7 @@ fn materialize_with_index(
         None,
     )?;
 
-    let tracked = if projection.managed_root().is_repository_root() {
+    let tracked = if text.managed_root().is_repository_root() {
         git_with_index(
             repository,
             index_path,
@@ -112,7 +110,7 @@ fn materialize_with_index(
                 "ls-files",
                 "-z",
                 "--",
-                &literal_pathspec(projection.managed_root()),
+                &literal_pathspec(text.managed_root()),
             ],
             None,
         )?
@@ -165,36 +163,30 @@ fn materialize_with_index(
     })?;
     let tree_oid = parse_object_id(&output.stdout, "write candidate tree")?;
 
-    verify_projection(repository, &tree_oid, projection)?;
-    verify_outside_managed_root(
-        repository,
-        base_tree_oid,
-        &tree_oid,
-        projection.managed_root(),
-    )?;
+    verify_text_tree(repository, &tree_oid, text)?;
+    verify_outside_managed_root(repository, base_tree_oid, &tree_oid, text.managed_root())?;
 
     Ok(ReviewedGitTree::from_parts(
         base_commit,
         base_tree_oid,
-        projection.projection_sha256(),
-        projection.snapshot_id(),
+        text.projection_sha256(),
+        text.snapshot_id(),
         tree_oid,
-        projection.managed_root().clone(),
+        text.managed_root().clone(),
     ))
 }
 
-fn verify_projection(
+fn verify_text_tree(
     repository: &Path,
     tree_oid: &str,
-    projection: &PublicProjection,
+    text: &TextProjection,
 ) -> Result<(), GitProjectionMaterializationError> {
     let actual =
-        GitCurrentTargetAdapter::read_tree(repository, tree_oid, projection.managed_root().clone())
+        GitCurrentTargetAdapter::read_tree(repository, tree_oid, text.managed_root().clone())
             .map_err(GitProjectionMaterializationError::CandidateTreeRead)?;
     let expected = CurrentTargetState::new(
-        projection.managed_root().clone(),
-        projection
-            .entries()
+        text.managed_root().clone(),
+        text.files()
             .iter()
             .map(|entry| {
                 CurrentTargetEntry::with_mode(
@@ -205,7 +197,7 @@ fn verify_projection(
             })
             .collect(),
     )
-    .expect("PublicProjection already enforces managed paths and uniqueness");
+    .expect("TextProjection already enforces managed paths and uniqueness");
     if actual != expected {
         return Err(GitProjectionMaterializationError::ProjectionTreeMismatch);
     }
@@ -557,12 +549,11 @@ impl Error for GitProjectionMaterializationError {
 
 #[cfg(test)]
 mod tests {
-    use std::time::SystemTime;
 
     use crate::{
-        domain::{ContentPath, Snapshot, SnapshotFile, SnapshotId, SourceId},
+        domain::{ContentPath, Sha256, SnapshotId},
         storage::LocalContentStore,
-        workflow::{FinalPublicationSet, PublishOperation, PublishPlan},
+        workflow::{PublishOperation, PublishPlan},
     };
 
     use super::*;
@@ -661,7 +652,9 @@ mod tests {
         ManagedRoot::new("content").unwrap()
     }
 
-    fn projection(repository: &TestRepository, entries: &[(&str, &[u8])]) -> PublicProjection {
+    /// The materializer's only input is the delivery text side, so these tests
+    /// hand it exact bytes identities directly.
+    fn projection(repository: &TestRepository, entries: &[(&str, &[u8])]) -> TextProjection {
         projection_at(repository, entries, root())
     }
 
@@ -669,41 +662,26 @@ mod tests {
         repository: &TestRepository,
         entries: &[(&str, &[u8])],
         managed_root: ManagedRoot,
-    ) -> PublicProjection {
+    ) -> TextProjection {
         let files = entries
             .iter()
             .map(|(path, bytes)| {
                 let sha256 = repository.store.store(bytes).unwrap();
-                SnapshotFile::new(
-                    ContentPath::new(*path).unwrap(),
-                    bytes.len() as u64,
-                    sha256,
-                    None,
-                )
+                (ContentPath::new(*path).unwrap(), sha256)
             })
             .collect::<Vec<_>>();
-        let snapshot = Snapshot::new(
+        TextProjection::from_parts_for_test(
             SnapshotId::new(7).unwrap(),
-            SystemTime::UNIX_EPOCH,
-            SourceId::new("test").unwrap(),
+            managed_root,
+            Sha256::new([0; 32]),
             files,
         )
-        .unwrap();
-        let set = FinalPublicationSet::from_parts_for_test(
-            snapshot.id(),
-            entries
-                .iter()
-                .map(|(path, _)| ContentPath::new(*path).unwrap())
-                .collect(),
-            vec![],
-        );
-        PublicProjection::build(&set, &snapshot, managed_root).unwrap()
     }
 
     fn materialize(
         repository: &TestRepository,
         base: &str,
-        projection: &PublicProjection,
+        projection: &TextProjection,
     ) -> ReviewedGitTree {
         GitProjectionMaterializer::materialize(
             &repository.path,
@@ -916,7 +894,7 @@ mod tests {
         repository.write("README.md", b"base");
         let base = repository.commit_all("base");
         let desired = projection(&repository, &[("a.md", b"A")]);
-        let identity = desired.entries()[0].blob_sha256();
+        let identity = desired.files()[0].blob_sha256();
         fs::remove_file(repository.store.root().join(identity.to_string())).unwrap();
         assert!(matches!(
             GitProjectionMaterializer::materialize(

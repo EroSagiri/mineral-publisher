@@ -11,7 +11,7 @@ use crate::{
         ReviewedGitTree,
     },
     publish::{RepositoryLocator, RepositoryLocatorError},
-    workflow::{ManagedRoot, PublicProjection},
+    workflow::{ManagedRoot, TextProjection},
 };
 
 use super::{
@@ -154,15 +154,10 @@ impl<B: BlobStore> GitRepository for GitRepositoryAdapter<B> {
     fn materialize(
         &self,
         base: &GitCommitOid,
-        projection: &PublicProjection,
+        text: &TextProjection,
     ) -> Result<ReviewedGitTree, Self::Error> {
-        GitProjectionMaterializer::materialize(
-            &self.repository,
-            base.as_str(),
-            projection,
-            &self.blobs,
-        )
-        .map_err(GitRepositoryAdapterError::Materialization)
+        GitProjectionMaterializer::materialize(&self.repository, base.as_str(), text, &self.blobs)
+            .map_err(GitRepositoryAdapterError::Materialization)
     }
 
     fn create_commit(&self, spec: &GitCommitSpec) -> Result<GitCommitOid, Self::Error> {

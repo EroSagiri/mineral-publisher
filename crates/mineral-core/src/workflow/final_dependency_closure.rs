@@ -398,8 +398,8 @@ mod tests {
         content::{AnalyzedMarkdown, MarkdownReferenceParser, Resolution, ResolvedReference},
         domain::{SnapshotFile, SourceId},
         workflow::{
-            EffectiveAssetReview, EffectiveDocumentDecision, ImageSanitizationFormat,
-            SanitizationTransformation,
+            AssetContentType, EffectiveAssetReview, EffectiveDocumentDecision,
+            ImageSanitizationFormat, SanitizationTransformation,
         },
     };
 
@@ -497,6 +497,7 @@ mod tests {
             source_sha256,
             published_sha256,
             42,
+            AssetContentType::new("image/png").unwrap(),
             vec![
                 SanitizationTransformation::StripMetadata,
                 SanitizationTransformation::ReencodeImage {

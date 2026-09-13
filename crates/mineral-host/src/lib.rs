@@ -8,6 +8,8 @@
 pub use mineral_core::{content, domain, policy, ports, publication, publish};
 
 #[cfg(test)]
+mod conformance_delivery_projection;
+#[cfg(test)]
 mod conformance_effective_review_set;
 #[cfg(test)]
 mod conformance_git_remote;

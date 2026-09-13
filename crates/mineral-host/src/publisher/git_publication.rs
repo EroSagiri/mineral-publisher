@@ -3,16 +3,23 @@ use std::{error::Error, fmt, path::Path, time::SystemTime};
 use uuid::Uuid;
 
 use crate::{
-    domain::TimestampMillis, ports::BlobStore, runtime::SystemClock, workflow::PublicProjection,
+    domain::{Snapshot, TimestampMillis},
+    ports::BlobStore,
+    runtime::SystemClock,
+    workflow::{
+        AssetDeliveryConfig, DeliveryProjectionBuilder, DeliveryProjectionError,
+        DeliveryProjectionStore, PublicProjection,
+    },
 };
 
 use super::{
-    GitCommitMetadata, GitPublicationExecuteError, GitPublicationExecution, GitPublicationExecutor,
-    GitPublicationPrepareError, GitPublicationPrepareRequest, GitPublicationPreparer, GitRefTarget,
-    GitRemoteAdapter, GitRemoteError, GitRemoteObserver, GitRepositoryAdapter,
-    GitRepositoryAdapterError, GitRepositoryIdentity, GitRepositoryIdentityError, PublishRunId,
-    PublishRunStore, PublishTargetId, RemoteObservationId, RemoteObservationIdGenerator,
-    RemoteObservationStore, RemoteRefState,
+    DeliveryProjectionBinding, GitCommitMetadata, GitPublicationExecuteError,
+    GitPublicationExecution, GitPublicationExecutor, GitPublicationPrepareError,
+    GitPublicationPrepareRequest, GitPublicationPreparer, GitRefTarget, GitRemoteAdapter,
+    GitRemoteError, GitRemoteObserver, GitRepositoryAdapter, GitRepositoryAdapterError,
+    GitRepositoryIdentity, GitRepositoryIdentityError, PublishRunId, PublishRunStore,
+    PublishTargetId, RemoteObservationId, RemoteObservationIdGenerator, RemoteObservationStore,
+    RemoteRefState,
 };
 
 /// Allocates immutable publication-attempt identities at the application boundary.
@@ -175,6 +182,7 @@ pub struct GitPublicationApplication;
 pub struct GitPublicationApplicationResult {
     publish_run_id: PublishRunId,
     projection_sha256: crate::domain::Sha256,
+    delivery_sha256: crate::domain::Sha256,
     publish_plan_sha256: crate::domain::Sha256,
     workflow: GitPublicationExecution,
 }
@@ -184,8 +192,15 @@ impl GitPublicationApplicationResult {
         self.publish_run_id
     }
 
+    /// The logical public projection this attempt delivered.
     pub fn projection_sha256(&self) -> crate::domain::Sha256 {
         self.projection_sha256
+    }
+
+    /// The complete delivery decision: which documents, with which rewritten
+    /// bytes, and where every referenced asset will physically live.
+    pub fn delivery_sha256(&self) -> crate::domain::Sha256 {
+        self.delivery_sha256
     }
 
     pub fn publish_plan_sha256(&self) -> crate::domain::Sha256 {
@@ -198,15 +213,19 @@ impl GitPublicationApplicationResult {
 }
 
 #[derive(Debug)]
-pub enum GitPublicationApplicationError<P: Error, O: Error, R: Error, I: Error> {
+pub enum GitPublicationApplicationError<P: Error, D: Error, O: Error, R: Error, I: Error> {
     RepositoryIdentity(GitRepositoryIdentityError),
     PreparationObservation(GitRemoteError),
     TargetMissing,
     RepositoryAdapter(GitRepositoryAdapterError),
     SystemClockUnavailable,
     PublishRunId(R),
+    /// The delivery stage refused to derive a publishable text tree.
+    Delivery(DeliveryProjectionError),
     /// The portable prepare stage refused the facts the runtime supplied.
     Prepare(GitPublicationPrepareError<GitRepositoryAdapterError>),
+    /// The delivery intent could not be made durable before anything else happened.
+    DeliveryPersistence(D),
     PublishRunPersistence(P),
     /// Recovery could not read the intent it was asked to continue.
     PublishRunLoad(P),
@@ -214,11 +233,11 @@ pub enum GitPublicationApplicationError<P: Error, O: Error, R: Error, I: Error> 
     PublishRunMissing(PublishRunId),
     /// Binding the native adapters failed.
     RemoteAdapter(GitRemoteError),
-    Workflow(GitPublicationExecuteError<P, O, I, GitRepositoryAdapterError, GitRemoteError>),
+    Workflow(GitPublicationExecuteError<P, D, O, I, GitRepositoryAdapterError, GitRemoteError>),
 }
 
-impl<P: Error, O: Error, R: Error, I: Error> fmt::Display
-    for GitPublicationApplicationError<P, O, R, I>
+impl<P: Error, D: Error, O: Error, R: Error, I: Error> fmt::Display
+    for GitPublicationApplicationError<P, D, O, R, I>
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -243,11 +262,20 @@ impl<P: Error, O: Error, R: Error, I: Error> fmt::Display
                 formatter.write_str("system clock reading cannot be frozen as a commit timestamp")
             }
             Self::PublishRunId(_) => formatter.write_str("could not allocate publish run ID"),
+            Self::Delivery(error) => {
+                write!(
+                    formatter,
+                    "could not build the delivery projection: {error}"
+                )
+            }
             Self::Prepare(error) => {
                 write!(
                     formatter,
                     "could not prepare the publication intent: {error}"
                 )
+            }
+            Self::DeliveryPersistence(_) => {
+                formatter.write_str("could not persist the delivery projection before publication")
             }
             Self::PublishRunPersistence(_) => {
                 formatter.write_str("could not persist publish run before publication")
@@ -261,8 +289,13 @@ impl<P: Error, O: Error, R: Error, I: Error> fmt::Display
     }
 }
 
-impl<P: Error + 'static, O: Error + 'static, R: Error + 'static, I: Error + 'static> Error
-    for GitPublicationApplicationError<P, O, R, I>
+impl<
+    P: Error + 'static,
+    D: Error + 'static,
+    O: Error + 'static,
+    R: Error + 'static,
+    I: Error + 'static,
+> Error for GitPublicationApplicationError<P, D, O, R, I>
 {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
@@ -271,7 +304,9 @@ impl<P: Error + 'static, O: Error + 'static, R: Error + 'static, I: Error + 'sta
             Self::RepositoryAdapter(error) => Some(error),
             Self::RemoteAdapter(error) => Some(error),
             Self::PublishRunId(error) => Some(error),
+            Self::Delivery(error) => Some(error),
             Self::Prepare(error) => Some(error),
+            Self::DeliveryPersistence(error) => Some(error),
             Self::PublishRunPersistence(error) => Some(error),
             Self::PublishRunLoad(error) => Some(error),
             Self::Workflow(error) => Some(error),
@@ -282,23 +317,27 @@ impl<P: Error + 'static, O: Error + 'static, R: Error + 'static, I: Error + 'sta
 
 impl GitPublicationApplication {
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
-    pub fn prepare_and_publish<P, O, R, I, B>(
+    pub fn prepare_and_publish<P, D, O, R, I, B>(
         projection: &PublicProjection,
+        snapshot: &Snapshot,
+        delivery_config: &AssetDeliveryConfig,
         repository: impl AsRef<Path>,
         target_id: PublishTargetId,
         target: GitRefTarget,
         commit_metadata: &GitCommitMetadata,
         content_store: &B,
         publish_run_store: &P,
+        delivery_projections: &D,
         observation_store: &O,
         publish_run_ids: &mut R,
         observation_ids: &mut I,
     ) -> Result<
         GitPublicationApplicationResult,
-        GitPublicationApplicationError<P::Error, O::Error, R::Error, I::Error>,
+        GitPublicationApplicationError<P::Error, D::Error, O::Error, R::Error, I::Error>,
     >
     where
         P: PublishRunStore,
+        D: DeliveryProjectionStore,
         O: RemoteObservationStore,
         R: PublishRunIdGenerator,
         I: RemoteObservationIdGenerator,
@@ -313,6 +352,21 @@ impl GitPublicationApplication {
         let RemoteRefState::Present { commit_oid } = observed else {
             return Err(GitPublicationApplicationError::TargetMissing);
         };
+        // The delivery split happens before any Git fact is read: the runtime is
+        // handed the final text side, so binary assets and reference rewriting are
+        // decided in the engine rather than by the Git adapter.
+        let delivery =
+            DeliveryProjectionBuilder::build(projection, snapshot, delivery_config, content_store)
+                .map_err(GitPublicationApplicationError::Delivery)?;
+        // Durable before any Git object is written and long before any remote is
+        // touched: recovery may only ever rematerialize the projection the intent
+        // bound, so that projection has to exist first. An orphan projection whose
+        // run never gets saved is harmless — it is content-addressed and describes
+        // an intent nothing acted on.
+        delivery_projections
+            .save(&delivery)
+            .map_err(GitPublicationApplicationError::DeliveryPersistence)?;
+        let delivery_binding = DeliveryProjectionBinding::from_projection(&delivery);
         let git_repository =
             GitRepositoryAdapter::from_locator(repository.locator(), content_store)
                 .map_err(GitPublicationApplicationError::RepositoryAdapter)?;
@@ -337,7 +391,8 @@ impl GitPublicationApplication {
                 target_id: &target_id,
                 repository: repository.locator(),
                 target: &target,
-                projection,
+                text_projection: delivery.text(),
+                delivery: delivery_binding,
                 observed_base: &commit_oid,
                 author_name: commit_metadata.author_name(),
                 author_email: commit_metadata.author_email(),
@@ -356,6 +411,7 @@ impl GitPublicationApplication {
         let workflow = GitPublicationExecutor::execute(
             publish_run_id,
             publish_run_store,
+            delivery_projections,
             observation_store,
             observation_ids,
             &git_repository,
@@ -366,6 +422,7 @@ impl GitPublicationApplication {
         Ok(GitPublicationApplicationResult {
             publish_run_id,
             projection_sha256: projection.projection_sha256(),
+            delivery_sha256: delivery.delivery_sha256(),
             publish_plan_sha256,
             workflow,
         })
@@ -379,18 +436,26 @@ impl GitPublicationApplication {
     /// is reloaded by the executor, which is the only reader that decides what to
     /// publish.
     #[allow(clippy::type_complexity, clippy::too_many_arguments)]
-    pub fn resume<P, O, I, B>(
+    pub fn resume<P, D, O, I, B>(
         publish_run_id: PublishRunId,
         publish_run_store: &P,
+        delivery_projections: &D,
         observation_store: &O,
         observation_ids: &mut I,
         content_store: &B,
     ) -> Result<
         GitPublicationExecution,
-        GitPublicationApplicationError<P::Error, O::Error, std::convert::Infallible, I::Error>,
+        GitPublicationApplicationError<
+            P::Error,
+            D::Error,
+            O::Error,
+            std::convert::Infallible,
+            I::Error,
+        >,
     >
     where
         P: PublishRunStore,
+        D: DeliveryProjectionStore,
         O: RemoteObservationStore,
         I: RemoteObservationIdGenerator,
         B: BlobStore,
@@ -412,6 +477,7 @@ impl GitPublicationApplication {
         GitPublicationExecutor::execute(
             publish_run_id,
             publish_run_store,
+            delivery_projections,
             observation_store,
             observation_ids,
             &git_repository,
@@ -440,8 +506,10 @@ mod tests {
             GitCommitObjectCreator, PublishRun, PublishRunPublication,
             SequentialRemoteObservationIdGenerator,
         },
-        storage::{SqlitePublishRunStore, SqliteRemoteObservationStore},
-        workflow::{FinalPublicationSet, ManagedRoot, PublicProjection},
+        storage::{
+            SqliteDeliveryProjectionStore, SqlitePublishRunStore, SqliteRemoteObservationStore,
+        },
+        workflow::{DeliveryProjectionBuilder, FinalPublicationSet, ManagedRoot, PublicProjection},
     };
 
     use super::*;
@@ -489,18 +557,19 @@ mod tests {
                 .to_owned()
         }
 
-        fn projection(&self, store: &LocalContentStore) -> PublicProjection {
+        fn projection(&self, store: &LocalContentStore) -> (Snapshot, PublicProjection) {
             self.projection_of(store, &[("note.md", b"new public content")])
         }
 
         /// Builds the complete desired state for an explicit set of documents, so
         /// a projection can also be made identical to what the remote already
-        /// holds.
+        /// holds. The snapshot travels with it because the delivery stage resolves
+        /// document references against that immutable source state.
         fn projection_of(
             &self,
             store: &LocalContentStore,
             entries: &[(&str, &[u8])],
-        ) -> PublicProjection {
+        ) -> (Snapshot, PublicProjection) {
             let files = entries
                 .iter()
                 .map(|(path, bytes)| {
@@ -528,7 +597,10 @@ mod tests {
                     .collect(),
                 vec![],
             );
-            PublicProjection::build(&set, &snapshot, ManagedRoot::new("content").unwrap()).unwrap()
+            let projection =
+                PublicProjection::build(&set, &snapshot, ManagedRoot::new("content").unwrap())
+                    .unwrap();
+            (snapshot, projection)
         }
     }
 
@@ -579,6 +651,10 @@ mod tests {
         PublishTargetId::new("origin:refs/heads/main").unwrap()
     }
 
+    fn delivery_config() -> AssetDeliveryConfig {
+        AssetDeliveryConfig::new("https://assets.example.com").unwrap()
+    }
+
     #[derive(Debug)]
     struct SaveFailure;
     impl fmt::Display for SaveFailure {
@@ -587,6 +663,25 @@ mod tests {
         }
     }
     impl Error for SaveFailure {}
+
+    /// A delivery projection store that refuses every write, so the ordering
+    /// between durable delivery intent and any remote effect can be pinned.
+    struct RejectingDeliveryProjectionStore;
+
+    impl crate::workflow::DeliveryProjectionStore for RejectingDeliveryProjectionStore {
+        type Error = SaveFailure;
+
+        fn save(&self, _: &crate::workflow::DeliveryProjection) -> Result<(), Self::Error> {
+            Err(SaveFailure)
+        }
+
+        fn get(
+            &self,
+            _: crate::domain::Sha256,
+        ) -> Result<Option<crate::workflow::DeliveryProjection>, Self::Error> {
+            Ok(None)
+        }
+    }
 
     struct RejectingPublishRunStore;
     impl PublishRunStore for RejectingPublishRunStore {
@@ -675,22 +770,27 @@ mod tests {
     fn missing_remote_target_stops_before_preparation_or_persistence() {
         let repository = TestRepository::new();
         let store = LocalContentStore::new(repository.root.join("content-store"));
-        let projection = repository.projection(&store);
+        let (snapshot, projection) = repository.projection(&store);
         let runs = MemoryPublishRunStore::default();
         let observations =
             SqliteRemoteObservationStore::open(repository.root.join("obs.sqlite")).unwrap();
+        let deliveries =
+            SqliteDeliveryProjectionStore::open(repository.root.join("deliveries.sqlite")).unwrap();
         let mut run_ids = SequentialPublishRunIdGenerator::new(PublishRunId::new(1).unwrap());
         let mut observation_ids =
             SequentialRemoteObservationIdGenerator::new(RemoteObservationId::new(1).unwrap());
 
         let result = GitPublicationApplication::prepare_and_publish(
             &projection,
+            &snapshot,
+            &delivery_config(),
             &repository.local,
             target_id(),
             GitRefTarget::new("origin", "refs/heads/missing").unwrap(),
             &metadata(),
             &store,
             &runs,
+            &deliveries,
             &observations,
             &mut run_ids,
             &mut observation_ids,
@@ -706,26 +806,77 @@ mod tests {
         );
     }
 
+    /// §9: the delivery intent must be durable before anything else can happen, so
+    /// a store that cannot capture it stops the attempt with zero remote effects.
     #[test]
-    fn persistence_failure_prevents_any_remote_push() {
+    fn delivery_persistence_failure_prevents_any_publication() {
         let repository = TestRepository::new();
         let before = repository.remote_oid();
         let store = LocalContentStore::new(repository.root.join("content-store"));
-        let projection = repository.projection(&store);
+        let (snapshot, projection) = repository.projection(&store);
+        let runs = SqlitePublishRunStore::open(repository.root.join("runs.sqlite")).unwrap();
         let observations =
             SqliteRemoteObservationStore::open(repository.root.join("obs.sqlite")).unwrap();
+        let deliveries =
+            SqliteDeliveryProjectionStore::open(repository.root.join("deliveries.sqlite")).unwrap();
         let mut run_ids = SequentialPublishRunIdGenerator::new(PublishRunId::new(1).unwrap());
         let mut observation_ids =
             SequentialRemoteObservationIdGenerator::new(RemoteObservationId::new(1).unwrap());
 
         let result = GitPublicationApplication::prepare_and_publish(
             &projection,
+            &snapshot,
+            &delivery_config(),
+            &repository.local,
+            target_id(),
+            target(),
+            &metadata(),
+            &store,
+            &runs,
+            &RejectingDeliveryProjectionStore,
+            &observations,
+            &mut run_ids,
+            &mut observation_ids,
+        );
+
+        assert!(matches!(
+            result,
+            Err(GitPublicationApplicationError::DeliveryPersistence(_))
+        ));
+        assert_eq!(repository.remote_oid(), before);
+        assert!(runs.list().unwrap().is_empty());
+        // Nothing was captured, because the delivery stage refused first.
+        let expected =
+            DeliveryProjectionBuilder::build(&projection, &snapshot, &delivery_config(), &store)
+                .unwrap();
+        assert_eq!(deliveries.get(expected.delivery_sha256()).unwrap(), None);
+    }
+
+    #[test]
+    fn persistence_failure_prevents_any_remote_push() {
+        let repository = TestRepository::new();
+        let before = repository.remote_oid();
+        let store = LocalContentStore::new(repository.root.join("content-store"));
+        let (snapshot, projection) = repository.projection(&store);
+        let observations =
+            SqliteRemoteObservationStore::open(repository.root.join("obs.sqlite")).unwrap();
+        let deliveries =
+            SqliteDeliveryProjectionStore::open(repository.root.join("deliveries.sqlite")).unwrap();
+        let mut run_ids = SequentialPublishRunIdGenerator::new(PublishRunId::new(1).unwrap());
+        let mut observation_ids =
+            SequentialRemoteObservationIdGenerator::new(RemoteObservationId::new(1).unwrap());
+
+        let result = GitPublicationApplication::prepare_and_publish(
+            &projection,
+            &snapshot,
+            &delivery_config(),
             &repository.local,
             target_id(),
             target(),
             &metadata(),
             &store,
             &RejectingPublishRunStore,
+            &deliveries,
             &observations,
             &mut run_ids,
             &mut observation_ids,
@@ -736,31 +887,46 @@ mod tests {
             Err(GitPublicationApplicationError::PublishRunPersistence(_))
         ));
         assert_eq!(repository.remote_oid(), before);
+        // The delivery intent was made durable first and is now an orphan: that is
+        // explicitly allowed, because a content-addressed projection nothing acted
+        // on does not constitute a publication.
+        let expected =
+            DeliveryProjectionBuilder::build(&projection, &snapshot, &delivery_config(), &store)
+                .unwrap();
+        assert_eq!(
+            deliveries.get(expected.delivery_sha256()).unwrap(),
+            Some(expected)
+        );
     }
 
     #[test]
     fn remote_advance_after_preparation_is_reconciled_without_an_overwrite() {
         let repository = TestRepository::new();
         let store = LocalContentStore::new(repository.root.join("content-store"));
-        let projection = repository.projection(&store);
+        let (snapshot, projection) = repository.projection(&store);
         let runs = AdvancingPublishRunStore {
             inner: SqlitePublishRunStore::open(repository.root.join("runs.sqlite")).unwrap(),
             repository: repository.local.clone(),
         };
         let observations =
             SqliteRemoteObservationStore::open(repository.root.join("obs.sqlite")).unwrap();
+        let deliveries =
+            SqliteDeliveryProjectionStore::open(repository.root.join("deliveries.sqlite")).unwrap();
         let mut run_ids = SequentialPublishRunIdGenerator::new(PublishRunId::new(1).unwrap());
         let mut observation_ids =
             SequentialRemoteObservationIdGenerator::new(RemoteObservationId::new(1).unwrap());
 
         let result = GitPublicationApplication::prepare_and_publish(
             &projection,
+            &snapshot,
+            &delivery_config(),
             &repository.local,
             target_id(),
             target(),
             &metadata(),
             &store,
             &runs,
+            &deliveries,
             &observations,
             &mut run_ids,
             &mut observation_ids,
@@ -789,23 +955,28 @@ mod tests {
         let repository = TestRepository::new();
         fs::write(repository.local.join("unrelated-dirty-file"), b"ignored").unwrap();
         let store = LocalContentStore::new(repository.root.join("content-store"));
-        let projection = repository.projection(&store);
+        let (snapshot, projection) = repository.projection(&store);
         let run_db = repository.root.join("runs.sqlite");
         let observation_db = repository.root.join("observations.sqlite");
         let runs = SqlitePublishRunStore::open(&run_db).unwrap();
         let observations = SqliteRemoteObservationStore::open(&observation_db).unwrap();
+        let deliveries =
+            SqliteDeliveryProjectionStore::open(repository.root.join("deliveries.sqlite")).unwrap();
         let mut run_ids = SequentialPublishRunIdGenerator::new(PublishRunId::new(1).unwrap());
         let mut observation_ids =
             SequentialRemoteObservationIdGenerator::new(RemoteObservationId::new(1).unwrap());
 
         let result = GitPublicationApplication::prepare_and_publish(
             &projection,
+            &snapshot,
+            &delivery_config(),
             &repository.local,
             target_id(),
             target(),
             &metadata(),
             &store,
             &runs,
+            &deliveries,
             &observations,
             &mut run_ids,
             &mut observation_ids,
@@ -825,11 +996,14 @@ mod tests {
 
         let runs = SqlitePublishRunStore::open(&run_db).unwrap();
         let observations = SqliteRemoteObservationStore::open(&observation_db).unwrap();
+        let deliveries =
+            SqliteDeliveryProjectionStore::open(repository.root.join("deliveries.sqlite")).unwrap();
         let mut recovery_ids =
             SequentialRemoteObservationIdGenerator::new(RemoteObservationId::new(3).unwrap());
         let recovered = GitPublicationApplication::resume(
             result.publish_run_id(),
             &runs,
+            &deliveries,
             &observations,
             &mut recovery_ids,
             &store,
@@ -849,24 +1023,29 @@ mod tests {
     fn a_published_run_persists_the_exact_specification_that_created_its_commit() {
         let repository = TestRepository::new();
         let store = LocalContentStore::new(repository.root.join("content-store"));
-        let projection = repository.projection(&store);
+        let (snapshot, projection) = repository.projection(&store);
         let run_db = repository.root.join("runs.sqlite");
         let runs = SqlitePublishRunStore::open(&run_db).unwrap();
         let observations =
             SqliteRemoteObservationStore::open(repository.root.join("observations.sqlite"))
                 .unwrap();
+        let deliveries =
+            SqliteDeliveryProjectionStore::open(repository.root.join("deliveries.sqlite")).unwrap();
         let mut run_ids = SequentialPublishRunIdGenerator::new(PublishRunId::new(1).unwrap());
         let mut observation_ids =
             SequentialRemoteObservationIdGenerator::new(RemoteObservationId::new(1).unwrap());
 
         let result = GitPublicationApplication::prepare_and_publish(
             &projection,
+            &snapshot,
+            &delivery_config(),
             &repository.local,
             target_id(),
             target(),
             &metadata(),
             &store,
             &runs,
+            &deliveries,
             &observations,
             &mut run_ids,
             &mut observation_ids,
@@ -913,24 +1092,29 @@ mod tests {
         let before = repository.remote_oid();
         let store = LocalContentStore::new(repository.root.join("content-store"));
         // The complete desired state already equals what the target holds.
-        let projection = repository.projection_of(&store, &[("old.md", b"old")]);
+        let (snapshot, projection) = repository.projection_of(&store, &[("old.md", b"old")]);
         let run_db = repository.root.join("runs.sqlite");
         let runs = SqlitePublishRunStore::open(&run_db).unwrap();
         let observations =
             SqliteRemoteObservationStore::open(repository.root.join("observations.sqlite"))
                 .unwrap();
+        let deliveries =
+            SqliteDeliveryProjectionStore::open(repository.root.join("deliveries.sqlite")).unwrap();
         let mut run_ids = SequentialPublishRunIdGenerator::new(PublishRunId::new(1).unwrap());
         let mut observation_ids =
             SequentialRemoteObservationIdGenerator::new(RemoteObservationId::new(1).unwrap());
 
         let result = GitPublicationApplication::prepare_and_publish(
             &projection,
+            &snapshot,
+            &delivery_config(),
             &repository.local,
             target_id(),
             target(),
             &metadata(),
             &store,
             &runs,
+            &deliveries,
             &observations,
             &mut run_ids,
             &mut observation_ids,
