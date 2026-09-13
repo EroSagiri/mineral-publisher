@@ -95,7 +95,7 @@ impl FilesystemObjectStore {
             || existing.len() as u64 != asset.published_size()
         {
             return Err(FilesystemObjectStoreError::ConflictingObject {
-                object_key: asset.object_key().clone(),
+                object_key: Box::new(asset.object_key().clone()),
                 expected_sha256: asset.published_sha256(),
                 expected_size: asset.published_size(),
                 observed_sha256: existing_sha256,
@@ -339,7 +339,9 @@ pub enum FilesystemObjectStoreError {
     },
     /// The frozen key already holds different bytes.
     ConflictingObject {
-        object_key: AssetObjectKey,
+        /// Boxed because a key is the largest fact this error carries and every
+        /// early return of the store would otherwise pay for it.
+        object_key: Box<AssetObjectKey>,
         expected_sha256: Sha256,
         expected_size: u64,
         observed_sha256: Sha256,
@@ -588,14 +590,25 @@ mod tests {
     #[test]
     fn a_wrong_content_type_under_the_frozen_key_is_a_conflict() {
         let fixture = TestStore::new();
-        let frozen = asset("img/photo.png", b"published bytes", "image/jpeg");
+        // The key names these exact bytes under this exact filename; the media type
+        // is the third frozen fact, and a stored sidecar that disagrees with it is
+        // corruption rather than something to rewrite.
+        let frozen = asset("img/photo.png", b"published bytes", "image/png");
         fixture.write(&frozen, b"published bytes");
-        let other = asset("img/photo.png", b"published bytes", "image/png");
+        fs::write(
+            fixture.metadata_path(&frozen),
+            b"{\"content_type\":\"image/jpeg\"}",
+        )
+        .unwrap();
 
         assert!(matches!(
-            fixture.store.open_writer(&other),
+            fixture.store.open_writer(&frozen),
             Err(FilesystemObjectStoreError::ConflictingObjectMetadata { .. })
         ));
+        assert_eq!(
+            fs::read(fixture.object_path(&frozen)).unwrap(),
+            b"published bytes"
+        );
     }
 
     #[test]

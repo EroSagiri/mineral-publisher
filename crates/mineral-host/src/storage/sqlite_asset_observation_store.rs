@@ -492,6 +492,77 @@ mod tests {
         );
     }
 
+    /// §18.11, host side: an observation written before filename-bearing keys
+    /// existed still loads after a restart.
+    ///
+    /// The durable asset-observation trail stores the object key as text, and both
+    /// canonical shapes remain readable: a legacy row must not become unreadable
+    /// just because current publications name a filename too.
+    #[test]
+    fn an_observation_recorded_under_a_legacy_key_still_loads() {
+        let directory = TestDirectory::new();
+        let database = directory.database();
+        let run = run(1);
+        let current = asset("img/a.png", b"legacy body");
+        let legacy_key = AssetObjectKey::legacy_for_published_sha256(&current.published_sha256());
+        assert!(legacy_key.is_legacy());
+        let legacy = AssetTargetObservation::rehydrate(
+            AssetObservationId::new(9).unwrap(),
+            run.id(),
+            Sha256::new([3; 32]),
+            current.logical_path().clone(),
+            legacy_key,
+            AssetTargetState::Present(AssetTargetFacts::new(
+                current.object_key().clone(),
+                current.published_size(),
+                current.published_content_type().clone(),
+                AssetByteIdentity::Verified(current.published_sha256()),
+            )),
+            12,
+        );
+        // The facts above name the current key, so they cannot be recorded against
+        // the legacy one: an observation never mixes the two schemes.
+        assert!(
+            legacy.is_err(),
+            "an observation must state facts about the key it records"
+        );
+
+        let legacy_key = AssetObjectKey::legacy_for_published_sha256(&current.published_sha256());
+        let legacy = AssetTargetObservation::rehydrate(
+            AssetObservationId::new(9).unwrap(),
+            run.id(),
+            Sha256::new([3; 32]),
+            current.logical_path().clone(),
+            legacy_key.clone(),
+            AssetTargetState::Present(AssetTargetFacts::new(
+                legacy_key.clone(),
+                current.published_size(),
+                current.published_content_type().clone(),
+                AssetByteIdentity::Verified(current.published_sha256()),
+            )),
+            12,
+        )
+        .unwrap();
+        {
+            let store = SqliteAssetObservationStore::open(&database).unwrap();
+            store.save(&legacy).unwrap();
+        }
+
+        let reopened = SqliteAssetObservationStore::open(&database).unwrap();
+        let loaded = reopened.get(legacy.id()).unwrap().unwrap();
+        assert_eq!(loaded, legacy);
+        assert!(loaded.object_key().is_legacy());
+        assert!(loaded.object_key().public_filename().is_none());
+        assert_eq!(
+            reopened
+                .list_for_publish_run(run.id())
+                .unwrap()
+                .first()
+                .map(|observation| observation.object_key().as_str().to_owned()),
+            Some(legacy_key.as_str().to_owned())
+        );
+    }
+
     #[test]
     fn every_observed_shape_round_trips() {
         let directory = TestDirectory::new();

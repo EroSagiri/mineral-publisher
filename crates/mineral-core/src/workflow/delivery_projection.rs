@@ -12,8 +12,9 @@ use crate::{
 };
 
 use super::{
-    AssetContentType, AssetDeliveryConfig, AssetObjectKey, AssetPublicUrl, ManagedRoot,
-    ProjectionEntryKind, ProjectionTargetPath, PublicProjection, PublicationFileMode,
+    AssetContentType, AssetDeliveryConfig, AssetObjectKey, AssetPublicFilename,
+    AssetPublicFilenameError, AssetPublicUrl, ManagedRoot, ProjectionEntryKind,
+    ProjectionTargetPath, PublicProjection, PublicationFileMode,
 };
 
 /// One text publication file, carrying the bytes that must reach the target.
@@ -172,6 +173,12 @@ impl TextProjection {
 
 /// One logical asset that must exist in object storage under a deterministic
 /// identity before the text side may become public.
+///
+/// Three of these fields are frozen *presentation* facts — the public filename,
+/// the object key and the public URL — and they are frozen together precisely
+/// because recovery may never re-derive them: today's filename rules, today's
+/// media-type mapping and today's delivery configuration are not what an old
+/// delivery intent agreed to.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PublishedAsset {
     logical_path: ContentPath,
@@ -179,13 +186,47 @@ pub struct PublishedAsset {
     published_sha256: Sha256,
     published_size: u64,
     published_content_type: AssetContentType,
+    /// `None` only for a durable V1 intent, which predates filename-bearing keys.
+    public_filename: Option<AssetPublicFilename>,
     object_key: AssetObjectKey,
     public_url: AssetPublicUrl,
 }
 
 impl PublishedAsset {
+    /// Builds one asset of the current scheme.
+    ///
+    /// The object key is derived here from the bytes identity and the presentation
+    /// filename, so a caller cannot freeze a filename and a key that disagree.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_parts(
+        logical_path: ContentPath,
+        source_sha256: Sha256,
+        published_sha256: Sha256,
+        published_size: u64,
+        published_content_type: AssetContentType,
+        public_filename: AssetPublicFilename,
+        public_url: AssetPublicUrl,
+    ) -> Self {
+        let object_key = AssetObjectKey::for_published_asset(&published_sha256, &public_filename);
+        Self {
+            logical_path,
+            source_sha256,
+            published_sha256,
+            published_size,
+            published_content_type,
+            public_filename: Some(public_filename),
+            object_key,
+            public_url,
+        }
+    }
+
+    /// Rebuilds one asset of the legacy V1 scheme, for durable recovery only.
+    ///
+    /// The filename is not invented and not derived: V1 froze neither, and a
+    /// historical intent must keep pointing at the exact object it published.
+    /// Every fact is still cross-checked before this is called.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_legacy_parts(
         logical_path: ContentPath,
         source_sha256: Sha256,
         published_sha256: Sha256,
@@ -194,12 +235,17 @@ impl PublishedAsset {
         object_key: AssetObjectKey,
         public_url: AssetPublicUrl,
     ) -> Self {
+        debug_assert!(
+            object_key.is_legacy(),
+            "a legacy asset can only be rebuilt with a legacy key"
+        );
         Self {
             logical_path,
             source_sha256,
             published_sha256,
             published_size,
             published_content_type,
+            public_filename: None,
             object_key,
             public_url,
         }
@@ -228,6 +274,14 @@ impl PublishedAsset {
         &self.published_content_type
     }
 
+    /// The presentation filename the frozen key ends with.
+    ///
+    /// Absent only for a durable V1 intent; every publication since S6.4.1 freezes
+    /// one, and [`Self::object_key`] names it.
+    pub fn public_filename(&self) -> Option<&AssetPublicFilename> {
+        self.public_filename.as_ref()
+    }
+
     pub fn object_key(&self) -> &AssetObjectKey {
         &self.object_key
     }
@@ -245,7 +299,10 @@ impl PublishedAsset {
         published_content_type: AssetContentType,
         config: &AssetDeliveryConfig,
     ) -> Self {
-        let object_key = AssetObjectKey::for_published_sha256(&published_sha256);
+        let public_filename =
+            AssetPublicFilename::from_logical_path(&logical_path, &published_content_type)
+                .expect("test assets use a media type with a known filename extension");
+        let object_key = AssetObjectKey::for_published_asset(&published_sha256, &public_filename);
         let public_url = config.public_url(&object_key);
         Self::from_parts(
             logical_path,
@@ -253,7 +310,7 @@ impl PublishedAsset {
             published_sha256,
             published_size,
             published_content_type,
-            object_key,
+            public_filename,
             public_url,
         )
     }
@@ -508,7 +565,20 @@ impl DeliveryProjectionBuilder {
                         logical_path: entry.source_path().clone(),
                     });
                 };
-                let object_key = AssetObjectKey::for_published_sha256(&published_sha256);
+                // The presentation filename is derived from the logical basename
+                // reconciled with the *published* media type, so a sanitizer that
+                // changed the format cannot leave a filename that describes the
+                // representation it replaced.
+                let public_filename = AssetPublicFilename::from_logical_path(
+                    entry.source_path(),
+                    facts.published_content_type(),
+                )
+                .map_err(|source| DeliveryProjectionError::PublicFilename {
+                    logical_path: entry.source_path().clone(),
+                    source,
+                })?;
+                let object_key =
+                    AssetObjectKey::for_published_asset(&published_sha256, &public_filename);
                 let public_url = config.public_url(&object_key);
                 Ok(PublishedAsset::from_parts(
                     entry.source_path().clone(),
@@ -516,7 +586,7 @@ impl DeliveryProjectionBuilder {
                     published_sha256,
                     facts.published_size(),
                     facts.published_content_type().clone(),
-                    object_key,
+                    public_filename,
                     public_url,
                 ))
             })
@@ -746,6 +816,12 @@ pub enum DeliveryProjectionError {
     AssetPublicationFactsMissing {
         logical_path: ContentPath,
     },
+    /// The published media type has no known canonical filename extension, so no
+    /// truthful presentation filename can be derived for the logical asset.
+    PublicFilename {
+        logical_path: ContentPath,
+        source: AssetPublicFilenameError,
+    },
     AssetReferenceKindNotRewritable {
         document_path: ContentPath,
         kind: ReferenceKind,
@@ -814,6 +890,13 @@ impl fmt::Display for DeliveryProjectionError {
                 formatter,
                 "asset entry carries no publication facts: {logical_path}"
             ),
+            Self::PublicFilename {
+                logical_path,
+                source,
+            } => write!(
+                formatter,
+                "asset entry cannot be given a truthful public filename ({logical_path}): {source}"
+            ),
             Self::AssetReferenceKindNotRewritable {
                 document_path,
                 kind,
@@ -847,6 +930,7 @@ impl Error for DeliveryProjectionError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::BlobRead { source, .. } | Self::BlobWrite { source, .. } => Some(source),
+            Self::PublicFilename { source, .. } => Some(source),
             _ => None,
         }
     }
@@ -1082,11 +1166,25 @@ mod tests {
         }
     }
 
-    fn expected_url(published: Sha256) -> String {
-        config()
-            .public_url(&AssetObjectKey::for_published_sha256(&published))
-            .as_str()
-            .to_owned()
+    /// The URL one fixture asset must be delivered at.
+    ///
+    /// The object key is the pair of the published digest and the presentation
+    /// filename, so the fixture's logical basename is part of the expectation.
+    fn expected_url(logical_path: &str, published: Sha256) -> String {
+        let public_filename =
+            AssetPublicFilename::from_logical_path(&path(logical_path), &media_type("image/png"))
+                .unwrap();
+        let object_key = AssetObjectKey::for_published_asset(&published, &public_filename);
+        config().public_url(&object_key).as_str().to_owned()
+    }
+
+    fn media_type(value: &str) -> AssetContentType {
+        AssetContentType::new(value).unwrap()
+    }
+
+    fn filename_for(logical_path: &str, content_type: &str) -> AssetPublicFilename {
+        AssetPublicFilename::from_logical_path(&path(logical_path), &media_type(content_type))
+            .unwrap()
     }
 
     fn mixed() -> Fixture {
@@ -1136,7 +1234,7 @@ mod tests {
 
         assert_eq!(
             rewritten,
-            format!("# A\n\n![]({})\n", expected_url(digest(2)))
+            format!("# A\n\n![]({})\n", expected_url("img/a.png", digest(2)))
         );
         assert!(!rewritten.contains("![["));
         assert!(rewritten.starts_with("# A\n"));
@@ -1158,7 +1256,7 @@ mod tests {
         );
         let delivery = fixture.build();
 
-        let url = expected_url(digest(2));
+        let url = expected_url("img/a.png", digest(2));
         assert_eq!(
             fixture.delivered(&delivery, "notes/b.md"),
             format!("# B\n\n![]({url})\n")
@@ -1178,7 +1276,10 @@ mod tests {
 
         assert_eq!(
             fixture.delivered(&delivery, "notes/b.md"),
-            format!("# B\n\n[manual]({})\n", expected_url(digest(4)))
+            format!(
+                "# B\n\n[manual]({})\n",
+                expected_url("files/a.pdf", digest(4))
+            )
         );
     }
 
@@ -1337,12 +1438,12 @@ mod tests {
     }
 
     #[test]
-    fn one_physical_object_serves_every_logical_asset_with_identical_published_bytes() {
+    fn identical_bytes_under_one_filename_are_one_object_and_one_url() {
         let fixture = Fixture::new(
-            &[("a.md", "![[one.png]]\n![[two.png]]\n")],
+            &[("a.md", "![[one/photo.png]]\n![[two/photo.png]]\n")],
             &[
-                ("one.png", digest(1), digest(9)),
-                ("two.png", digest(2), digest(9)),
+                ("one/photo.png", digest(1), digest(9)),
+                ("two/photo.png", digest(2), digest(9)),
             ],
         );
 
@@ -1351,11 +1452,81 @@ mod tests {
         assert_eq!(delivery.assets().len(), 2);
         assert_eq!(
             delivery.assets().assets()[0].object_key(),
-            delivery.assets().assets()[1].object_key()
+            delivery.assets().assets()[1].object_key(),
+            "one published blob under one presentation filename is one object"
         );
         assert_eq!(
             delivery.assets().assets()[0].public_url(),
             delivery.assets().assets()[1].public_url()
+        );
+    }
+
+    /// §13: the same published bytes under different filenames are different
+    /// delivery identities, and each one is served from its own object.
+    ///
+    /// Physical deduplication is deliberately traded for a URL path that is the
+    /// object key, needs no router or alias, and gives a client the filename it
+    /// was promised.
+    #[test]
+    fn identical_bytes_under_different_filenames_are_different_objects() {
+        let fixture = Fixture::with_publication(
+            &[("a.md", "![[one/manual.pdf]]\n![[two/guide.pdf]]\n")],
+            &[
+                (
+                    "one/manual.pdf",
+                    digest(1),
+                    digest(9),
+                    10,
+                    "application/pdf",
+                ),
+                ("two/guide.pdf", digest(2), digest(9), 10, "application/pdf"),
+            ],
+        );
+
+        let delivery = fixture.build();
+        let assets = delivery.assets().assets();
+
+        assert_eq!(assets.len(), 2);
+        assert_eq!(
+            assets[0].published_sha256(),
+            assets[1].published_sha256(),
+            "the bytes identity is shared"
+        );
+        assert_ne!(assets[0].public_filename(), assets[1].public_filename());
+        assert_ne!(assets[0].object_key(), assets[1].object_key());
+        assert_ne!(assets[0].public_url(), assets[1].public_url());
+        assert!(assets[0].object_key().as_str().ends_with("/manual.pdf"));
+        assert!(assets[1].object_key().as_str().ends_with("/guide.pdf"));
+    }
+
+    /// §10: renaming a logical asset changes delivery, text and Git identity even
+    /// though not one published byte changed.
+    #[test]
+    fn renaming_an_asset_changes_the_delivery_text_and_git_identity() {
+        let before = Fixture::new(
+            &[("a.md", "![[img/photo.png]]\n")],
+            &[("img/photo.png", digest(1), digest(2))],
+        )
+        .build();
+        let after = Fixture::new(
+            &[("a.md", "![[img/trip.png]]\n")],
+            &[("img/trip.png", digest(1), digest(2))],
+        )
+        .build();
+
+        let before_asset = &before.assets().assets()[0];
+        let after_asset = &after.assets().assets()[0];
+        assert_eq!(
+            before_asset.published_sha256(),
+            after_asset.published_sha256()
+        );
+        assert_ne!(before_asset.object_key(), after_asset.object_key());
+        assert_ne!(before_asset.public_url(), after_asset.public_url());
+        assert_ne!(before.delivery_sha256(), after.delivery_sha256());
+        assert_ne!(
+            before.text().projection_sha256(),
+            after.text().projection_sha256(),
+            "the rewritten URL is different bytes"
         );
     }
 
@@ -1423,11 +1594,25 @@ mod tests {
 
         assert_ne!(base.delivery_sha256(), other_size.delivery_sha256());
         assert_ne!(base.delivery_sha256(), other_type.delivery_sha256());
-        // The document bytes only depend on the published blob identity and the
-        // URL, so all three agree on the text side.
-        assert_eq!(
+        // A re-encoded format changes the presentation filename, so it changes the
+        // URL the document carries as well: the text side is no longer identical,
+        // and that is the point -- the committed Markdown must not keep pointing at
+        // a name that describes the representation the sanitizer replaced.
+        assert_ne!(
             base.text().projection_sha256(),
             other_type.text().projection_sha256()
+        );
+        assert!(
+            base.assets().assets()[0]
+                .object_key()
+                .as_str()
+                .ends_with("/a.png")
+        );
+        assert!(
+            other_type.assets().assets()[0]
+                .object_key()
+                .as_str()
+                .ends_with("/a.jpg")
         );
     }
 
@@ -1446,8 +1631,9 @@ mod tests {
         assert_eq!(asset.published_sha256(), digest(8));
         assert_eq!(
             asset.object_key(),
-            &AssetObjectKey::for_published_sha256(&digest(8))
+            &AssetObjectKey::for_published_asset(&digest(8), asset.public_filename().unwrap())
         );
+        assert_eq!(asset.public_filename().unwrap().as_str(), "a.png");
         assert!(asset.public_url().as_str().contains(&digest(8).to_string()));
         assert!(!asset.public_url().as_str().contains(&digest(7).to_string()));
     }
@@ -1485,7 +1671,7 @@ mod tests {
         );
 
         let delivery = fixture.build();
-        let url = expected_url(digest(2));
+        let url = expected_url("img/a.png", digest(2));
 
         assert_eq!(delivery.assets().len(), 1);
         assert_eq!(
@@ -1512,7 +1698,7 @@ mod tests {
             fixture.delivered(&delivery, "a.md"),
             format!(
                 "![]({url}) then ![alt]({url})\n",
-                url = expected_url(digest(2))
+                url = expected_url("img/a.png", digest(2))
             )
         );
     }
@@ -1554,7 +1740,10 @@ mod tests {
         );
         assert_eq!(
             delivery.assets().assets()[0].object_key(),
-            &AssetObjectKey::for_published_sha256(&digest(2))
+            &AssetObjectKey::for_published_asset(
+                &digest(2),
+                &filename_for("img/a.png", "image/png")
+            )
         );
     }
 
@@ -1837,7 +2026,7 @@ mod tests {
         // The exact bytes the Git port was asked for are the rewritten ones.
         assert_eq!(
             fixture.delivered(&delivery, "a.md"),
-            format!("# A\n\n![]({})\n", expected_url(digest(2)))
+            format!("# A\n\n![]({})\n", expected_url("img/a.png", digest(2)))
         );
         for file in recorded.files() {
             assert_eq!(

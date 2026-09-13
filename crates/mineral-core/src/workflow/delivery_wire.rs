@@ -6,8 +6,8 @@ use crate::domain::{ContentPath, Sha256, SnapshotId};
 
 use super::{
     AssetContentType, AssetDeliveryConfig, AssetObjectKey, AssetProjection, AssetPublicBaseUrl,
-    AssetPublicUrl, DeliveryProjection, ManagedRoot, ProjectionTargetPath, PublishedAsset,
-    TextProjection, TextProjectionFile,
+    AssetPublicFilename, AssetPublicUrl, DeliveryProjection, ManagedRoot, ProjectionTargetPath,
+    PublishedAsset, TextProjection, TextProjectionFile,
 };
 
 /// Versioned durable encoding of one immutable [`DeliveryProjection`].
@@ -15,31 +15,34 @@ use super::{
 /// A stored projection is the only thing a later execution may rematerialize a
 /// reviewed tree from, so the payload has to carry its own version: when the
 /// delivery model changes shape, an old durable row must fail loudly instead of
-/// being silently bound to today's field set. Version 1 is:
+/// being silently bound to today's field set.
+///
+/// Version 2 is what this engine writes, and it is version 1 plus one frozen
+/// presentation fact per asset:
 ///
 /// ```json
 /// {
-///   "version": 1,
+///   "version": 2,
 ///   "delivery_sha256": "…",
 ///   "source_projection_sha256": "…",
 ///   "snapshot_id": 1,
 ///   "managed_root": "content",
-///   "text": {
-///     "source_projection_sha256": "…",
-///     "projection_sha256": "…",
-///     "snapshot_id": 1,
-///     "managed_root": "content",
-///     "files": [
-///       { "target_path": "…", "blob_sha256": "…", "source_path": "…", "source_sha256": "…" }
-///     ]
-///   },
+///   "text": { "…": "…", "files": [ … ] },
 ///   "assets": [
 ///     { "logical_path": "…", "source_sha256": "…", "published_sha256": "…",
 ///       "published_size": 0, "published_content_type": "image/png",
-///       "object_key": "…", "public_url": "…" }
+///       "public_filename": "photo.png",
+///       "object_key": "assets/sha256/ab/<hash>/photo.png", "public_url": "…" }
 ///   ]
 /// }
 /// ```
+///
+/// Version 1 is still decoded, and only for recovery. It froze keys of the shape
+/// `assets/sha256/<2 hex>/<64 hex>` and no filename at all. Those payloads are
+/// immutable: this decoder rebuilds the exact legacy object key they recorded,
+/// and [`DeliveryProjectionWire::encode`] reproduces a decoded V1 payload as V1
+/// rather than upgrading it, so a historical intent can never be silently
+/// re-pointed at objects it never published.
 ///
 /// Only portable facts appear here: no runtime handle, no path, no credential,
 /// and no base URL that is not already implied by each asset's final URL.
@@ -47,43 +50,66 @@ use super::{
 pub struct DeliveryProjectionWire;
 
 impl DeliveryProjectionWire {
-    /// The only durable version this engine writes and reads.
-    pub const VERSION: u32 = 1;
+    /// The durable version this engine writes.
+    pub const VERSION: u32 = 2;
 
+    /// The durable version it still reads, and only in order to recover an intent
+    /// published before S6.4.1.
+    pub const LEGACY_VERSION: u32 = 1;
+
+    /// Encodes one projection in the version its own facts belong to.
+    ///
+    /// A projection built now carries a frozen filename for every asset and is
+    /// written as V2. A projection decoded from a V1 row carries none and is
+    /// written back as V1, byte for byte the same shape: recovery reads history, it
+    /// does not rewrite it.
     pub fn encode(projection: &DeliveryProjection) -> String {
-        let wire = WireDeliveryProjection {
+        let assets = projection.assets().assets();
+        let legacy =
+            !assets.is_empty() && assets.iter().all(|asset| asset.public_filename().is_none());
+        if legacy {
+            let wire = WireDeliveryProjectionV1 {
+                version: Self::LEGACY_VERSION,
+                delivery_sha256: projection.delivery_sha256().to_string(),
+                source_projection_sha256: projection.source_projection_sha256().to_string(),
+                snapshot_id: projection.snapshot_id().get(),
+                managed_root: projection.managed_root().as_str().to_owned(),
+                text: wire_text(projection),
+                assets: assets
+                    .iter()
+                    .map(|asset| WireAssetV1 {
+                        logical_path: asset.logical_path().as_str().to_owned(),
+                        source_sha256: asset.source_sha256().to_string(),
+                        published_sha256: asset.published_sha256().to_string(),
+                        published_size: asset.published_size(),
+                        published_content_type: asset.published_content_type().as_str().to_owned(),
+                        object_key: asset.object_key().as_str().to_owned(),
+                        public_url: asset.public_url().as_str().to_owned(),
+                    })
+                    .collect(),
+            };
+            return serde_json::to_string(&wire)
+                .expect("a delivery projection is always representable as a JSON object");
+        }
+        let wire = WireDeliveryProjectionV2 {
             version: Self::VERSION,
             delivery_sha256: projection.delivery_sha256().to_string(),
             source_projection_sha256: projection.source_projection_sha256().to_string(),
             snapshot_id: projection.snapshot_id().get(),
             managed_root: projection.managed_root().as_str().to_owned(),
-            text: WireTextProjection {
-                source_projection_sha256: projection.text().source_projection_sha256().to_string(),
-                projection_sha256: projection.text().projection_sha256().to_string(),
-                snapshot_id: projection.text().snapshot_id().get(),
-                managed_root: projection.text().managed_root().as_str().to_owned(),
-                files: projection
-                    .text()
-                    .files()
-                    .iter()
-                    .map(|file| WireTextFile {
-                        target_path: file.target_path().as_str().to_owned(),
-                        blob_sha256: file.blob_sha256().to_string(),
-                        source_path: file.source_path().as_str().to_owned(),
-                        source_sha256: file.source_sha256().to_string(),
-                    })
-                    .collect(),
-            },
-            assets: projection
-                .assets()
-                .assets()
+            text: wire_text(projection),
+            assets: assets
                 .iter()
-                .map(|asset| WireAsset {
+                .map(|asset| WireAssetV2 {
                     logical_path: asset.logical_path().as_str().to_owned(),
                     source_sha256: asset.source_sha256().to_string(),
                     published_sha256: asset.published_sha256().to_string(),
                     published_size: asset.published_size(),
                     published_content_type: asset.published_content_type().as_str().to_owned(),
+                    public_filename: asset
+                        .public_filename()
+                        .expect("a current delivery projection freezes one filename per asset")
+                        .clone(),
                     object_key: asset.object_key().as_str().to_owned(),
                     public_url: asset.public_url().as_str().to_owned(),
                 })
@@ -104,71 +130,102 @@ impl DeliveryProjectionWire {
         // such instead of as the shape error its different fields would cause.
         let probe: WireVersion =
             serde_json::from_str(value).map_err(|_| DeliveryProjectionWireError::Malformed)?;
-        if probe.version != Self::VERSION {
-            return Err(DeliveryProjectionWireError::UnsupportedVersion(
-                probe.version,
-            ));
+        match probe.version {
+            Self::LEGACY_VERSION => Self::decode_v1(value),
+            Self::VERSION => Self::decode_v2(value),
+            other => Err(DeliveryProjectionWireError::UnsupportedVersion(other)),
         }
-        let wire: WireDeliveryProjection =
+    }
+
+    /// Rebuilds a version 1 payload, whose assets carry no presentation filename.
+    fn decode_v1(value: &str) -> Result<DeliveryProjection, DeliveryProjectionWireError> {
+        let wire: WireDeliveryProjectionV1 =
             serde_json::from_str(value).map_err(|_| DeliveryProjectionWireError::Malformed)?;
-
-        let source_projection_sha256 = sha256(&wire.source_projection_sha256)?;
-        let snapshot_id = snapshot_id(wire.snapshot_id)?;
-        let managed_root = managed_root(&wire.managed_root)?;
-        if wire.text.source_projection_sha256 != wire.source_projection_sha256 {
-            return Err(field_mismatch("text.source_projection_sha256"));
-        }
-        if wire.text.snapshot_id != wire.snapshot_id {
-            return Err(field_mismatch("text.snapshot_id"));
-        }
-        if wire.text.managed_root != wire.managed_root {
-            return Err(field_mismatch("text.managed_root"));
-        }
-
-        let mut files = Vec::with_capacity(wire.text.files.len());
-        let mut previous: Option<ProjectionTargetPath> = None;
-        for file in &wire.text.files {
-            let target_path = ProjectionTargetPath::new(file.target_path.clone())
-                .map_err(|_| DeliveryProjectionWireError::Malformed)?;
-            if previous.as_ref().is_some_and(|path| path >= &target_path) {
-                return Err(DeliveryProjectionWireError::NonCanonicalOrder {
-                    collection: "text.files",
-                });
-            }
-            previous = Some(target_path.clone());
-            files.push(TextProjectionFile::from_parts(
-                target_path,
-                sha256(&file.blob_sha256)?,
-                content_path(&file.source_path)?,
-                sha256(&file.source_sha256)?,
-            ));
-        }
-        let text = TextProjection::from_parts(
-            snapshot_id,
-            managed_root.clone(),
+        let (source_projection_sha256, snapshot_id, managed_root) = shared_facts(
+            &wire.source_projection_sha256,
+            wire.snapshot_id,
+            &wire.managed_root,
+        )?;
+        let text = decode_text(
+            &wire.text,
             source_projection_sha256,
-            files,
-        );
-        let recorded_text_sha256 = sha256(&wire.text.projection_sha256)?;
-        if text.projection_sha256() != recorded_text_sha256 {
-            return Err(DeliveryProjectionWireError::TextProjectionHashMismatch {
-                recorded: recorded_text_sha256,
-                recomputed: text.projection_sha256(),
-            });
-        }
+            snapshot_id,
+            &managed_root,
+        )?;
 
         let mut assets = Vec::with_capacity(wire.assets.len());
         let mut previous: Option<ContentPath> = None;
         for asset in &wire.assets {
-            let logical_path = content_path(&asset.logical_path)?;
-            if previous.as_ref().is_some_and(|path| path >= &logical_path) {
-                return Err(DeliveryProjectionWireError::NonCanonicalOrder {
-                    collection: "assets",
+            let logical_path = ordered_asset_path(&mut previous, &asset.logical_path)?;
+            let published_sha256 = sha256(&asset.published_sha256)?;
+            let object_key = AssetObjectKey::legacy_for_published_sha256(&published_sha256);
+            if object_key.as_str() != asset.object_key {
+                return Err(DeliveryProjectionWireError::ObjectKeyMismatch {
+                    logical_path: asset.logical_path.clone(),
                 });
             }
-            previous = Some(logical_path.clone());
+            let public_url = public_url(&asset.public_url, &object_key, &asset.logical_path)?;
+            assets.push(PublishedAsset::from_legacy_parts(
+                logical_path,
+                sha256(&asset.source_sha256)?,
+                published_sha256,
+                asset.published_size,
+                AssetContentType::new(asset.published_content_type.clone())
+                    .map_err(|_| DeliveryProjectionWireError::Malformed)?,
+                object_key,
+                public_url,
+            ));
+        }
+        finish(
+            source_projection_sha256,
+            snapshot_id,
+            managed_root,
+            text,
+            assets,
+            &wire.delivery_sha256,
+        )
+    }
+
+    /// Rebuilds a version 2 payload, cross-checking every presentation fact.
+    ///
+    /// The filename is not trusted because it is stored: it must be exactly the
+    /// filename the frozen logical path and the frozen media type derive, and the
+    /// stored key must be exactly the key that filename and the published digest
+    /// produce. A payload that names the right digest under the wrong filename is
+    /// a different delivery intent, not a recoverable one.
+    fn decode_v2(value: &str) -> Result<DeliveryProjection, DeliveryProjectionWireError> {
+        let wire: WireDeliveryProjectionV2 =
+            serde_json::from_str(value).map_err(|_| DeliveryProjectionWireError::Malformed)?;
+        let (source_projection_sha256, snapshot_id, managed_root) = shared_facts(
+            &wire.source_projection_sha256,
+            wire.snapshot_id,
+            &wire.managed_root,
+        )?;
+        let text = decode_text(
+            &wire.text,
+            source_projection_sha256,
+            snapshot_id,
+            &managed_root,
+        )?;
+
+        let mut assets = Vec::with_capacity(wire.assets.len());
+        let mut previous: Option<ContentPath> = None;
+        for asset in &wire.assets {
+            let logical_path = ordered_asset_path(&mut previous, &asset.logical_path)?;
             let published_sha256 = sha256(&asset.published_sha256)?;
-            let object_key = AssetObjectKey::for_published_sha256(&published_sha256);
+            let content_type = AssetContentType::new(asset.published_content_type.clone())
+                .map_err(|_| DeliveryProjectionWireError::Malformed)?;
+            let derived = AssetPublicFilename::from_logical_path(&logical_path, &content_type)
+                .map_err(|_| DeliveryProjectionWireError::PublicFilenameMismatch {
+                    logical_path: asset.logical_path.clone(),
+                })?;
+            if derived != asset.public_filename {
+                return Err(DeliveryProjectionWireError::PublicFilenameMismatch {
+                    logical_path: asset.logical_path.clone(),
+                });
+            }
+            let object_key =
+                AssetObjectKey::for_published_asset(&published_sha256, &asset.public_filename);
             if object_key.as_str() != asset.object_key {
                 return Err(DeliveryProjectionWireError::ObjectKeyMismatch {
                     logical_path: asset.logical_path.clone(),
@@ -180,32 +237,145 @@ impl DeliveryProjectionWire {
                 sha256(&asset.source_sha256)?,
                 published_sha256,
                 asset.published_size,
-                AssetContentType::new(asset.published_content_type.clone())
-                    .map_err(|_| DeliveryProjectionWireError::Malformed)?,
-                object_key,
+                content_type,
+                asset.public_filename.clone(),
                 public_url,
             ));
         }
-        let assets = AssetProjection::from_assets(assets);
-
-        let projection = DeliveryProjection::from_parts(
+        finish(
             source_projection_sha256,
             snapshot_id,
             managed_root,
             text,
             assets,
-        );
-        let recorded_delivery_sha256 = sha256(&wire.delivery_sha256)?;
-        if projection.delivery_sha256() != recorded_delivery_sha256 {
-            return Err(
-                DeliveryProjectionWireError::DeliveryProjectionHashMismatch {
-                    recorded: recorded_delivery_sha256,
-                    recomputed: projection.delivery_sha256(),
-                },
-            );
-        }
-        Ok(projection)
+            &wire.delivery_sha256,
+        )
     }
+}
+
+fn wire_text(projection: &DeliveryProjection) -> WireTextProjection {
+    WireTextProjection {
+        source_projection_sha256: projection.text().source_projection_sha256().to_string(),
+        projection_sha256: projection.text().projection_sha256().to_string(),
+        snapshot_id: projection.text().snapshot_id().get(),
+        managed_root: projection.text().managed_root().as_str().to_owned(),
+        files: projection
+            .text()
+            .files()
+            .iter()
+            .map(|file| WireTextFile {
+                target_path: file.target_path().as_str().to_owned(),
+                blob_sha256: file.blob_sha256().to_string(),
+                source_path: file.source_path().as_str().to_owned(),
+                source_sha256: file.source_sha256().to_string(),
+            })
+            .collect(),
+    }
+}
+
+/// The three facts both versions state once and the text side repeats.
+fn shared_facts(
+    source_projection_sha256: &str,
+    snapshot_id: u64,
+    managed_root: &str,
+) -> Result<(Sha256, SnapshotId, ManagedRoot), DeliveryProjectionWireError> {
+    Ok((
+        sha256(source_projection_sha256)?,
+        self::snapshot_id(snapshot_id)?,
+        self::managed_root(managed_root)?,
+    ))
+}
+
+fn ordered_asset_path(
+    previous: &mut Option<ContentPath>,
+    logical_path: &str,
+) -> Result<ContentPath, DeliveryProjectionWireError> {
+    let logical_path = content_path(logical_path)?;
+    if previous.as_ref().is_some_and(|path| path >= &logical_path) {
+        return Err(DeliveryProjectionWireError::NonCanonicalOrder {
+            collection: "assets",
+        });
+    }
+    *previous = Some(logical_path.clone());
+    Ok(logical_path)
+}
+
+fn decode_text(
+    wire: &WireTextProjection,
+    source_projection_sha256: Sha256,
+    snapshot_id: SnapshotId,
+    managed_root: &ManagedRoot,
+) -> Result<TextProjection, DeliveryProjectionWireError> {
+    // The text side restates the snapshot-level facts; a payload whose two copies
+    // disagree describes no single intent.
+    if wire.source_projection_sha256 != source_projection_sha256.to_string() {
+        return Err(field_mismatch("text.source_projection_sha256"));
+    }
+    if wire.snapshot_id != snapshot_id.get() {
+        return Err(field_mismatch("text.snapshot_id"));
+    }
+    if wire.managed_root != managed_root.as_str() {
+        return Err(field_mismatch("text.managed_root"));
+    }
+    let mut files = Vec::with_capacity(wire.files.len());
+    let mut previous: Option<ProjectionTargetPath> = None;
+    for file in &wire.files {
+        let target_path = ProjectionTargetPath::new(file.target_path.clone())
+            .map_err(|_| DeliveryProjectionWireError::Malformed)?;
+        if previous.as_ref().is_some_and(|path| path >= &target_path) {
+            return Err(DeliveryProjectionWireError::NonCanonicalOrder {
+                collection: "text.files",
+            });
+        }
+        previous = Some(target_path.clone());
+        files.push(TextProjectionFile::from_parts(
+            target_path,
+            sha256(&file.blob_sha256)?,
+            content_path(&file.source_path)?,
+            sha256(&file.source_sha256)?,
+        ));
+    }
+    let text = TextProjection::from_parts(
+        snapshot_id,
+        managed_root.clone(),
+        source_projection_sha256,
+        files,
+    );
+    let recorded_text_sha256 = sha256(&wire.projection_sha256)?;
+    if text.projection_sha256() != recorded_text_sha256 {
+        return Err(DeliveryProjectionWireError::TextProjectionHashMismatch {
+            recorded: recorded_text_sha256,
+            recomputed: text.projection_sha256(),
+        });
+    }
+    Ok(text)
+}
+
+fn finish(
+    source_projection_sha256: Sha256,
+    snapshot_id: SnapshotId,
+    managed_root: ManagedRoot,
+    text: TextProjection,
+    assets: Vec<PublishedAsset>,
+    recorded_delivery_sha256: &str,
+) -> Result<DeliveryProjection, DeliveryProjectionWireError> {
+    let projection = DeliveryProjection::from_parts(
+        source_projection_sha256,
+        snapshot_id,
+        managed_root,
+        text,
+        AssetProjection::from_assets(assets),
+    );
+    let recorded_delivery_sha256 = sha256(recorded_delivery_sha256)?;
+    if projection.delivery_sha256() != recorded_delivery_sha256 {
+        return Err(
+            DeliveryProjectionWireError::DeliveryProjectionHashMismatch {
+                recorded: recorded_delivery_sha256,
+                recomputed: projection.delivery_sha256(),
+            },
+        );
+    }
+    Ok(projection)
 }
 
 /// Rebuilds one asset URL from the object key and validates the base it implies.
@@ -218,7 +388,7 @@ fn public_url(
     object_key: &AssetObjectKey,
     logical_path: &str,
 ) -> Result<AssetPublicUrl, DeliveryProjectionWireError> {
-    let suffix = format!("/{object_key}");
+    let suffix = format!("/{}", object_key.as_url_path());
     let Some(base) = value.strip_suffix(&suffix) else {
         return Err(DeliveryProjectionWireError::PublicUrlMismatch {
             logical_path: logical_path.to_owned(),
@@ -282,14 +452,26 @@ struct WireVersion {
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct WireDeliveryProjection {
+struct WireDeliveryProjectionV1 {
     version: u32,
     delivery_sha256: String,
     source_projection_sha256: String,
     snapshot_id: u64,
     managed_root: String,
     text: WireTextProjection,
-    assets: Vec<WireAsset>,
+    assets: Vec<WireAssetV1>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireDeliveryProjectionV2 {
+    version: u32,
+    delivery_sha256: String,
+    source_projection_sha256: String,
+    snapshot_id: u64,
+    managed_root: String,
+    text: WireTextProjection,
+    assets: Vec<WireAssetV2>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -313,12 +495,25 @@ struct WireTextFile {
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct WireAsset {
+struct WireAssetV1 {
     logical_path: String,
     source_sha256: String,
     published_sha256: String,
     published_size: u64,
     published_content_type: String,
+    object_key: String,
+    public_url: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireAssetV2 {
+    logical_path: String,
+    source_sha256: String,
+    published_sha256: String,
+    published_size: u64,
+    published_content_type: String,
+    public_filename: AssetPublicFilename,
     object_key: String,
     public_url: String,
 }
@@ -333,8 +528,12 @@ pub enum DeliveryProjectionWireError {
     /// A collection is not in the single canonical order the identity is defined
     /// over (strictly ascending, no duplicates).
     NonCanonicalOrder { collection: &'static str },
-    /// The stored object key is not the content-addressed key of the stored bytes.
+    /// The stored object key is not the content-addressed, filename-bearing key of
+    /// the stored bytes and filename.
     ObjectKeyMismatch { logical_path: String },
+    /// The stored presentation filename is not the one the stored logical path and
+    /// published media type derive.
+    PublicFilenameMismatch { logical_path: String },
     /// The stored URL is not the deterministic URL of the stored object key.
     PublicUrlMismatch { logical_path: String },
     /// Two copies of the same fact inside one payload disagree.
@@ -366,6 +565,10 @@ impl fmt::Display for DeliveryProjectionWireError {
             Self::ObjectKeyMismatch { logical_path } => write!(
                 formatter,
                 "encoded delivery projection has a non-canonical object key for {logical_path}"
+            ),
+            Self::PublicFilenameMismatch { logical_path } => write!(
+                formatter,
+                "encoded delivery projection names a presentation filename that does not belong to {logical_path}"
             ),
             Self::PublicUrlMismatch { logical_path } => write!(
                 formatter,
@@ -502,19 +705,26 @@ mod tests {
     }
 
     #[test]
-    fn version_one_pins_the_field_names_and_round_trips() {
+    fn version_two_pins_the_field_names_and_round_trips() {
         let (projection, _) = projection();
 
         let encoded = DeliveryProjectionWire::encode(&projection);
         let decoded = DeliveryProjectionWire::decode(&encoded).unwrap();
 
         assert_eq!(decoded, projection);
-        assert!(encoded.contains("\"version\":1"));
+        assert!(encoded.contains("\"version\":2"));
         assert!(encoded.contains("\"delivery_sha256\":"));
         assert!(encoded.contains("\"source_projection_sha256\":"));
         assert!(encoded.contains("\"published_content_type\":\"image/jpeg\""));
         assert!(encoded.contains("\"published_size\":4242"));
-        assert!(encoded.contains("\"object_key\":\"assets/sha256/"));
+        // The presentation filename is frozen next to the facts it was derived
+        // from, so recovery never has to re-derive it.
+        assert!(encoded.contains("\"public_filename\":\"a.jpg\""));
+        assert!(encoded.contains("\"public_filename\":\"a.pdf\""));
+        assert!(
+            encoded.contains("\"object_key\":\"assets/sha256/02/") && encoded.contains("/a.jpg\""),
+            "the key carries the filename segment: {encoded}"
+        );
         // Only portable facts: no runtime handle, no filesystem path.
         assert!(!encoded.contains("PathBuf"));
         assert!(!encoded.contains("/srv/"));
@@ -530,8 +740,179 @@ mod tests {
         let encoded = DeliveryProjectionWire::encode(&projection);
 
         assert_eq!(
-            DeliveryProjectionWire::decode(&encoded.replace("\"version\":1", "\"version\":2")),
-            Err(DeliveryProjectionWireError::UnsupportedVersion(2))
+            DeliveryProjectionWire::decode(&encoded.replace("\"version\":2", "\"version\":3")),
+            Err(DeliveryProjectionWireError::UnsupportedVersion(3))
+        );
+    }
+
+    /// The exact bytes the engine wrote before filename-bearing keys existed.
+    ///
+    /// This payload was produced by the version 1 encoder for [`projection`]. It
+    /// is kept verbatim because it is the only real evidence that a durable row
+    /// already in someone's database still loads: the keys it recorded have no
+    /// filename segment, and recovery must reach those very objects.
+    const FROZEN_VERSION_ONE_PAYLOAD: &str = concat!(
+        "{\"version\":1,",
+        "\"delivery_sha256\":\"9b111e21d1d7c1656440b27b2c23ffe883d0bc14d24970901de131ffe383be61\",",
+        "\"source_projection_sha256\":\"e6a6a5a6a237f81d871a85086c3b4a445505ccd9429dce5fe0ecf26de5e6ebcd\",",
+        "\"snapshot_id\":7,\"managed_root\":\"content\",",
+        "\"text\":{",
+        "\"source_projection_sha256\":\"e6a6a5a6a237f81d871a85086c3b4a445505ccd9429dce5fe0ecf26de5e6ebcd\",",
+        "\"projection_sha256\":\"930770590736035e19b8c3152c097ad821d85c398a4267456be84a2166cee982\",",
+        "\"snapshot_id\":7,\"managed_root\":\"content\",",
+        "\"files\":[",
+        "{\"target_path\":\"content/a.md\",\"blob_sha256\":\"9eb37c01176c0bfda0ee6ec0f0eba34324392d87e97d145b88a87a3fd38ac21c\",",
+        "\"source_path\":\"a.md\",\"source_sha256\":\"3a660235b7d958fb2f3b9d50fba11ba5e1c2b9c0063d58503f315174d0a33f7f\"},",
+        "{\"target_path\":\"content/notes/b.md\",\"blob_sha256\":\"9eb37c01176c0bfda0ee6ec0f0eba34324392d87e97d145b88a87a3fd38ac21c\",",
+        "\"source_path\":\"notes/b.md\",\"source_sha256\":\"3a660235b7d958fb2f3b9d50fba11ba5e1c2b9c0063d58503f315174d0a33f7f\"}]},",
+        "\"assets\":[",
+        "{\"logical_path\":\"files/a.pdf\",",
+        "\"source_sha256\":\"0303030303030303030303030303030303030303030303030303030303030303\",",
+        "\"published_sha256\":\"0303030303030303030303030303030303030303030303030303030303030303\",",
+        "\"published_size\":200,\"published_content_type\":\"application/pdf\",",
+        "\"object_key\":\"assets/sha256/03/0303030303030303030303030303030303030303030303030303030303030303\",",
+        "\"public_url\":\"https://assets.example.com/assets/sha256/03/0303030303030303030303030303030303030303030303030303030303030303\"},",
+        "{\"logical_path\":\"img/a.png\",",
+        "\"source_sha256\":\"0101010101010101010101010101010101010101010101010101010101010101\",",
+        "\"published_sha256\":\"0202020202020202020202020202020202020202020202020202020202020202\",",
+        "\"published_size\":4242,\"published_content_type\":\"image/jpeg\",",
+        "\"object_key\":\"assets/sha256/02/0202020202020202020202020202020202020202020202020202020202020202\",",
+        "\"public_url\":\"https://assets.example.com/assets/sha256/02/0202020202020202020202020202020202020202020202020202020202020202\"}]}",
+    );
+
+    /// §18.11/§18.13: a real V1 row still decodes, keeps the legacy objects it
+    /// already published, and is never silently upgraded to the current scheme.
+    #[test]
+    fn a_frozen_version_one_payload_still_decodes_to_its_exact_legacy_intent() {
+        let decoded = DeliveryProjectionWire::decode(FROZEN_VERSION_ONE_PAYLOAD).unwrap();
+
+        assert_eq!(
+            decoded.delivery_sha256().to_string(),
+            "9b111e21d1d7c1656440b27b2c23ffe883d0bc14d24970901de131ffe383be61"
+        );
+        for asset in decoded.assets().assets() {
+            assert!(
+                asset.public_filename().is_none(),
+                "a V1 asset froze no filename"
+            );
+            assert!(asset.object_key().is_legacy());
+            let digest = asset.published_sha256().to_string();
+            assert_eq!(
+                asset.object_key().as_str(),
+                format!("assets/sha256/{}/{digest}", &digest[..2])
+            );
+            assert!(
+                asset
+                    .public_url()
+                    .as_str()
+                    .ends_with(asset.object_key().as_str())
+            );
+        }
+
+        // Re-encoding reproduces the identical payload: recovery reads history, it
+        // does not rewrite it into today's scheme.
+        assert_eq!(
+            DeliveryProjectionWire::encode(&decoded),
+            FROZEN_VERSION_ONE_PAYLOAD
+        );
+    }
+
+    /// §18.14: a version 2 payload has to prove every presentation fact it states.
+    #[test]
+    fn a_version_two_payload_must_name_the_filename_its_own_facts_derive() {
+        let (projection, _) = projection();
+        let encoded = DeliveryProjectionWire::encode(&projection);
+        let mut value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+
+        // The image asset is `img/a.png` re-encoded to `image/jpeg`, so its frozen
+        // filename is `a.jpg`. Naming it `a.png` must not decode: that is a
+        // different delivery intent, not a recoverable one.
+        let mut renamed = value.clone();
+        renamed["assets"][1]["public_filename"] = serde_json::json!("a.png");
+        assert_eq!(
+            DeliveryProjectionWire::decode(&serde_json::to_string(&renamed).unwrap()),
+            Err(DeliveryProjectionWireError::PublicFilenameMismatch {
+                logical_path: "img/a.png".to_owned()
+            })
+        );
+
+        // The right filename under a key that does not carry it.
+        let mut wrong_key = value.clone();
+        wrong_key["assets"][1]["object_key"] = serde_json::json!(
+            "assets/sha256/02/0202020202020202020202020202020202020202020202020202020202020202"
+        );
+        assert_eq!(
+            DeliveryProjectionWire::decode(&serde_json::to_string(&wrong_key).unwrap()),
+            Err(DeliveryProjectionWireError::ObjectKeyMismatch {
+                logical_path: "img/a.png".to_owned()
+            })
+        );
+
+        // The right hash under the wrong fan-out prefix.
+        let mut wrong_prefix = value.clone();
+        wrong_prefix["assets"][1]["object_key"] = serde_json::json!(
+            "assets/sha256/aa/0202020202020202020202020202020202020202020202020202020202020202/a.jpg"
+        );
+        assert_eq!(
+            DeliveryProjectionWire::decode(&serde_json::to_string(&wrong_prefix).unwrap()),
+            Err(DeliveryProjectionWireError::ObjectKeyMismatch {
+                logical_path: "img/a.png".to_owned()
+            })
+        );
+
+        // An extra segment is not a filename.
+        let mut extra = value.clone();
+        extra["assets"][1]["object_key"] = serde_json::json!(
+            "assets/sha256/02/0202020202020202020202020202020202020202020202020202020202020202/a.jpg/extra"
+        );
+        assert_eq!(
+            DeliveryProjectionWire::decode(&serde_json::to_string(&extra).unwrap()),
+            Err(DeliveryProjectionWireError::ObjectKeyMismatch {
+                logical_path: "img/a.png".to_owned()
+            })
+        );
+
+        // A URL whose filename disagrees with the key.
+        let mut wrong_url = value.clone();
+        let url = projection.assets().assets()[1]
+            .public_url()
+            .as_str()
+            .to_owned();
+        let key = projection.assets().assets()[1]
+            .object_key()
+            .as_str()
+            .to_owned();
+        let tampered = url.replace(&key, &key.replace("/a.jpg", "/b.jpg"));
+        wrong_url["assets"][1]["public_url"] = serde_json::json!(tampered);
+        assert_eq!(
+            DeliveryProjectionWire::decode(&serde_json::to_string(&wrong_url).unwrap()),
+            Err(DeliveryProjectionWireError::PublicUrlMismatch {
+                logical_path: "img/a.png".to_owned()
+            })
+        );
+
+        // A missing filename is not a version 2 payload at all.
+        value["assets"][1]
+            .as_object_mut()
+            .unwrap()
+            .remove("public_filename");
+        assert_eq!(
+            DeliveryProjectionWire::decode(&serde_json::to_string(&value).unwrap()),
+            Err(DeliveryProjectionWireError::Malformed)
+        );
+    }
+
+    /// §18.14: a payload labelled version 1 may not carry version 2 facts.
+    #[test]
+    fn a_version_one_label_can_not_carry_a_filename_bearing_key() {
+        let (projection, _) = projection();
+        let encoded = DeliveryProjectionWire::encode(&projection);
+        let mut value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        value["version"] = serde_json::json!(1);
+
+        assert_eq!(
+            DeliveryProjectionWire::decode(&serde_json::to_string(&value).unwrap()),
+            Err(DeliveryProjectionWireError::Malformed)
         );
     }
 

@@ -27,7 +27,7 @@ pub use asset_check::{
 pub use asset_delivery::{
     ASSET_OBJECT_KEY_PREFIX, AssetContentType, AssetContentTypeError, AssetDeliveryConfig,
     AssetDeliveryConfigError, AssetObjectKey, AssetObjectKeyError, AssetPublicBaseUrl,
-    AssetPublicUrl,
+    AssetPublicFilename, AssetPublicFilenameError, AssetPublicUrl,
 };
 pub use asset_policy::{
     AssetHumanReviewReason, AssetPolicy, AssetPolicyDecision, AssetPolicyOutcome,

@@ -337,7 +337,10 @@ fn git_target_holds_only_rewritten_documents_and_never_a_referenced_binary() {
     let committed = String::from_utf8(repository.tree_file(&tree, "content/note.md")).unwrap();
     assert_eq!(committed, format!("# Note\n\n![]({url})\n"));
     assert!(!committed.contains("![["));
-    assert!(!committed.contains("asset.png"));
+    // The filename appears exactly once, as the last segment of the delivered URL:
+    // the document no longer resolves the asset by its vault location.
+    assert_eq!(committed.matches("asset.png").count(), 1);
+    assert!(url.ends_with("/asset.png"));
 }
 
 #[test]
@@ -852,6 +855,11 @@ fn a_live_bucket_receives_the_asset_before_a_real_git_compare_and_swap() {
         DeliveryProjectionBuilder::build(&projection, &snapshot, &config(), &repository.store)
             .unwrap();
     let asset = &delivery.assets().assets()[0];
+    // §20: the delivered URL ends with the frozen presentation filename, and the
+    // object key it is served from carries the same segment.
+    assert_eq!(asset.public_filename().unwrap().as_str(), "asset.png");
+    assert!(asset.object_key().as_str().ends_with("/asset.png"));
+    assert!(asset.public_url().as_str().ends_with("/asset.png"));
     eprintln!(
         "live asset: key={} url={}",
         asset.object_key().as_str(),

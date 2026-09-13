@@ -36,12 +36,16 @@ const SECRET_ACCESS_KEY: &str = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY";
 const BODY: &[u8] = b"the one published representation of this asset";
 
 fn asset(body: &[u8]) -> PublishedAsset {
+    asset_at("img/a.bin", body, "image/png")
+}
+
+fn asset_at(logical_path: &str, body: &[u8], media_type: &str) -> PublishedAsset {
     PublishedAsset::from_parts_for_test(
-        ContentPath::new("img/a.bin").unwrap(),
+        ContentPath::new(logical_path).unwrap(),
         Sha256::new([1; 32]),
         Sha256::digest(body),
         body.len() as u64,
-        AssetContentType::new("image/png").unwrap(),
+        AssetContentType::new(media_type).unwrap(),
         &AssetDeliveryConfig::new("https://assets.example.com").unwrap(),
     )
 }
@@ -583,6 +587,90 @@ fn a_driver_upload_of_a_multi_chunk_object_is_verified_again_by_reading_it_back(
     assert!(spool_files(&spool).is_empty(), "{:?}", spool_files(&spool));
 }
 
+/// §19: the adapter consumes the frozen key exactly as it is, and names it on the
+/// wire in its URL form.
+///
+/// The key itself stays the canonical UTF-8 name an object store holds; only the
+/// request path is percent-encoded. Nothing here re-derives the key from a hash, a
+/// logical path or a media type: the adapter has no rule to derive it with.
+#[test]
+fn the_adapter_names_the_frozen_key_on_the_wire_and_never_re_derives_it() {
+    let server = FakeServer::start();
+    let store = server.transport(&spool_directory("frozen-key"));
+    // A filename that is neither ASCII nor URL-safe.
+    let published = asset_at("attachments/旅行 照片.png", BODY, "image/png");
+
+    let driver = StreamingAssetTarget::with_transport(store).with_chunk_size(8);
+    let mut source = BufferedBlobSource::new(published.published_sha256(), BODY.to_vec());
+    driver.publish(&published, &mut source).unwrap();
+
+    let key = published.object_key();
+    // The durable key keeps the bytes of the filename...
+    assert!(
+        key.as_str().ends_with("/旅行 照片.png"),
+        "the key is not the filename: {key}"
+    );
+    // ...while the URL serialization escapes them.
+    let expected_path = format!("/{BUCKET}/{}", key.as_url_path());
+    assert!(
+        expected_path.ends_with("/%E6%97%85%E8%A1%8C%20%E7%85%A7%E7%89%87.png"),
+        "unexpected encoded path: {expected_path}"
+    );
+    assert_ne!(key.as_str(), key.as_url_path());
+    assert_eq!(
+        expected_path.matches('/').count(),
+        format!("/{BUCKET}/{}", key.as_str()).matches('/').count(),
+        "encoding must not add a path segment"
+    );
+
+    // Every request the adapter made names that one path, and only that path.
+    let methods: Vec<String> = server
+        .bucket
+        .requests()
+        .into_iter()
+        .map(|request| {
+            assert_eq!(
+                request.path, expected_path,
+                "{} went elsewhere",
+                request.method
+            );
+            request.method
+        })
+        .collect();
+    assert!(methods.contains(&"PUT".to_owned()), "{methods:?}");
+
+    // And the frozen facts still verify from the bytes the store serves back.
+    let state = driver.inspect(published.object_key()).unwrap();
+    assert!(published.judge(&state).is_ready(), "{state:?}");
+}
+
+/// §15: the immutable-namespace rule is unchanged by the filename segment.
+#[test]
+fn a_filename_bearing_key_still_refuses_to_replace_a_conflicting_object() {
+    let server = FakeServer::start();
+    let store = server.transport(&spool_directory("filename-conflict"));
+    let published = asset_at("attachments/photo.png", BODY, "image/png");
+    server.store_for(&published, b"something else entirely", "image/png");
+
+    let error = match store.open_writer(&published) {
+        Ok(_) => panic!("a conflicting object must not produce a writer"),
+        Err(error) => error,
+    };
+
+    assert!(matches!(
+        error,
+        R2ObjectStoreError::ConflictingObject { .. }
+    ));
+    assert_eq!(
+        server
+            .object(published.object_key().as_str())
+            .unwrap()
+            .bytes,
+        b"something else entirely"
+    );
+    assert_eq!(server.bucket.count("PUT"), 0);
+}
+
 #[test]
 fn a_source_that_is_not_the_frozen_representation_never_reaches_the_bucket() {
     let server = FakeServer::start();
@@ -717,7 +805,8 @@ fn a_secret_is_never_printed() {
 /// The default test run touches no network and needs no credentials. Set
 /// `MINERAL_R2_ENDPOINT`, `MINERAL_R2_BUCKET`, `MINERAL_R2_ACCESS_KEY_ID` and
 /// `MINERAL_R2_SECRET_ACCESS_KEY` and run with `--ignored` to exercise the
-/// adapter against the real service, where the signature is actually validated.
+/// adapter against the real service, where the signature is actually validated and
+/// where a Unicode object key has to survive the round trip.
 #[test]
 #[ignore = "requires a live bucket and credentials"]
 fn a_live_bucket_accepts_a_publish_and_serves_the_frozen_bytes_back() {
@@ -738,52 +827,78 @@ fn a_live_bucket_accepts_a_publish_and_serves_the_frozen_bytes_back() {
     .unwrap();
     let store = R2ObjectStore::new(config, spool_directory("live")).unwrap();
 
-    // A unique key per run: the live test must never depend on state left behind.
-    let body: Vec<u8> = (0..150_000_u32).map(|index| (index % 253) as u8).collect();
-    let key = format!(
-        "mineral-live/{}/object.bin",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    );
-    let published = PublishedAsset::from_parts_for_test(
-        ContentPath::new(key.as_str()).unwrap(),
-        Sha256::new([2; 32]),
-        Sha256::digest(&body),
-        body.len() as u64,
-        AssetContentType::new("application/octet-stream").unwrap(),
-        &AssetDeliveryConfig::new("https://assets.example.com").unwrap(),
-    );
+    // One ASCII filename and one that is neither ASCII nor URL-safe. Neither body
+    // is random: the key is content-addressed, so re-running this test finds the
+    // object it published last time instead of filling the bucket.
+    let bodies: Vec<Vec<u8>> = vec![
+        (0..150_000_u32).map(|index| (index % 253) as u8).collect(),
+        (0..90_000_u32).map(|index| (index % 241) as u8).collect(),
+    ];
+    for (logical_path, body) in [
+        ("mineral-filename-test.png", &bodies[0]),
+        ("旅行照片.png", &bodies[1]),
+    ] {
+        let published = PublishedAsset::from_parts_for_test(
+            ContentPath::new(logical_path).unwrap(),
+            Sha256::new([2; 32]),
+            Sha256::digest(body),
+            body.len() as u64,
+            AssetContentType::new("image/png").unwrap(),
+            &AssetDeliveryConfig::new("https://assets.example.com").unwrap(),
+        );
+        let key = published.object_key();
+        assert_eq!(
+            key.public_filename().unwrap().as_str(),
+            logical_path,
+            "the frozen presentation filename is the logical basename"
+        );
+        assert!(key.as_str().ends_with(&format!("/{logical_path}")));
+        assert!(
+            published
+                .public_url()
+                .as_str()
+                .ends_with(&key.as_url_path()),
+            "the public URL ends with the URL form of the frozen key"
+        );
+        if logical_path.is_ascii() {
+            assert_eq!(key.as_url_path(), key.as_str());
+        } else {
+            assert_ne!(key.as_url_path(), key.as_str());
+            assert!(key.as_url_path().contains("%E6%97%85%E8%A1%8C"));
+        }
 
-    // The key is content-addressed, so an earlier run against the same bucket left
-    // the very same object under it. Either state is a valid starting point:
-    // publishing is idempotent, and anything else under the key is a real failure.
-    match store.inspect(published.object_key()).unwrap() {
-        AssetTargetState::Missing => {}
-        present => assert!(
-            published.judge(&present).is_ready(),
-            "the live bucket holds something else under the frozen key: {present:?}"
-        ),
+        // The key is content-addressed, so an earlier run against the same bucket
+        // left the very same object under it. Either state is a valid starting
+        // point: publishing is idempotent, and anything else under the key is a
+        // real failure.
+        match store.inspect(key).unwrap() {
+            AssetTargetState::Missing => {}
+            present => assert!(
+                published.judge(&present).is_ready(),
+                "the live bucket holds something else under the frozen key: {present:?}"
+            ),
+        }
+
+        let driver = StreamingAssetTarget::with_transport(&store).with_chunk_size(8 * 1024);
+        let mut source = BufferedBlobSource::new(published.published_sha256(), body.clone());
+        driver.publish(&published, &mut source).unwrap();
+
+        // Read back: the served bytes, their size, their media type and their
+        // digest — through the same Unicode key the publication froze.
+        let state = driver.inspect(key).unwrap();
+        let (size, content_type, identity) = present_identity(&state).expect("a present object");
+        assert_eq!(size, body.len() as u64, "{logical_path}");
+        assert_eq!(content_type.as_str(), "image/png");
+        assert_eq!(identity, AssetByteIdentity::Verified(Sha256::digest(body)));
+        assert!(published.judge(&state).is_ready());
+
+        // Publishing again is a no-op: the object already satisfies the frozen
+        // facts, so nothing is uploaded a second time.
+        let mut source = BufferedBlobSource::new(published.published_sha256(), body.clone());
+        driver.publish(&published, &mut source).unwrap();
+        let state = driver.inspect(key).unwrap();
+        assert!(published.judge(&state).is_ready());
     }
-
-    let driver = StreamingAssetTarget::with_transport(store).with_chunk_size(8 * 1024);
-    let mut source = BufferedBlobSource::new(published.published_sha256(), body.clone());
-    driver.publish(&published, &mut source).unwrap();
-
-    // Read back: the served bytes, their size, their media type and their digest.
-    let state = driver.inspect(published.object_key()).unwrap();
-    let (size, content_type, identity) = present_identity(&state).expect("a present object");
-    assert_eq!(size, body.len() as u64);
-    assert_eq!(content_type.as_str(), "application/octet-stream");
-    assert_eq!(identity, AssetByteIdentity::Verified(Sha256::digest(&body)));
-    assert!(published.judge(&state).is_ready());
-
-    // Publishing again is a no-op: the object already satisfies the frozen facts.
-    let mut source = BufferedBlobSource::new(published.published_sha256(), body.clone());
-    driver.publish(&published, &mut source).unwrap();
-    let state = driver.inspect(published.object_key()).unwrap();
-    assert!(published.judge(&state).is_ready());
 }
 
 /// Compile-time proof that the adapter's error type stays inside the runtime.

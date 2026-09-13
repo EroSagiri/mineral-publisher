@@ -105,6 +105,15 @@ buffer。真实对象存储由 host 的 R2 adapter（SigV4 自实现 + 临时 sp
 承担；**没有任何 R2 / HTTP / SDK 类型进入 mineral-core**，core 里的
 `AssetTarget` 端口只看到 `ImmutableBlobSource`。
 
+S6.4.1 把 delivery 的对象键从纯内容寻址扩展成
+`assets/sha256/<prefix>/<hash>/<filename>`：`<hash>` 仍是 bytes identity，
+`<filename>` 是 presentation identity（来自 logical path 的 basename，并与冻结的
+`published_content_type` 对齐，避免 sanitizer 改变格式后后缀说谎）。同一个 hash 配不同
+filename 会得到不同 object key，换掉物理去重换取 "URL path == object key"；public URL 只
+对 filename segment 做 percent-encoding，R2 适配器始终只消费冻结的 `object_key`，
+不理解 V1/V2。Durable 侧 `DeliveryProjectionWire` 现在写 V2、仍读 V1：V1 的历史
+filename-less key 保持原样可恢复，并且 decode 后的 V1 会原样 re-encode，不做隐式升级。
+
 ### 2.3 已批准的 schema 变更
 
 `publish-runs.sqlite3`：`user_version 1 → 2`

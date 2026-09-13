@@ -418,7 +418,7 @@ impl ObjectStoreTransport for R2ObjectStore {
                 AssetVerification::Conflict(conflict) => {
                     return Err(R2ObjectStoreError::ConflictingObject {
                         object_key: asset.object_key().clone(),
-                        conflict,
+                        conflict: Box::new(conflict),
                     });
                 }
                 AssetVerification::Unverifiable => {
@@ -627,7 +627,9 @@ pub enum R2ObjectStoreError {
     },
     ConflictingObject {
         object_key: AssetObjectKey,
-        conflict: crate::asset::AssetTargetConflict,
+        /// Boxed: the exact disagreement is the largest fact here, and every early
+        /// return of the adapter would otherwise pay for it.
+        conflict: Box<crate::asset::AssetTargetConflict>,
     },
     UnverifiableObject {
         object_key: AssetObjectKey,
