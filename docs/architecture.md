@@ -172,44 +172,35 @@ AssetReview
 
 # 4. Source
 
-`Source` 表示知识库来源。
-
-当前实现：
+`Source` 表示知识库来源。当前实现是二选一（第一版只允许一个 active source）：
 
 ```text
-R2Source
+LocalSource   本地目录树（默认；不写 type 的旧配置就是它）
+R2Source      S3 兼容 bucket 里的一个 managed prefix（source.type: r2）
 ```
 
-开发和测试环境还应提供：
-
-```text
-LocalSource
-```
-
-未来可能支持：
-
-```text
-Source
-├── LocalSource
-├── R2Source
-├── S3Source
-├── GitSource
-└── 其他来源
-```
+未来可能支持 S3 / Git / 多源合并，但都不属于当前设计。
 
 Source 负责：
 
-* 枚举文件
-* 获取文件元信息
-* 读取文件内容
+* 枚举 namespace
+* 获取每个文件的 remote revision
+* 以 exact revision 读取内容，并在返回 Snapshot 之前把内容不可变地保存进 CAS
+* 计算文件大小与内容身份
 
-Source 创建 Snapshot 时，必须以同一次实际读取的内容为准计算文件大小和内容身份，并在 Snapshot 创建成功前保证该内容已经被不可变地保存。
+Source 创建 Snapshot 时，必须以**同一次实际读取**的内容为准计算大小和内容身份，
+并在 Snapshot 成功前保证该内容已在不可变 CAS 中；远端 validator（ETag / version /
+uploaded time）只能作为 revision / provenance / 复用证据，**永远不能**当作内容 SHA。
+R2 Source 的语义是 **stabilized scan**：它对每个文件读取了各自的 exact revision，
+且 materialize 前后两次 canonical inventory 一致；它不是"bucket 的原子事务快照"。
 
 Source 不负责：
 
+* 判断内容是否被 public.exclude 排除
 * 判断内容是否私有
 * AI 审核
 * 发布决策
+* 资产发布
 * Git 操作
 * 网站构建
 

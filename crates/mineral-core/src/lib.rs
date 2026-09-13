@@ -12,4 +12,5 @@ pub mod policy;
 pub mod ports;
 pub mod publication;
 pub mod publish;
+pub mod source;
 pub mod workflow;

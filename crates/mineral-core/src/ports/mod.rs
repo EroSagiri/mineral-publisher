@@ -6,5 +6,5 @@
 mod blob;
 mod clock;
 
-pub use blob::{BlobStore, ContentStoreError};
+pub use blob::{BlobStore, BlobWriter, ContentStoreError, StoredBlob};
 pub use clock::Clock;

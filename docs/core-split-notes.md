@@ -169,6 +169,39 @@ intent 与 scope 是两次独立写入（`save` 再 `save_public_scope`），中
 * `public_scope(id)` 的 `None` 只有一个含义：这一行写在"scope 会被冻结"之前（旧库），
   绝不表示"范围为空"——空范围被记录成空范围，与新库旧行可以区分。
 
+S7.1 增加 **R2 Source**：除本地目录树之外，source 现在可以是一个 S3 兼容 namespace
+（`source.type: r2` + `source.r2`，`type` 缺省仍是 local，旧配置不变）。语义是
+**stabilized scan**，不是"bucket 的原子事务快照"：
+
+* `SourceIdentity = H(identity version, source kind, canonical endpoint/bucket/prefix)`
+  ——凭据永远不进 identity，换 bucket / 换 prefix 就是另一个 namespace；
+  prefix 必填、非空、canonical（用与 `ContentPath` 相同的规则校验），并以 `/` 结尾，
+  第一版禁止把整个 bucket 当 source；
+* key → `ContentPath` 是**精确后缀剥离**（不 normalize、不 trim、不认 `./`/`../`/`\`/`//`），
+  无法构成 canonical path 的 key 让整次 inventory fail closed；以 `/` 结尾且 size==0 的
+  object 是 directory marker（跳过），以 `/` 结尾但非空则 fail closed；
+* LIST 结果只生成 `SourceInventory`（canonical 排序、重复 logical path fail closed、
+  分页 cursor 重复 fail closed、`SourceInventoryIdentity` 覆盖 source + 每条 path/revision/size）；
+  `SourceRevision` 对 core 是不透明字符串（版本化编码，未知版本读不回来），
+  ETag / version / uploaded time **永远不是** content SHA；
+* `fetch_exact` 用 `If-Match: <listed ETag>` 读对象：LIST 之后远端变化 → 412 →
+  `RemoteRevisionChanged` → 重新 inventory（有界重试，最终 `SourceUnstable`）；
+  读的过程中同时核对 Content-Length / 响应 ETag / 实际字节数；
+* GET body 以 64 KiB 为界流式写入 CAS：同一份流既做增量 SHA-256 又写临时文件，
+  finalize 才 hard-link 成内容寻址 blob —— 落盘的 bytes 就是被哈希的 bytes，
+  中途失败不留 blob、不留临时文件；
+* 跨运行复用基于 durable `SourceMaterializationBinding`（
+  `source_identity + logical_path + source_revision → content_sha256 + content_size`，
+  独立 `source-materializations.sqlite3`），并且**必须**同时通过两道检查：
+  该 revision 有 binding，且本地 CAS 里该 identity 的 blob 仍在、大小与 binding 一致；
+  blob 消失 → 重新下载；大小矛盾 → fail closed；
+* 每次成功 Snapshot 前做 **Inventory A → materialize → Inventory B**，identity 相同才允许
+  组装；不同则用上一次已证明的 materialization 重试（不删除已正确验证的 CAS blob），
+  最多 3 次后 `SourceUnstable`。Snapshot 的 path/size/SHA256 全部来自 materialized CAS facts，
+  R2 的 `Content-Type` 不参与分类（与 Local Source 一样留空）；
+* `public.exclude`、privacy、review、DeliveryProjection、R2 publication 完全在 source 之后，
+  R2 source adapter 里没有任何 public scope / privacy / review / publication 判断。
+
 同一轮还修掉一个 durable identity 的漏洞：`delivery_sha256` 当初只哈希
 "交付的文本树 + 已发布资产"，却没有覆盖它自己存储的 snapshot provenance
 （`snapshot_id`、`managed_root`、每篇文档的 `source_path`/`source_sha256`）。于是

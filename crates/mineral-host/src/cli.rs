@@ -12,12 +12,13 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use mineral_core::source::{DEFAULT_MAX_SCAN_ATTEMPTS, stabilize_scan};
 use mineral_publisher::{
     asset::{
         AssetPublicationOutcome, ConfiguredAssetTarget, R2ObjectStore, R2ObjectStoreConfig,
         R2SecretKey, UuidAssetObservationIdGenerator,
     },
-    domain::{Sha256, Snapshot, SnapshotId, SourceId},
+    domain::{Sha256, Snapshot, SnapshotFile, SnapshotId, SourceId},
     policy::{
         PolicyIdentity, ReviewCandidate, ReviewRunId, ReviewRunStore, Reviewer, ReviewerError,
         ReviewerReport,
@@ -33,16 +34,17 @@ use mineral_publisher::{
     },
     runtime::{HostAssetReviews, HostMarkdownReviews},
     source::LocalSource,
+    source::r2::{R2Source, R2SourcePrefix},
     storage::{
         LocalContentStore, SqliteAssetObservationStore, SqliteAssetReviewRunStore,
         SqliteDeliveryProjectionStore, SqliteHumanReviewStore, SqlitePublishRunStore,
-        SqliteRemoteObservationStore, SqliteReviewRunStore,
+        SqliteRemoteObservationStore, SqliteReviewRunStore, SqliteSourceMaterializationStore,
     },
     workflow::{
-        AssetDeliveryConfig, AssetReviewCandidate, AssetReviewRunId, AssetReviewRunIdGenerator,
-        AssetReviewRunStore, AssetReviewer, AssetReviewerError, AssetReviewerReport,
-        ExplicitHumanReviewSelection, HumanReviewAttempt, HumanReviewDecision, HumanReviewId,
-        HumanReviewRecordError, HumanReviewResolution, PublicExclusionRules,
+        ASSET_OBJECT_KEY_PREFIX, AssetDeliveryConfig, AssetReviewCandidate, AssetReviewRunId,
+        AssetReviewRunIdGenerator, AssetReviewRunStore, AssetReviewer, AssetReviewerError,
+        AssetReviewerReport, ExplicitHumanReviewSelection, HumanReviewAttempt, HumanReviewDecision,
+        HumanReviewId, HumanReviewRecordError, HumanReviewResolution, PublicExclusionRules,
         PublicationApplication, PublicationApplicationOutcome, PublicationApplicationRequest,
         ReviewRunIdGenerator,
     },
@@ -51,8 +53,23 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256 as Sha256Hasher};
 
 const DEFAULT_CONFIG: &str = r#"source:
-  path: ./vault
+  # One active source. `type` is optional and defaults to a local directory tree, so
+  # every configuration written before R2 sources existed keeps working unchanged.
+  type: local
   id: local-vault
+  path: ./vault
+  # An R2 source instead reads one managed prefix of a bucket. It needs a non-empty
+  # prefix (never the whole bucket) and the same credential mechanism as the asset
+  # target: the secret is named here, never written here.
+  # type: r2
+  # r2:
+  #   endpoint: https://<account>.r2.cloudflarestorage.com
+  #   bucket: mineral-vault
+  #   prefix: vault/
+  #   access_key_id: <access key id>
+  #   secret_access_key_env: MINERAL_R2_SECRET_ACCESS_KEY
+  #   region: auto
+  #   timeout_seconds: 300
 state:
   path: ./.mineral
 git:
@@ -112,11 +129,56 @@ struct Config {
     public: Option<PublicConfig>,
 }
 
+/// Which kind of namespace one workspace reads its source from.
+///
+/// It defaults to a local directory tree, which is what every workspace written
+/// before R2 sources existed means.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum SourceType {
+    #[default]
+    Local,
+    R2,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SourceConfig {
-    path: PathBuf,
     id: String,
+    #[serde(default, rename = "type")]
+    kind: Option<SourceType>,
+    /// The local source root. Required for a local source, and refused for an R2
+    /// source, so a workspace cannot silently keep reading a directory.
+    #[serde(default)]
+    path: Option<PathBuf>,
+    #[serde(default)]
+    r2: Option<SourceR2Config>,
+}
+
+impl SourceConfig {
+    fn kind(&self) -> SourceType {
+        self.kind.unwrap_or_default()
+    }
+}
+
+/// The connection one R2 source reads through.
+///
+/// The shape mirrors `assets.r2` on purpose: the same endpoint, bucket and
+/// credential mechanism reach the same kind of store, whether this engine is
+/// reading source objects or writing published ones.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SourceR2Config {
+    endpoint: String,
+    bucket: String,
+    /// The one managed namespace this source reads. Required and non-empty.
+    prefix: String,
+    access_key_id: String,
+    secret_access_key_env: String,
+    #[serde(default)]
+    region: Option<String>,
+    #[serde(default)]
+    timeout_seconds: Option<u64>,
 }
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -212,6 +274,7 @@ fn default_asset_concurrency() -> usize {
     2
 }
 
+#[derive(Debug)]
 struct Workspace {
     config: Config,
     config_path: PathBuf,
@@ -225,7 +288,42 @@ impl Workspace {
             return Err("review concurrency must be at least 1".into());
         }
         let base = path.parent().unwrap_or_else(|| Path::new("."));
-        config.source.path = absolute(base, &config.source.path)?;
+        // One source, chosen explicitly. A local source still requires its root, and
+        // an R2 source requires a managed prefix and must not name a local root:
+        // whichever one is configured decides where the Snapshot comes from.
+        match config.source.kind() {
+            SourceType::Local => {
+                if config.source.r2.is_some() {
+                    return Err(
+                        "source.r2 is configured but source.type is local; set type: r2".into(),
+                    );
+                }
+                let Some(source_path) = config.source.path.clone() else {
+                    return Err("source.path is required for a local source".into());
+                };
+                config.source.path = Some(absolute(base, &source_path)?);
+            }
+            SourceType::R2 => {
+                if config.source.path.is_some() {
+                    return Err(
+                        "source.path is not used by an R2 source; configure source.r2 instead"
+                            .into(),
+                    );
+                }
+                let r2 = config
+                    .source
+                    .r2
+                    .as_ref()
+                    .ok_or("source.type is r2 but source.r2 is not configured")?;
+                // The prefix is validated, and stored back in canonical form, before
+                // anything reads the namespace: an unusable namespace must stop the
+                // run, not a listing in the middle of one.
+                let prefix = R2SourcePrefix::new(&r2.prefix)
+                    .map_err(|error| format!("source.r2.prefix is unusable: {error}"))?;
+                config.source.r2.as_mut().expect("checked above").prefix =
+                    prefix.as_str().to_owned();
+            }
+        }
         config.state.path = absolute(base, &config.state.path)?;
         config.git.repository = absolute(base, &config.git.repository)?;
         // Public scope is validated with the rest of the configuration: an unusable
@@ -254,11 +352,86 @@ impl Workspace {
                 assets.target_path = Some(absolute(base, target_path)?);
             }
         }
+        // A source and a publication target that share one namespace on one bucket
+        // would make this engine read its own output back as input. That is refused
+        // here, before any publication can create the loop.
+        config.check_namespace_overlap()?;
         Ok(Self {
             config,
             config_path: path,
         })
     }
+    /// The configured source kind.
+    fn source_kind(&self) -> SourceType {
+        self.config.source.kind()
+    }
+
+    /// The local source root, refusing an R2 workspace.
+    fn local_source_path(&self) -> Result<&Path, Box<dyn Error>> {
+        self.config
+            .source
+            .path
+            .as_deref()
+            .ok_or_else(|| "this workspace reads an R2 source and has no local source path".into())
+    }
+
+    /// Where a human-readable description of the configured source comes from.
+    fn source_description(&self) -> String {
+        match self.source_kind() {
+            SourceType::Local => self
+                .config
+                .source
+                .path
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "<unconfigured local source>".to_owned()),
+            SourceType::R2 => match &self.config.source.r2 {
+                Some(r2) => format!("r2:{}/{}/{}", r2.endpoint, r2.bucket, r2.prefix),
+                None => "<unconfigured r2 source>".to_owned(),
+            },
+        }
+    }
+
+    /// Builds the configured R2 source reader, reading its secret from the
+    /// environment. The secret never reaches the engine or a durable record.
+    fn r2_source(&self, store: LocalContentStore) -> Result<R2Source, Box<dyn Error>> {
+        let r2 = self
+            .config
+            .source
+            .r2
+            .as_ref()
+            .ok_or("source.type is r2 but source.r2 is not configured")?;
+        let prefix = R2SourcePrefix::new(&r2.prefix)
+            .map_err(|error| format!("source.r2.prefix is unusable: {error}"))?;
+        let mut config = R2ObjectStoreConfig::new(
+            r2.endpoint.clone(),
+            r2.bucket.clone(),
+            r2.access_key_id.clone(),
+            R2SecretKey::new(env::var(&r2.secret_access_key_env).map_err(|_| {
+                format!(
+                    "source.r2.secret_access_key_env names {}, which is not set",
+                    r2.secret_access_key_env
+                )
+            })?)?,
+        )?;
+        if let Some(region) = &r2.region {
+            config = config.with_region(region.clone())?;
+        }
+        if let Some(seconds) = r2.timeout_seconds {
+            config = config.with_timeout(Duration::from_secs(seconds));
+        }
+        let materializations =
+            SqliteSourceMaterializationStore::open(self.source_materializations_db())?;
+        Ok(R2Source::new(config, prefix, store, materializations)?)
+    }
+
+    fn source_materializations_db(&self) -> PathBuf {
+        self.config
+            .state
+            .path
+            .join("source-materializations.sqlite3")
+    }
+
     fn cas(&self) -> PathBuf {
         self.config.state.path.join("cas")
     }
@@ -340,6 +513,51 @@ impl Workspace {
     }
 }
 
+impl Config {
+    /// Refuses a source and a publication target that share one namespace.
+    ///
+    /// Two namespaces overlap when one is a prefix of the other on the same bucket
+    /// of the same endpoint. Reading published assets back as source objects, or
+    /// publishing source objects on top of the source, is a loop this engine will
+    /// not create for itself.
+    fn check_namespace_overlap(&self) -> Result<(), Box<dyn Error>> {
+        let Some(source) = self.source.r2.as_ref() else {
+            return Ok(());
+        };
+        let Some(assets) = self.assets.as_ref().and_then(|assets| assets.r2.as_ref()) else {
+            return Ok(());
+        };
+        let same_account = source.endpoint.eq_ignore_ascii_case(&assets.endpoint);
+        if !same_account || source.bucket != assets.bucket {
+            return Ok(());
+        }
+        let source_prefix = R2SourcePrefix::new(&source.prefix)?.as_str().to_owned();
+        let publication_prefix = self.publication_namespace();
+        if namespaces_overlap(&source_prefix, &publication_prefix) {
+            return Err(format!(
+                "source.r2 prefix {source_prefix} overlaps the publication namespace                  {publication_prefix} on bucket {}; a source must not read this engine's own output",
+                source.bucket
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    /// Where published assets live inside the bucket, as a canonical prefix.
+    fn publication_namespace(&self) -> String {
+        format!("{ASSET_OBJECT_KEY_PREFIX}/")
+    }
+}
+
+/// Whether one canonical object namespace contains, or is contained by, another.
+///
+/// Both prefixes are canonical and end in `/`, so the relation is a plain string
+/// prefix test — and a namespace never overlaps itself by accident: two identical
+/// prefixes are exactly the loop this check exists to refuse.
+fn namespaces_overlap(left: &str, right: &str) -> bool {
+    left.starts_with(right) || right.starts_with(left)
+}
+
 fn absolute(base: &Path, value: &Path) -> Result<PathBuf, Box<dyn Error>> {
     Ok(if value.is_absolute() {
         value.to_path_buf()
@@ -393,7 +611,9 @@ fn init(path: &Path) -> Result<(), Box<dyn Error>> {
     }
     fs::write(path, DEFAULT_CONFIG)?;
     let workspace = Workspace::load(path.to_path_buf())?;
-    fs::create_dir_all(&workspace.config.source.path)?;
+    if workspace.source_kind() == SourceType::Local {
+        fs::create_dir_all(workspace.local_source_path()?)?;
+    }
     fs::create_dir_all(&workspace.config.state.path)?;
     fs::create_dir_all(workspace.cas())?;
     open_stores(&workspace)?;
@@ -401,7 +621,7 @@ fn init(path: &Path) -> Result<(), Box<dyn Error>> {
         "Initialized Mineral workspace\n  config: {}\n  state: {}\n  source: {}",
         workspace.config_path.display(),
         workspace.config.state.path.display(),
-        workspace.config.source.path.display()
+        workspace.source_description()
     );
     Ok(())
 }
@@ -414,20 +634,60 @@ fn open_stores(workspace: &Workspace) -> Result<(), Box<dyn Error>> {
     SqliteRemoteObservationStore::open(workspace.observation_db())?;
     SqliteDeliveryProjectionStore::open(workspace.delivery_db())?;
     SqliteAssetObservationStore::open(workspace.asset_observations_db())?;
+    SqliteSourceMaterializationStore::open(workspace.source_materializations_db())?;
     Ok(())
 }
 
 fn snapshot(workspace: &Workspace, store: &LocalContentStore) -> Result<Snapshot, Box<dyn Error>> {
     let source_id = SourceId::new(workspace.config.source.id.clone())?;
-    let source = LocalSource::new(
-        &workspace.config.source.path,
-        source_id.clone(),
-        store.clone(),
-    );
-    let provisional = source.snapshot(SnapshotId::new(1)?, SystemTime::now())?;
+    match workspace.source_kind() {
+        SourceType::Local => {
+            let source = LocalSource::new(
+                workspace.local_source_path()?,
+                source_id.clone(),
+                store.clone(),
+            );
+            let provisional = source.snapshot(SnapshotId::new(1)?, SystemTime::now())?;
+            let id = snapshot_id(&source_id, provisional.files());
+            source
+                .snapshot(SnapshotId::new(id)?, SystemTime::now())
+                .map_err(Into::into)
+        }
+        SourceType::R2 => {
+            // One stabilized scan, one assembled state. The identity is computed from
+            // the materialized bytes only, so the same bytes from a local directory
+            // and from R2 describe the same source state.
+            let source = workspace.r2_source(store.clone())?;
+            let stabilized = stabilize_scan(&source, DEFAULT_MAX_SCAN_ATTEMPTS)
+                .map_err(|error| format!("could not read the R2 source: {error}"))?;
+            eprintln!(
+                "[1/4] R2 source {} prefix {}: {} file(s), {} read, {} reused, inventory {}",
+                source.describe(),
+                source.prefix(),
+                stabilized.materialized().len(),
+                source.fetched_objects(),
+                source.reused_objects(),
+                stabilized.inventory_identity(),
+            );
+            let provisional =
+                stabilized.snapshot(SnapshotId::new(1)?, SystemTime::now(), source_id.clone())?;
+            let id = snapshot_id(&source_id, provisional.files());
+            stabilized
+                .snapshot(SnapshotId::new(id)?, SystemTime::now(), source_id)
+                .map_err(Into::into)
+        }
+    }
+}
+
+/// The deterministic snapshot identity of one complete source state.
+///
+/// It is derived from the source id and every file's path, size and content
+/// identity — never from the source kind, so identical bytes from a local directory
+/// and from R2 describe the same state.
+fn snapshot_id(source_id: &SourceId, files: &[SnapshotFile]) -> u64 {
     let mut hasher = Sha256Hasher::new();
     hasher.update(source_id.as_str().as_bytes());
-    for file in provisional.files() {
+    for file in files {
         hasher.update(file.path().as_str().as_bytes());
         hasher.update(file.size().to_le_bytes());
         hasher.update(file.sha256().as_bytes());
@@ -435,10 +695,7 @@ fn snapshot(workspace: &Workspace, store: &LocalContentStore) -> Result<Snapshot
     let digest = hasher.finalize();
     let mut bytes = [0_u8; 8];
     bytes.copy_from_slice(&digest[..8]);
-    let id = sqlite_positive_id(u64::from_be_bytes(bytes));
-    source
-        .snapshot(SnapshotId::new(id)?, SystemTime::now())
-        .map_err(Into::into)
+    sqlite_positive_id(u64::from_be_bytes(bytes))
 }
 
 fn publish(workspace: Workspace) -> Result<(), Box<dyn Error>> {
@@ -647,6 +904,7 @@ fn status(workspace: Workspace) -> Result<(), Box<dyn Error>> {
     let assets = SqliteAssetReviewRunStore::open(workspace.asset_db())?;
     let human = SqliteHumanReviewStore::open(workspace.human_db())?;
     let runs = SqlitePublishRunStore::open(workspace.publish_db())?;
+    SqliteSourceMaterializationStore::open(workspace.source_materializations_db())?;
     let pending_documents =
         HumanReviewResolution::list_pending_documents(&documents, &human)?.len();
     let pending_assets = HumanReviewResolution::list_pending_assets(&assets, &human)?.len();
@@ -655,7 +913,7 @@ fn status(workspace: Workspace) -> Result<(), Box<dyn Error>> {
     println!(
         "Mineral status\n  source: {} ({})\n  state: {}\n  publication target: {} {}\n  last publication: {}\n  pending Markdown reviews: {}\n  pending Asset reviews: {}",
         workspace.config.source.id,
-        workspace.config.source.path.display(),
+        workspace.source_description(),
         workspace.config.state.path.display(),
         workspace.config.git.remote,
         workspace.config.git.reference,
@@ -872,11 +1130,32 @@ fn doctor(workspace: Workspace) -> Result<(), Box<dyn Error>> {
         true,
         workspace.config_path.display().to_string(),
     );
-    check(
-        "source",
-        workspace.config.source.path.is_dir(),
-        workspace.config.source.path.display().to_string(),
-    );
+    match workspace.source_kind() {
+        SourceType::Local => check(
+            "source",
+            workspace
+                .config
+                .source
+                .path
+                .as_ref()
+                .is_some_and(|path| path.is_dir()),
+            workspace.source_description(),
+        ),
+        SourceType::R2 => check(
+            "source",
+            env::var_os(
+                workspace
+                    .config
+                    .source
+                    .r2
+                    .as_ref()
+                    .map(|r2| r2.secret_access_key_env.clone())
+                    .unwrap_or_default(),
+            )
+            .is_some(),
+            format!("{} (credential)", workspace.source_description()),
+        ),
+    }
     check(
         "state",
         workspace.config.state.path.is_dir(),
@@ -897,6 +1176,7 @@ fn doctor(workspace: Workspace) -> Result<(), Box<dyn Error>> {
             workspace.observation_db(),
             workspace.delivery_db(),
             workspace.asset_observations_db(),
+            workspace.source_materializations_db(),
         ]
         .iter()
         .all(|path| path.is_file()),
@@ -1080,7 +1360,15 @@ fn sqlite_positive_id(value: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, DEFAULT_CONFIG, Workspace, sqlite_positive_id};
+    use std::{
+        error::Error,
+        fs,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
+    use super::{
+        Config, DEFAULT_CONFIG, LocalContentStore, SourceType, Workspace, sqlite_positive_id,
+    };
 
     /// The three asset-target shapes a configuration can have: the native store,
     /// neither target, and both. Only the first is publishable, and the two that
@@ -1162,8 +1450,7 @@ mod tests {
         let path = directory.join("malformed.yml");
         std::fs::write(&path, malformed).unwrap();
         let error = Workspace::load(path)
-            .err()
-            .expect("an unusable rule must be refused")
+            .expect_err("an unusable rule must be refused")
             .to_string();
         assert!(error.contains("public.exclude"), "{error}");
 
@@ -1213,5 +1500,168 @@ mod tests {
             let id = sqlite_positive_id(value);
             assert!((1..=i64::MAX as u64).contains(&id));
         }
+    }
+    /// A workspace for the source-configuration tests: one source block, one asset
+    /// block, everything else minimal.
+    fn source_workspace(source: &str, assets: &str) -> Result<Workspace, Box<dyn Error>> {
+        let text = format!(
+            "source:\n{source}state:\n  path: ./.mineral\ngit:\n  repository: ./publication\n  remote: origin\n  reference: refs/heads/main\n  author_name: Bot\n  author_email: bot@example.invalid\n  message: Publish Mineral content\n{assets}review:\n  api_base_url: https://api.deepseek.com\n  markdown_model: deepseek-flash\n  asset_model: deepseek-flash\n  api_key_env: MINERAL_DEEPSEEK_API_KEY\n  timeout_seconds: 45\n"
+        );
+        static NEXT: AtomicUsize = AtomicUsize::new(1);
+        let directory = std::env::temp_dir().join(format!(
+            "mineral-cli-source-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("mineral.yaml");
+        fs::write(&path, text).unwrap();
+        Workspace::load(path)
+    }
+
+    fn r2_source_block(prefix: &str) -> String {
+        format!(
+            "  id: r2-vault\n  type: r2\n  r2:\n    endpoint: https://account.r2.cloudflarestorage.com\n    bucket: mineral-vault\n    prefix: {prefix}\n    access_key_id: AKIDEXAMPLE\n    secret_access_key_env: MINERAL_R2_TEST_UNSET_SECRET\n"
+        )
+    }
+
+    fn r2_assets_block(bucket: &str) -> String {
+        format!(
+            "assets:\n  public_base_url: https://assets.example.com\n  r2:\n    endpoint: https://account.r2.cloudflarestorage.com\n    bucket: {bucket}\n    access_key_id: AKIDEXAMPLE\n    secret_access_key_env: MINERAL_R2_TEST_UNSET_SECRET\n"
+        )
+    }
+
+    #[test]
+    fn a_local_source_keeps_working_without_a_type_and_absolute_paths_its_root() {
+        let workspace = source_workspace("  id: local-vault\n  path: ./vault\n", "").unwrap();
+
+        assert_eq!(workspace.source_kind(), SourceType::Local);
+        assert!(workspace.local_source_path().unwrap().is_absolute());
+        assert!(workspace.source_description().ends_with("vault"));
+        assert!(
+            workspace
+                .r2_source(LocalContentStore::new(workspace.cas()))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn an_r2_source_canonicalizes_its_prefix_and_reads_its_secret_lazily() {
+        let workspace = source_workspace(&r2_source_block("vault"), "").unwrap();
+
+        assert_eq!(workspace.source_kind(), SourceType::R2);
+        assert_eq!(
+            workspace.config.source.r2.as_ref().unwrap().prefix,
+            "vault/",
+            "a configured namespace without the separator is canonicalized once"
+        );
+        assert!(
+            workspace
+                .source_description()
+                .contains("mineral-vault/vault/")
+        );
+        assert!(workspace.local_source_path().is_err());
+
+        let error = match workspace.r2_source(LocalContentStore::new(workspace.cas())) {
+            Ok(_) => panic!("an unset secret must be refused"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("MINERAL_R2_TEST_UNSET_SECRET"), "{error}");
+    }
+
+    #[test]
+    fn a_source_must_choose_exactly_one_kind() {
+        // `type: local` cannot also carry an R2 namespace.
+        let local_with_r2 = source_workspace(
+            "  id: local-vault\n  path: ./vault\n  type: local\n  r2:\n    endpoint: https://account.r2.cloudflarestorage.com\n    bucket: mineral-vault\n    prefix: vault/\n    access_key_id: A\n    secret_access_key_env: X\n",
+            "",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            local_with_r2.contains("source.r2 is configured"),
+            "{local_with_r2}"
+        );
+
+        // `type: r2` needs its namespace.
+        let r2_without_block = source_workspace("  id: r2-vault\n  type: r2\n", "")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            r2_without_block.contains("source.r2 is not configured"),
+            "{r2_without_block}"
+        );
+
+        // An R2 source must not keep reading a local directory.
+        let r2_with_path = source_workspace(
+            &format!("  path: ./vault\n{}", r2_source_block("vault/")),
+            "",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            r2_with_path.contains("source.path is not used"),
+            "{r2_with_path}"
+        );
+
+        // A local source still requires its root.
+        let local_without_path = source_workspace("  id: local-vault\n", "")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            local_without_path.contains("source.path is required"),
+            "{local_without_path}"
+        );
+    }
+
+    #[test]
+    fn an_unusable_source_prefix_is_refused_before_anything_reads_the_namespace() {
+        for prefix in ["vault//", "../escape", "/absolute", "C:/vault"] {
+            let error = source_workspace(&r2_source_block(prefix), "")
+                .err()
+                .map(|error| error.to_string())
+                .unwrap_or_default();
+            assert!(
+                error.contains("source.r2.prefix is unusable"),
+                "prefix {prefix:?} was accepted: {error}"
+            );
+        }
+        // An empty prefix would make the whole bucket the source.
+        let empty = source_workspace(
+            "  id: r2-vault\n  type: r2\n  r2:\n    endpoint: https://account.r2.cloudflarestorage.com\n    bucket: mineral-vault\n    prefix: \"\"\n    access_key_id: A\n    secret_access_key_env: X\n",
+            "",
+        )
+        .err()
+        .map(|error| error.to_string())
+        .unwrap_or_default();
+        assert!(empty.contains("source.r2.prefix is unusable"), "{empty}");
+    }
+
+    #[test]
+    fn a_source_namespace_may_not_overlap_the_publication_namespace() {
+        // Same endpoint and bucket, one namespace inside the other: refused.
+        for prefix in ["assets", "assets/sha256", "assets/sha256/deep"] {
+            let error =
+                source_workspace(&r2_source_block(prefix), &r2_assets_block("mineral-vault"))
+                    .err()
+                    .map(|error| error.to_string())
+                    .unwrap_or_default();
+            assert!(
+                error.contains("overlaps the publication namespace"),
+                "{prefix}: {error}"
+            );
+        }
+        // A sibling namespace on the same bucket is exactly the supported case.
+        source_workspace(
+            &r2_source_block("vault/"),
+            &r2_assets_block("mineral-vault"),
+        )
+        .unwrap();
+        // Same namespace but a different bucket is a different namespace.
+        source_workspace(
+            &r2_source_block("assets/"),
+            &r2_assets_block("other-bucket"),
+        )
+        .unwrap();
     }
 }

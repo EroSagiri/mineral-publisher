@@ -4,12 +4,11 @@ use std::{
     io::Read,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
-    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use reqwest::StatusCode;
 use reqwest::blocking::{Client, RequestBuilder};
-use reqwest::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HOST, IF_NONE_MATCH};
+use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use sha2::Digest;
 
 use crate::{
@@ -18,127 +17,14 @@ use crate::{
         ObjectStoreTransport, ObjectWriter,
     },
     domain::Sha256,
+    object_store::{
+        R2ObjectStoreConfig, R2TransportError, SignedRequestSpec, encode_path, payload_sha256,
+        signed_request_builder,
+    },
     workflow::{AssetContentType, AssetObjectKey, PublishedAsset},
 };
 
-use super::signature::{SignableRequest, SigningContext, authorization_header, payload_sha256};
-
 static NEXT_SPOOL: AtomicU64 = AtomicU64::new(1);
-
-/// A secret access key.
-///
-/// The inner value is never printed: a credential must not reach a log, a panic
-/// message or an audit record.
-#[derive(Clone)]
-pub struct R2SecretKey(String);
-
-impl R2SecretKey {
-    pub fn new(value: impl Into<String>) -> Result<Self, R2ObjectStoreConfigError> {
-        let value = value.into();
-        if value.is_empty() || value.contains(['\0', '\n', '\r']) {
-            return Err(R2ObjectStoreConfigError::InvalidSecret);
-        }
-        Ok(Self(value))
-    }
-
-    fn expose(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Debug for R2SecretKey {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("R2SecretKey(<redacted>)")
-    }
-}
-
-/// Everything the adapter needs to reach one bucket.
-///
-/// This is runtime configuration: it lives in the host, is never handed to the
-/// engine, and the engine's durable records never contain any of it.
-#[derive(Clone)]
-pub struct R2ObjectStoreConfig {
-    endpoint: String,
-    bucket: String,
-    region: String,
-    access_key_id: String,
-    secret_access_key: R2SecretKey,
-    /// How long one HTTP request may take, including the streaming body.
-    timeout: Duration,
-}
-
-impl R2ObjectStoreConfig {
-    pub fn new(
-        endpoint: impl Into<String>,
-        bucket: impl Into<String>,
-        access_key_id: impl Into<String>,
-        secret_access_key: R2SecretKey,
-    ) -> Result<Self, R2ObjectStoreConfigError> {
-        let endpoint = endpoint.into();
-        let bucket = bucket.into();
-        let access_key_id = access_key_id.into();
-        if !(endpoint.starts_with("https://") || endpoint.starts_with("http://")) {
-            return Err(R2ObjectStoreConfigError::InvalidEndpoint);
-        }
-        if endpoint.ends_with('/') {
-            return Err(R2ObjectStoreConfigError::InvalidEndpoint);
-        }
-        if bucket.is_empty()
-            || bucket.contains(['/', '\\', '\0'])
-            || access_key_id.is_empty()
-            || access_key_id.contains(['\0', '\n', '\r'])
-        {
-            return Err(R2ObjectStoreConfigError::InvalidIdentity);
-        }
-        Ok(Self {
-            endpoint,
-            bucket,
-            // R2 accepts `auto`; a generic S3 endpoint may need its own region.
-            region: "auto".to_owned(),
-            access_key_id,
-            secret_access_key,
-            timeout: Duration::from_secs(300),
-        })
-    }
-
-    pub fn with_region(
-        mut self,
-        region: impl Into<String>,
-    ) -> Result<Self, R2ObjectStoreConfigError> {
-        let region = region.into();
-        if region.is_empty() || region.contains(['\0', '\n', '\r']) {
-            return Err(R2ObjectStoreConfigError::InvalidIdentity);
-        }
-        self.region = region;
-        Ok(self)
-    }
-
-    pub fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.timeout = timeout;
-        self
-    }
-
-    pub fn bucket(&self) -> &str {
-        &self.bucket
-    }
-
-    pub fn endpoint(&self) -> &str {
-        &self.endpoint
-    }
-}
-
-impl fmt::Debug for R2ObjectStoreConfig {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("R2ObjectStoreConfig")
-            .field("endpoint", &self.endpoint)
-            .field("bucket", &self.bucket)
-            .field("region", &self.region)
-            .field("access_key_id", &self.access_key_id)
-            .field("secret_access_key", &self.secret_access_key)
-            .finish()
-    }
-}
 
 /// An S3-compatible object store used as an asset target.
 ///
@@ -159,7 +45,7 @@ impl R2ObjectStore {
         spool_directory: impl Into<PathBuf>,
     ) -> Result<Self, R2ObjectStoreError> {
         let client = Client::builder()
-            .timeout(config.timeout)
+            .timeout(config.timeout())
             .build()
             .map_err(R2ObjectStoreError::Client)?;
         Ok(Self {
@@ -171,13 +57,13 @@ impl R2ObjectStore {
 
     /// Where this bucket lives, for a report. It never contains a credential.
     pub fn describe(&self) -> String {
-        format!("{}/{}", self.config.endpoint(), self.config.bucket())
+        self.config.describe()
     }
 
     fn canonical_uri(&self, object_key: &AssetObjectKey) -> String {
         format!(
             "/{}/{}",
-            self.config.bucket,
+            self.config.bucket(),
             encode_path(object_key.as_str())
         )
     }
@@ -197,62 +83,18 @@ impl R2ObjectStore {
         content_length: Option<u64>,
         create_only: bool,
     ) -> Result<RequestBuilder, R2ObjectStoreError> {
-        let host = host_of(&self.config.endpoint)?;
-        let (date, amz_date) = timestamps()?;
-        let mut headers: Vec<(String, String)> = vec![
-            ("host".to_owned(), host.clone()),
-            (
-                "x-amz-content-sha256".to_owned(),
-                payload_sha256_hex.to_owned(),
-            ),
-            ("x-amz-date".to_owned(), amz_date.clone()),
-        ];
+        let canonical_uri = self.canonical_uri(object_key);
+        let mut spec =
+            SignedRequestSpec::new(method, &canonical_uri, payload_sha256_hex.to_owned());
         if let Some(content_type) = content_type {
-            headers.push(("content-type".to_owned(), content_type.to_owned()));
+            spec = spec.with_header("content-type", content_type);
         }
         if create_only {
-            headers.push(("if-none-match".to_owned(), "*".to_owned()));
+            spec = spec.with_header("if-none-match", "*");
         }
-        headers.sort_by(|left, right| left.0.cmp(&right.0));
 
-        let canonical_uri = self.canonical_uri(object_key);
-        let request = SignableRequest {
-            method,
-            canonical_uri: &canonical_uri,
-            canonical_query: "",
-            headers: &headers,
-            payload_sha256: payload_sha256_hex,
-        };
-        let context = SigningContext {
-            access_key_id: &self.config.access_key_id,
-            secret_access_key: self.config.secret_access_key.expose(),
-            region: &self.config.region,
-            service: "s3",
-            date: &date,
-            amz_date: &amz_date,
-        };
-        let authorization = authorization_header(&request, &context);
-        let url = format!("{}{canonical_uri}", self.config.endpoint);
-        let builder = self
-            .client
-            .request(
-                reqwest::Method::from_bytes(method.as_bytes())
-                    .expect("the method is a static HTTP verb"),
-                &url,
-            )
-            .header(HOST, host)
-            .header("x-amz-content-sha256", payload_sha256_hex)
-            .header("x-amz-date", amz_date)
-            .header(AUTHORIZATION, authorization);
-        let builder = match content_type {
-            Some(content_type) => builder.header(CONTENT_TYPE, content_type),
-            None => builder,
-        };
-        let builder = if create_only {
-            builder.header(IF_NONE_MATCH, "*")
-        } else {
-            builder
-        };
+        let builder = signed_request_builder(&self.client, &self.config, &spec)
+            .map_err(R2ObjectStoreError::from_transport)?;
         Ok(match content_length {
             Some(length) => builder.header(CONTENT_LENGTH, length),
             None => builder,
@@ -518,93 +360,6 @@ struct VerifiedRemoteObject {
     sha256: Sha256,
 }
 
-/// `YYYYMMDD` and `YYYYMMDDTHHMMSSZ` for the current instant.
-fn timestamps() -> Result<(String, String), R2ObjectStoreError> {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| R2ObjectStoreError::Clock)?;
-    let seconds = now.as_secs();
-    let (year, month, day, hour, minute, second) = civil_from_unix(seconds);
-    Ok((
-        format!("{year:04}{month:02}{day:02}"),
-        format!("{year:04}{month:02}{day:02}T{hour:02}{minute:02}{second:02}Z"),
-    ))
-}
-
-/// Days-from-civil, inverted (Howard Hinnant's algorithm), so no date dependency
-/// is needed for a timestamp.
-fn civil_from_unix(seconds: u64) -> (i64, u32, u32, u32, u32, u32) {
-    let days = (seconds / 86_400) as i64;
-    let remainder = seconds % 86_400;
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    let year = if m <= 2 { y + 1 } else { y };
-    (
-        year,
-        m,
-        d,
-        (remainder / 3_600) as u32,
-        ((remainder % 3_600) / 60) as u32,
-        (remainder % 60) as u32,
-    )
-}
-
-fn host_of(endpoint: &str) -> Result<String, R2ObjectStoreError> {
-    let without_scheme = endpoint
-        .strip_prefix("https://")
-        .or_else(|| endpoint.strip_prefix("http://"))
-        .ok_or(R2ObjectStoreError::InvalidEndpoint)?;
-    let host = without_scheme.split('/').next().unwrap_or_default();
-    if host.is_empty() {
-        return Err(R2ObjectStoreError::InvalidEndpoint);
-    }
-    Ok(host.to_owned())
-}
-
-/// Percent-encodes one object key for a canonical URI, keeping `/` as a separator.
-fn encode_path(path: &str) -> String {
-    let mut encoded = String::with_capacity(path.len());
-    for byte in path.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
-                encoded.push(byte as char)
-            }
-            other => encoded.push_str(&format!("%{other:02X}")),
-        }
-    }
-    encoded
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum R2ObjectStoreConfigError {
-    InvalidEndpoint,
-    InvalidIdentity,
-    InvalidSecret,
-}
-
-impl fmt::Display for R2ObjectStoreConfigError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidEndpoint => formatter.write_str(
-                "object store endpoint must be an absolute http(s) URL without a trailing slash",
-            ),
-            Self::InvalidIdentity => {
-                formatter.write_str("object store bucket or access key id is invalid")
-            }
-            Self::InvalidSecret => formatter.write_str("object store secret access key is invalid"),
-        }
-    }
-}
-
-impl Error for R2ObjectStoreConfigError {}
-
 #[derive(Debug)]
 pub enum R2ObjectStoreError {
     Client(reqwest::Error),
@@ -651,6 +406,14 @@ impl R2ObjectStoreError {
             operation,
             path: path.to_path_buf(),
             source,
+        }
+    }
+
+    /// Maps one low-level request failure onto this adapter's own vocabulary.
+    fn from_transport(error: R2TransportError) -> Self {
+        match error {
+            R2TransportError::Clock => Self::Clock,
+            R2TransportError::InvalidEndpoint => Self::InvalidEndpoint,
         }
     }
 }

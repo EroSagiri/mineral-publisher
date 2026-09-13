@@ -17,12 +17,14 @@
 //!   appeared under the frozen key after the inspection that found it absent, the
 //!   bucket refuses the write instead of accepting an object under a name that may
 //!   no longer describe it.
+//!
+//! The connection itself — endpoint, bucket, credentials, URL encoding and
+//! Signature Version 4 — is shared with the R2 source reader through
+//! [`crate::object_store`]. That module knows nothing about assets.
 
-mod signature;
 #[cfg(test)]
 mod tests;
 mod transport;
 
-pub use transport::{
-    R2ObjectStore, R2ObjectStoreConfig, R2ObjectStoreConfigError, R2ObjectStoreError, R2SecretKey,
-};
+pub use crate::object_store::{R2ObjectStoreConfig, R2ObjectStoreConfigError, R2SecretKey};
+pub use transport::{R2ObjectStore, R2ObjectStoreError};
