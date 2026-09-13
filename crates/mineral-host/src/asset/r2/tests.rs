@@ -756,10 +756,16 @@ fn a_live_bucket_accepts_a_publish_and_serves_the_frozen_bytes_back() {
         &AssetDeliveryConfig::new("https://assets.example.com").unwrap(),
     );
 
-    assert_eq!(
-        store.inspect(published.object_key()).unwrap(),
-        AssetTargetState::Missing
-    );
+    // The key is content-addressed, so an earlier run against the same bucket left
+    // the very same object under it. Either state is a valid starting point:
+    // publishing is idempotent, and anything else under the key is a real failure.
+    match store.inspect(published.object_key()).unwrap() {
+        AssetTargetState::Missing => {}
+        present => assert!(
+            published.judge(&present).is_ready(),
+            "the live bucket holds something else under the frozen key: {present:?}"
+        ),
+    }
 
     let driver = StreamingAssetTarget::with_transport(store).with_chunk_size(8 * 1024);
     let mut source = BufferedBlobSource::new(published.published_sha256(), body.clone());

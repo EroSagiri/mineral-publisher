@@ -15,15 +15,17 @@ use std::{
 
 use crate::{
     asset::{
-        AssetObservationId, AssetObservationStore, AssetTarget, FilesystemAssetTarget,
+        AssetObservationId, AssetObservationStore, AssetTarget, ConfiguredAssetTarget,
+        FilesystemAssetTarget, R2ObjectStore, R2ObjectStoreConfig, R2SecretKey,
         SequentialAssetObservationIdGenerator,
     },
     domain::{ContentPath, Sha256, Snapshot, SnapshotFile, SnapshotId, SourceId, TimestampMillis},
     publisher::{
-        DeliveryProjectionBinding, GitCommitObjectCreator, GitCommitOid, GitCommitSpec,
-        GitProjectionMaterializer, GitPublicationApplication, GitPublicationPrepareRequest,
-        GitPublicationPreparer, GitRefTarget, GitRepositoryAdapter, GitTreeOid, PublishRun,
-        PublishRunId, PublishRunStore, PublishTargetId, RemoteObservationId, RepositoryLocator,
+        DeliveryProjectionBinding, GitCommitMetadata, GitCommitObjectCreator, GitCommitOid,
+        GitCommitSpec, GitProjectionMaterializer, GitPublicationApplication,
+        GitPublicationPrepareRequest, GitPublicationPreparer, GitRefTarget, GitRepositoryAdapter,
+        GitTreeOid, PublishRun, PublishRunId, PublishRunStore, PublishTargetId,
+        RemoteObservationId, RepositoryLocator, SequentialPublishRunIdGenerator,
         SequentialRemoteObservationIdGenerator,
     },
     storage::{
@@ -229,6 +231,27 @@ impl Drop for TestRepository {
 
 fn config() -> AssetDeliveryConfig {
     AssetDeliveryConfig::new("https://assets.example.com").unwrap()
+}
+
+/// The real bucket, when one is configured.
+///
+/// The default test run never reads a credential and never opens a socket; this
+/// is only reached from the ignored live test below.
+fn live_r2_target(spool: PathBuf) -> Option<ConfiguredAssetTarget> {
+    let endpoint = std::env::var("MINERAL_R2_ENDPOINT").ok()?;
+    let bucket = std::env::var("MINERAL_R2_BUCKET").ok()?;
+    let access_key_id = std::env::var("MINERAL_R2_ACCESS_KEY_ID").ok()?;
+    let secret_access_key = std::env::var("MINERAL_R2_SECRET_ACCESS_KEY").ok()?;
+    let config = R2ObjectStoreConfig::new(
+        endpoint,
+        bucket,
+        access_key_id,
+        R2SecretKey::new(secret_access_key).unwrap(),
+    )
+    .unwrap();
+    Some(ConfiguredAssetTarget::r2(
+        R2ObjectStore::new(config, spool).expect("the spool directory must be usable"),
+    ))
 }
 
 fn asset_target(repository: &TestRepository) -> FilesystemAssetTarget {
@@ -733,6 +756,154 @@ fn a_broken_asset_keeps_a_real_publication_off_the_remote() {
         .unwrap(),
         published_bytes
     );
+}
+
+/// The S6.4 path, end to end, against the bucket this workspace is configured to
+/// publish to: one real delivery execution over a real repository, real SQLite
+/// stores, the real `ConfiguredAssetTarget` and the real object store.
+///
+/// It runs only when `MINERAL_R2_ENDPOINT`, `MINERAL_R2_BUCKET`,
+/// `MINERAL_R2_ACCESS_KEY_ID` and `MINERAL_R2_SECRET_ACCESS_KEY` name a bucket:
+///
+/// ```text
+/// cargo test -p mineral-publisher --lib \
+///   a_live_bucket_receives_the_asset_before_a_real_git_compare_and_swap \
+///   -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "requires a live bucket and credentials"]
+fn a_live_bucket_receives_the_asset_before_a_real_git_compare_and_swap() {
+    let Some(repository) = TestRepository::new() else {
+        return;
+    };
+    let Some(asset_target) = live_r2_target(repository.path.join("asset-spool")) else {
+        panic!(
+            "the live test needs MINERAL_R2_ENDPOINT, MINERAL_R2_BUCKET, MINERAL_R2_ACCESS_KEY_ID and MINERAL_R2_SECRET_ACCESS_KEY"
+        );
+    };
+    let (snapshot, projection) = repository.projection();
+    let deliveries =
+        SqliteDeliveryProjectionStore::open(repository.path.join("deliveries.sqlite")).unwrap();
+    let runs = SqlitePublishRunStore::open(repository.path.join("runs.sqlite")).unwrap();
+    let observations =
+        SqliteRemoteObservationStore::open(repository.path.join("observations.sqlite")).unwrap();
+    let asset_observations =
+        SqliteAssetObservationStore::open(repository.path.join("asset-observations.sqlite"))
+            .unwrap();
+    let mut publish_ids = SequentialPublishRunIdGenerator::new(PublishRunId::new(1).unwrap());
+    let mut observation_ids =
+        SequentialRemoteObservationIdGenerator::new(RemoteObservationId::new(1).unwrap());
+    let mut asset_observation_ids =
+        SequentialAssetObservationIdGenerator::new(AssetObservationId::new(1).unwrap());
+    let metadata = GitCommitMetadata::new(
+        "Mineral Publisher",
+        "publisher@example.invalid",
+        "Publish Mineral content",
+    )
+    .unwrap();
+    let target_id = PublishTargetId::new("origin:refs/heads/main").unwrap();
+    let target = GitRefTarget::new("origin", "refs/heads/main").unwrap();
+    let base = repository.remote_head();
+
+    let first = GitPublicationApplication::prepare_and_publish(
+        &projection,
+        &snapshot,
+        &config(),
+        &repository.local,
+        target_id.clone(),
+        target.clone(),
+        &metadata,
+        &repository.store,
+        &runs,
+        &deliveries,
+        &asset_target,
+        &asset_observations,
+        &mut asset_observation_ids,
+        &observations,
+        &mut publish_ids,
+        &mut observation_ids,
+    )
+    .unwrap();
+
+    let execution = first.workflow();
+    let first_published = execution.assets().published();
+    assert!(execution.is_satisfied(), "the delivery must be satisfied");
+    // The key is content-addressed, so a bucket that already holds this object
+    // (from an earlier run of this test, or from the same bytes published before)
+    // verifies and reuses it instead of uploading. What must hold either way is
+    // that the asset side is satisfied by bytes the bucket actually serves.
+    assert_eq!(
+        execution.assets().verified(),
+        1,
+        "the asset must be verified"
+    );
+    assert!(
+        execution.assets().published() <= 1,
+        "at most one object may be published"
+    );
+    eprintln!(
+        "first run: verified={} published={}",
+        execution.assets().verified(),
+        execution.assets().published()
+    );
+    let published = repository.remote_head();
+    assert_ne!(published, base, "the Git ref moved after the asset existed");
+    let delivery =
+        DeliveryProjectionBuilder::build(&projection, &snapshot, &config(), &repository.store)
+            .unwrap();
+    let asset = &delivery.assets().assets()[0];
+    eprintln!(
+        "live asset: key={} url={}",
+        asset.object_key().as_str(),
+        asset.public_url().as_str()
+    );
+
+    // Publishing the very same delivery again is a no-op for both targets: the
+    // bucket already serves bytes that hash to the frozen identity, so nothing is
+    // uploaded a second time and the ref does not move.
+    let second = GitPublicationApplication::prepare_and_publish(
+        &projection,
+        &snapshot,
+        &config(),
+        &repository.local,
+        target_id,
+        target,
+        &metadata,
+        &repository.store,
+        &runs,
+        &deliveries,
+        &asset_target,
+        &asset_observations,
+        &mut asset_observation_ids,
+        &observations,
+        &mut publish_ids,
+        &mut observation_ids,
+    )
+    .unwrap();
+
+    let execution = second.workflow();
+    assert!(execution.is_satisfied(), "the rerun must be satisfied");
+    assert_eq!(
+        execution.assets().published(),
+        0,
+        "an object the bucket already serves must never be uploaded again"
+    );
+    assert_eq!(execution.assets().verified(), 1);
+    assert_eq!(repository.remote_head(), published, "the ref must not move");
+
+    // The audit trail is durable and complete, exactly as with the native target:
+    // every asset inspection in both runs is recorded against its publish run.
+    let saved =
+        AssetObservationStore::list_for_publish_run(&asset_observations, first.publish_run_id())
+            .unwrap();
+    // An object that had to be created is observed before and after the upload; an
+    // object the bucket already served is observed once.
+    let expected = if first_published == 1 { 2 } else { 1 };
+    assert_eq!(saved.len(), expected, "the first run's audit rows");
+    let saved =
+        AssetObservationStore::list_for_publish_run(&asset_observations, second.publish_run_id())
+            .unwrap();
+    assert_eq!(saved.len(), 1, "a rerun only inspects the object it reuses");
 }
 
 #[test]
