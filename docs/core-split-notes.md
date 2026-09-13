@@ -124,6 +124,23 @@ review workflow 在调用 provider 之前先查该 subject 是否已有人工决
 NULL，语义仍是"只对当时那一次 attempt 生效"，不迁移、不放大），新决议同时记录
 identity 与引发它的 attempt。
 
+S6.5.1 把**自动**评审的复用也改成 subject 作用域：`ReviewRun` 的可复用性由
+`(content_path, content_sha256, policy_identity)` 决定，`snapshot_id` 只是这条结果的
+**出处（provenance）**，不再参与"能否复用"。此前 `list_by_snapshot(current)` 让任何
+vault 变动（哪怕只是加一个与交付无关的文件）都换掉 snapshot，从而对**逐字节相同**的内容
+重新调用 provider——既浪费调用，又把模型采样噪声重新引入已经审定的内容。现在：
+
+* store 增加 subject 索引与 `list_by_subject`（schema v1→v2，只加索引，不改任何旧行）；
+* 复用规则单点定义在 `workflow/review_reuse`：有 validated reviewer report 的结论可复用
+  （Approve/Reject/NeedsHumanReview 皆可），attempt failure（timeout/HTTP/decode/transport，
+  report 为空）**不可**当结论复用；人工决议优先于任何自动结论；
+* 同一 subject 出现互相冲突的结论 → fail closed，绝不按"最新一条"猜测；
+* `EffectiveReviewSet` 不再要求 `run.snapshot_id == current_snapshot_id`，改为校验
+  "选中的事实就是这个 subject（路径 + 策略一致，且与结果集里的 durable 行逐字段相同）"；
+  跨 snapshot 复用**不复制、不改写** provenance；
+* 与人工绑定一致：复用键保留 `content_path`（比 provider request identity 更保守），
+  rename 会重新评审，跨 rename 的 content cache 留给以后单独设计。
+
 同一轮还修掉一个 durable identity 的漏洞：`delivery_sha256` 当初只哈希
 "交付的文本树 + 已发布资产"，却没有覆盖它自己存储的 snapshot provenance
 （`snapshot_id`、`managed_root`、每篇文档的 `source_path`/`source_sha256`）。于是

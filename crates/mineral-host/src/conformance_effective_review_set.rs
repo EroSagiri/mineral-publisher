@@ -203,9 +203,16 @@ mod tests {
             )],
             runs,
         );
-        let set =
-            EffectiveReviewSet::build(&result, &asset_result(&[]), &documents, &assets, &human)
-                .unwrap();
+        let set = EffectiveReviewSet::build(
+            &result,
+            &asset_result(&[]),
+            &documents,
+            &assets,
+            &human,
+            &policy(),
+            &policy(),
+        )
+        .unwrap();
         assert_eq!(
             set.approved_markdown_paths(),
             [
@@ -324,6 +331,8 @@ mod tests {
             &documents,
             &assets,
             &human,
+            &policy(),
+            &policy(),
         )
         .unwrap();
         assert_eq!(
@@ -421,6 +430,8 @@ mod tests {
             &documents,
             &assets,
             &human,
+            &policy(),
+            &policy(),
         )
         .unwrap();
         assert_eq!(
@@ -469,6 +480,8 @@ mod tests {
             &documents,
             &assets,
             &human,
+            &policy(),
+            &policy(),
         )
         .unwrap();
         assert_eq!(
@@ -477,13 +490,43 @@ mod tests {
         );
     }
 
+    /// The invariant is the exact subject, not the snapshot.
+    ///
+    /// A fact recorded in an earlier snapshot still answers today's candidate when
+    /// the reviewed content and the policy are the same; a fact about other content,
+    /// or recorded under another policy, does not.
     #[test]
-    fn run_path_and_snapshot_mismatches_fail_closed() {
+    fn the_subject_not_the_snapshot_decides_whether_a_run_applies() {
         let documents = SqliteReviewRunStore::open(":memory:").unwrap();
         let assets = SqliteAssetReviewRunStore::open(":memory:").unwrap();
         let human = SqliteHumanReviewStore::open(":memory:").unwrap();
-        let stored = document(1, "actual.md", PublicPolicyDecision::ReviewApproved);
+
+        // The fact was captured in the fixture snapshot; the publication runs over a
+        // later one. Same content, same policy: it still applies.
+        let stored = document(1, "a.md", PublicPolicyDecision::ReviewApproved);
         documents.save(&stored).unwrap();
+        let later = SnapshotId::new(2).unwrap();
+        let set = EffectiveReviewSet::build(
+            &PublicPolicyRunResult::from_document_outcomes_for_test(later, vec![stored.clone()]),
+            &AssetReviewWorkflowResult::from_entries_for_test(later, Vec::new()),
+            &documents,
+            &assets,
+            &human,
+            &policy(),
+            &policy(),
+        )
+        .unwrap();
+        assert_eq!(
+            set.documents()[0].decision(),
+            EffectiveDocumentDecision::Approved
+        );
+        assert_eq!(
+            set.documents()[0].review_run_id(),
+            Some(stored.id()),
+            "the earlier durable fact is the one that answers"
+        );
+
+        // The selected fact must be about the content it claims to be.
         let selected = document(1, "claimed.md", PublicPolicyDecision::ReviewApproved);
         assert!(matches!(
             EffectiveReviewSet::build(
@@ -491,10 +534,28 @@ mod tests {
                 &asset_result(&[]),
                 &documents,
                 &assets,
-                &human
+                &human,
+                &policy(),
+                &policy()
             ),
             Err(EffectiveReviewSetError::DocumentRunMismatch { .. })
         ));
+
+        // A different policy is a different subject, even for identical content.
+        let other_policy = PolicyIdentity::new("other", "v1", Sha256::new([7; 32])).unwrap();
+        assert!(matches!(
+            EffectiveReviewSet::build(
+                &document_result(vec![stored.clone()]),
+                &asset_result(&[]),
+                &documents,
+                &assets,
+                &human,
+                &other_policy,
+                &policy()
+            ),
+            Err(EffectiveReviewSetError::DocumentRunMismatch { .. })
+        ));
+
         let asset_stored = asset(
             1,
             asset_outcome("actual.png", &["a.md"], AssetReviewDisposition::Blocked),
@@ -514,10 +575,15 @@ mod tests {
                 &selected_asset,
                 &documents,
                 &assets,
-                &human
+                &human,
+                &policy(),
+                &policy()
             ),
             Err(EffectiveReviewSetError::AssetRunMismatch { .. })
         ));
+
+        // The two result sets must still describe one publication, so their own
+        // snapshot identities have to agree.
         let other_snapshot = AssetReviewWorkflowResult::from_entries_for_test(
             SnapshotId::new(2).unwrap(),
             Vec::new(),
@@ -528,7 +594,9 @@ mod tests {
                 &other_snapshot,
                 &documents,
                 &assets,
-                &human
+                &human,
+                &policy(),
+                &policy()
             ),
             Err(EffectiveReviewSetError::SnapshotMismatch { .. })
         ));
@@ -595,7 +663,9 @@ mod tests {
                 &asset_result(&[]),
                 &documents,
                 &assets,
-                &human
+                &human,
+                &policy(),
+                &policy()
             ),
             Err(EffectiveReviewSetError::DocumentHumanSubjectMismatch(_))
         ));
@@ -630,6 +700,8 @@ mod tests {
             &documents,
             &assets,
             &human,
+            &policy(),
+            &policy(),
         )
         .unwrap();
         assert_eq!(

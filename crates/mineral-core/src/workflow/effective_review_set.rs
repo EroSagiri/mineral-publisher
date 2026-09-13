@@ -2,7 +2,7 @@ use std::{error::Error, fmt};
 
 use crate::{
     domain::{ContentPath, SnapshotId},
-    policy::{ReviewRunId, ReviewRunStore},
+    policy::{PolicyIdentity, ReviewRunId, ReviewRunStore},
 };
 
 use super::{
@@ -56,12 +56,15 @@ impl EffectiveReviewSet {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn build<D, A, H>(
         documents: &PublicPolicyRunResult,
         assets: &AssetReviewWorkflowResult,
         document_runs: &D,
         asset_runs: &A,
         human_reviews: &H,
+        document_policy: &PolicyIdentity,
+        asset_policy: &PolicyIdentity,
     ) -> EffectiveReviewSetBuildResult<D, A, H>
     where
         D: ReviewRunStore + ?Sized,
@@ -93,9 +96,14 @@ impl EffectiveReviewSet {
                     path: selected.content_path().clone(),
                     review_run_id: selected.id(),
                 })?;
+            // The selected fact is checked against the *subject* it claims to be:
+            // this content, under the policy the publication is running, exactly as
+            // it was recorded. The snapshot it was first produced in is provenance
+            // and is allowed to be an earlier one — that is what makes a conclusion
+            // reusable across snapshots.
             if run != *selected
-                || run.snapshot_id() != snapshot_id
                 || run.content_path() != selected.content_path()
+                || run.policy() != document_policy
             {
                 return Err(EffectiveReviewSetError::DocumentRunMismatch {
                     path: selected.content_path().clone(),
@@ -125,8 +133,8 @@ impl EffectiveReviewSet {
                     path: selected.content_path().clone(),
                     review_run_id: selected.review_run_id(),
                 })?;
-            if run.snapshot_id() != snapshot_id
-                || run.content_path() != selected.content_path()
+            if run.content_path() != selected.content_path()
+                || run.policy() != asset_policy
                 || run.outcome() != selected.outcome()
             {
                 return Err(EffectiveReviewSetError::AssetRunMismatch {

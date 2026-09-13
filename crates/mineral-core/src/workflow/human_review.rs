@@ -2,7 +2,10 @@ use std::{error::Error, fmt, time::SystemTime};
 
 use crate::{
     domain::{ContentPath, Sha256},
-    policy::{PolicyIdentity, PublicPolicyDecision, ReviewRun, ReviewRunId, ReviewRunStore},
+    policy::{
+        PolicyIdentity, PublicPolicyDecision, ReviewRun, ReviewRunId, ReviewRunStore,
+        ReviewSubjectIdentity,
+    },
 };
 
 use super::{
@@ -29,69 +32,6 @@ impl HumanReviewId {
 pub enum HumanReviewKind {
     Document,
     Asset,
-}
-
-/// What one human decision is about: the exact reviewed content under one policy.
-///
-/// A human decision is never about "the attempt that happened to be pending when
-/// an operator looked". Attempts are re-executed whenever the provider is
-/// unavailable, and every execution mints a fresh audit identity, so a decision
-/// bound to one attempt cannot be recognised by the next one and the same question
-/// is asked forever. The content identity and the policy identity are the only
-/// facts that survive a re-run, so they are what a decision binds to.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ReviewSubjectIdentity {
-    content_path: ContentPath,
-    content_sha256: Sha256,
-    policy: PolicyIdentity,
-}
-
-impl ReviewSubjectIdentity {
-    pub fn new(content_path: ContentPath, content_sha256: Sha256, policy: PolicyIdentity) -> Self {
-        Self {
-            content_path,
-            content_sha256,
-            policy,
-        }
-    }
-
-    pub fn content_path(&self) -> &ContentPath {
-        &self.content_path
-    }
-
-    pub fn content_sha256(&self) -> Sha256 {
-        self.content_sha256
-    }
-
-    pub fn policy(&self) -> &PolicyIdentity {
-        &self.policy
-    }
-}
-
-impl Ord for ReviewSubjectIdentity {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.content_path
-            .cmp(&other.content_path)
-            .then_with(|| {
-                self.content_sha256
-                    .as_bytes()
-                    .cmp(other.content_sha256.as_bytes())
-            })
-            .then_with(|| self.policy.name().cmp(other.policy.name()))
-            .then_with(|| self.policy.version().cmp(other.policy.version()))
-            .then_with(|| {
-                self.policy
-                    .hash()
-                    .as_bytes()
-                    .cmp(other.policy.hash().as_bytes())
-            })
-    }
-}
-
-impl PartialOrd for ReviewSubjectIdentity {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
 }
 
 /// The subject one automatic review outcome is about.
@@ -465,6 +405,29 @@ impl HumanReviewResolution {
         )
     }
 
+    /// The human decision that answers one subject, wherever its attempt was
+    /// recorded.
+    ///
+    /// The subject is looked up first, so a decision survives every later attempt
+    /// about the same content under the same policy. A decision written before
+    /// subjects were bound is found through the attempts it could have named: it
+    /// keeps exactly the meaning its author gave it.
+    pub fn subject_resolution<H: HumanReviewStore + ?Sized>(
+        subject: &HumanReviewSubject,
+        attempts: impl IntoIterator<Item = HumanReviewAttempt>,
+        human_store: &H,
+    ) -> Result<Option<HumanReviewRecord>, H::Error> {
+        if let Some(record) = human_store.get_for_subject(subject)? {
+            return Ok(Some(record));
+        }
+        for attempt in attempts {
+            if let Some(record) = human_store.get_for_attempt(attempt)? {
+                return Ok(Some(record));
+            }
+        }
+        Ok(None)
+    }
+
     /// The human decision that answers one automatic document outcome.
     ///
     /// The subject is looked up first, so a decision survives every later attempt
@@ -475,44 +438,11 @@ impl HumanReviewResolution {
         run: &ReviewRun,
         human_store: &H,
     ) -> Result<Option<HumanReviewRecord>, H::Error> {
-        let subject = HumanReviewSubject::document(run);
-        if let Some(record) = human_store.get_for_subject(&subject)? {
-            return Ok(Some(record));
-        }
-        human_store.get_for_attempt(HumanReviewAttempt::Document(run.id()))
-    }
-
-    /// The candidate paths whose exact content and policy a human has decided.
-    ///
-    /// A human decision is a final answer for the subject it decided about, so a
-    /// later attempt about that same subject must not ask the provider again: doing
-    /// so would not change the answer, would cost a call, and — when the provider
-    /// is the very thing that is down — would fail exactly the same way. The
-    /// subject is the content and the policy, never the attempt, which is why a
-    /// decision survives the re-run that follows a provider outage.
-    pub fn answered_paths<'a, H, I>(
-        human_store: &H,
-        kind: HumanReviewKind,
-        policy: &PolicyIdentity,
-        subjects: I,
-    ) -> Result<std::collections::BTreeSet<ContentPath>, H::Error>
-    where
-        H: HumanReviewStore + ?Sized,
-        I: IntoIterator<Item = (&'a ContentPath, Sha256)>,
-    {
-        let mut answered = std::collections::BTreeSet::new();
-        for (content_path, content_sha256) in subjects {
-            let subject = HumanReviewSubject::for_path(
-                kind,
-                content_path.clone(),
-                content_sha256,
-                policy.clone(),
-            );
-            if human_store.get_for_subject(&subject)?.is_some() {
-                answered.insert(content_path.clone());
-            }
-        }
-        Ok(answered)
+        Self::subject_resolution(
+            &HumanReviewSubject::document(run),
+            [HumanReviewAttempt::Document(run.id())],
+            human_store,
+        )
     }
 
     /// The human decision that answers one automatic asset outcome.
@@ -520,11 +450,11 @@ impl HumanReviewResolution {
         run: &AssetReviewRun,
         human_store: &H,
     ) -> Result<Option<HumanReviewRecord>, H::Error> {
-        let subject = HumanReviewSubject::asset(run);
-        if let Some(record) = human_store.get_for_subject(&subject)? {
-            return Ok(Some(record));
-        }
-        human_store.get_for_attempt(HumanReviewAttempt::Asset(run.id()))
+        Self::subject_resolution(
+            &HumanReviewSubject::asset(run),
+            [HumanReviewAttempt::Asset(run.id())],
+            human_store,
+        )
     }
 
     pub fn list_pending_documents<R, H>(

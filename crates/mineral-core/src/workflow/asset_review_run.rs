@@ -214,5 +214,12 @@ pub trait AssetReviewRunStore {
     fn get(&self, id: AssetReviewRunId) -> Result<Option<AssetReviewRun>, Self::Error>;
     fn list_by_snapshot(&self, snapshot_id: SnapshotId)
     -> Result<Vec<AssetReviewRun>, Self::Error>;
+    /// Every durable asset-review fact for one exact subject, in the order it was
+    /// recorded. See [`ReviewRunStore::list_by_subject`] for why the subject — not
+    /// the snapshot — is the lookup.
+    fn list_by_subject(
+        &self,
+        subject: &crate::policy::ReviewSubjectIdentity,
+    ) -> Result<Vec<AssetReviewRun>, Self::Error>;
     fn list_pending_human_review(&self) -> Result<Vec<AssetReviewRun>, Self::Error>;
 }

@@ -19,6 +19,8 @@ pub use public_policy::{
     ReviewDecision, ReviewReasonCode, Reviewer, ReviewerError, ReviewerErrorKind, ReviewerReport,
     ReviewerReportError,
 };
-pub use review_run::{PolicyIdentity, ReviewRun, ReviewRunError, ReviewRunId, ReviewRunStore};
+pub use review_run::{
+    PolicyIdentity, ReviewRun, ReviewRunError, ReviewRunId, ReviewRunStore, ReviewSubjectIdentity,
+};
 pub use review_summary::validate_review_summary;
 pub use review_summary::{MAX_REVIEW_SUMMARY_CHARS, ReviewSummaryError};

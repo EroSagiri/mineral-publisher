@@ -245,6 +245,8 @@ impl PublicationApplication {
             document_runs,
             asset_runs,
             human_store,
+            request.markdown_policy,
+            request.asset_policy,
         )
         .map_err(|e| stage("Markdown human resolution", e))?;
         if document_effective.has_pending_review() {
@@ -286,9 +288,16 @@ impl PublicationApplication {
             request.snapshot,
             request.asset_policy,
         )?;
-        let effective =
-            EffectiveReviewSet::build(&documents, &assets, document_runs, asset_runs, human_store)
-                .map_err(|e| stage("effective review selection", e))?;
+        let effective = EffectiveReviewSet::build(
+            &documents,
+            &assets,
+            document_runs,
+            asset_runs,
+            human_store,
+            request.markdown_policy,
+            request.asset_policy,
+        )
+        .map_err(|e| stage("effective review selection", e))?;
         let trace = PublicationTrace {
             snapshot: request.snapshot.clone(),
             markdown_reviews: documents,

@@ -203,6 +203,25 @@ mod tests {
             Ok(runs)
         }
 
+        fn list_by_subject(
+            &self,
+            subject: &ReviewSubjectIdentity,
+        ) -> Result<Vec<ReviewRun>, Self::Error> {
+            let mut runs = self
+                .saved
+                .borrow()
+                .iter()
+                .filter(|run| {
+                    run.content_path() == subject.content_path()
+                        && run.content_sha256() == subject.content_sha256()
+                        && run.policy() == subject.policy()
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            runs.sort_by_key(|run| run.id().get());
+            Ok(runs)
+        }
+
         fn list_pending_human_review(&self) -> Result<Vec<ReviewRun>, Self::Error> {
             Ok(self
                 .saved
@@ -240,6 +259,58 @@ mod tests {
             files,
         )
         .unwrap()
+    }
+
+    fn snapshot_with_id(
+        id: u64,
+        store: &LocalContentStore,
+        entries: impl IntoIterator<Item = (&'static str, &'static [u8])>,
+    ) -> Snapshot {
+        let files = entries
+            .into_iter()
+            .map(|(file_path, content)| {
+                let sha256 = store.store(content).unwrap();
+                SnapshotFile::new(path(file_path), content.len() as u64, sha256, None)
+            })
+            .collect();
+        Snapshot::new(
+            SnapshotId::new(id).unwrap(),
+            SystemTime::UNIX_EPOCH,
+            SourceId::new("test-vault").unwrap(),
+            files,
+        )
+        .unwrap()
+    }
+
+    fn execute_with_policy<R, S, H>(
+        snapshot: &Snapshot,
+        content_store: &LocalContentStore,
+        reviewer: &R,
+        review_run_store: &S,
+        human_reviews: &H,
+        policy_identity: &PolicyIdentity,
+        first_id: u64,
+    ) -> Result<
+        PublicPolicyRunResult,
+        PublicPolicyRunError<S::Error, SequentialReviewRunIdGeneratorError, H::Error>,
+    >
+    where
+        R: Reviewer + ?Sized,
+        S: ReviewRunStore + ?Sized,
+        H: HumanReviewStore + ?Sized,
+    {
+        let mut ids = SequentialReviewRunIdGenerator::new(ReviewRunId::new(first_id).unwrap());
+        PublicPolicyRun::execute_at(
+            snapshot,
+            content_store,
+            reviewer,
+            review_run_store,
+            human_reviews,
+            policy_identity,
+            &mut ids,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(10),
+            &SequentialMarkdownReviews,
+        )
     }
 
     fn execute_with_fixed_clock<
@@ -375,6 +446,307 @@ mod tests {
         assert_eq!(review_store.saved(), result.document_outcomes());
     }
 
+    fn calls_for(reviewer: &RecordingReviewer, path: &str) -> usize {
+        reviewer
+            .calls()
+            .iter()
+            .filter(|called| called.as_str() == path)
+            .count()
+    }
+
+    /// S6.5.1: a conclusion about identical content under one policy is reused from
+    /// an earlier snapshot, without asking the provider again — and the durable fact
+    /// it reuses keeps the snapshot it was first recorded in.
+    #[test]
+    fn a_conclusion_is_reused_across_snapshots() {
+        let directory = TestDirectory::new();
+        let store = directory.store();
+        let documents = SqliteReviewRunStore::open(directory.database()).unwrap();
+        let human = SqliteHumanReviewStore::open(directory.human_database()).unwrap();
+        let reviewer = RecordingReviewer::approving(["a.md"]);
+
+        let first_snapshot = snapshot_with_id(1, &store, [("a.md", b"body" as &[u8])]);
+        let first =
+            execute_with_fixed_clock(&first_snapshot, &store, &reviewer, &documents, &human, 1)
+                .unwrap();
+        assert_eq!(calls_for(&reviewer, "a.md"), 1);
+        let recorded = first.document_outcomes()[0].clone();
+
+        // A later snapshot, captured because an unrelated binary was added. Nothing
+        // about `a.md` changed.
+        let second_snapshot = snapshot_with_id(
+            2,
+            &store,
+            [
+                ("a.md", b"body" as &[u8]),
+                ("unrelated.png", b"\x89PNG\r\n\x1a\n" as &[u8]),
+            ],
+        );
+        let second =
+            execute_with_fixed_clock(&second_snapshot, &store, &reviewer, &documents, &human, 2)
+                .unwrap();
+
+        assert_eq!(
+            calls_for(&reviewer, "a.md"),
+            1,
+            "the provider must not be asked again"
+        );
+        let reused = &second.document_outcomes()[0];
+        assert_eq!(reused.id(), recorded.id(), "the durable fact is reused");
+        assert_eq!(
+            reused.snapshot_id(),
+            first_snapshot.id(),
+            "its origin snapshot is provenance and is not rewritten"
+        );
+        assert_eq!(
+            reused.reviewer_report(),
+            recorded.reviewer_report(),
+            "the conclusion itself is the same fact"
+        );
+    }
+
+    /// Only the changed file is asked about again.
+    #[test]
+    fn a_changed_file_is_reviewed_again_while_an_unchanged_one_is_reused() {
+        let directory = TestDirectory::new();
+        let store = directory.store();
+        let documents = SqliteReviewRunStore::open(directory.database()).unwrap();
+        let human = SqliteHumanReviewStore::open(directory.human_database()).unwrap();
+        let reviewer = RecordingReviewer::approving(["a.md", "b.md"]);
+
+        let first_snapshot = snapshot_with_id(
+            1,
+            &store,
+            [("a.md", b"first" as &[u8]), ("b.md", b"stable" as &[u8])],
+        );
+        let first =
+            execute_with_fixed_clock(&first_snapshot, &store, &reviewer, &documents, &human, 10)
+                .unwrap();
+        assert_eq!(reviewer.calls().len(), 2);
+
+        let second_snapshot = snapshot_with_id(
+            2,
+            &store,
+            [("a.md", b"second" as &[u8]), ("b.md", b"stable" as &[u8])],
+        );
+        let second =
+            execute_with_fixed_clock(&second_snapshot, &store, &reviewer, &documents, &human, 20)
+                .unwrap();
+
+        assert_eq!(
+            calls_for(&reviewer, "a.md"),
+            2,
+            "changed content is reviewed"
+        );
+        assert_eq!(
+            calls_for(&reviewer, "b.md"),
+            1,
+            "unchanged content is reused"
+        );
+        let recorded_b = first
+            .document_outcomes()
+            .iter()
+            .find(|run| run.content_path().as_str() == "b.md")
+            .unwrap();
+        let reused_b = second
+            .document_outcomes()
+            .iter()
+            .find(|run| run.content_path().as_str() == "b.md")
+            .unwrap();
+        assert_eq!(reused_b.id(), recorded_b.id());
+        assert_eq!(reused_b.snapshot_id(), first_snapshot.id());
+    }
+
+    /// A rename is a different subject, and this stage re-reviews rather than
+    /// widening reuse across paths.
+    #[test]
+    fn identical_bytes_under_another_path_are_a_different_subject() {
+        let directory = TestDirectory::new();
+        let store = directory.store();
+        let documents = SqliteReviewRunStore::open(directory.database()).unwrap();
+        let human = SqliteHumanReviewStore::open(directory.human_database()).unwrap();
+        let reviewer = RecordingReviewer::approving(["original.md", "renamed.md"]);
+
+        let first_snapshot = snapshot_with_id(1, &store, [("original.md", b"same" as &[u8])]);
+        execute_with_fixed_clock(&first_snapshot, &store, &reviewer, &documents, &human, 30)
+            .unwrap();
+        let second_snapshot = snapshot_with_id(2, &store, [("renamed.md", b"same" as &[u8])]);
+        execute_with_fixed_clock(&second_snapshot, &store, &reviewer, &documents, &human, 40)
+            .unwrap();
+
+        assert_eq!(calls_for(&reviewer, "renamed.md"), 1);
+    }
+
+    /// A policy change is a different subject for the same bytes.
+    #[test]
+    fn another_policy_is_a_different_subject() {
+        let directory = TestDirectory::new();
+        let store = directory.store();
+        let documents = SqliteReviewRunStore::open(directory.database()).unwrap();
+        let human = SqliteHumanReviewStore::open(directory.human_database()).unwrap();
+        let reviewer = RecordingReviewer::approving(["a.md"]);
+        let snapshot = snapshot_with_id(1, &store, [("a.md", b"body" as &[u8])]);
+
+        execute_with_policy(
+            &snapshot,
+            &store,
+            &reviewer,
+            &documents,
+            &human,
+            &policy(),
+            50,
+        )
+        .unwrap();
+        let other = PolicyIdentity::new("public", "v2", Sha256::new([43; 32])).unwrap();
+        execute_with_policy(&snapshot, &store, &reviewer, &documents, &human, &other, 60).unwrap();
+
+        assert_eq!(calls_for(&reviewer, "a.md"), 2);
+    }
+
+    /// A rejection and a provider-returned human-review question are conclusions
+    /// too, and are reused exactly as recorded.
+    #[test]
+    fn rejections_and_human_questions_are_reused_across_snapshots() {
+        let directory = TestDirectory::new();
+        let store = directory.store();
+        let documents = SqliteReviewRunStore::open(directory.database()).unwrap();
+        let human = SqliteHumanReviewStore::open(directory.human_database()).unwrap();
+        let reviewer = RecordingReviewer::with_responses([
+            ("a.md", Ok(ReviewDecision::Reject)),
+            ("b.md", Ok(ReviewDecision::NeedsHumanReview)),
+        ]);
+
+        let first_snapshot = snapshot_with_id(
+            1,
+            &store,
+            [("a.md", b"rejected" as &[u8]), ("b.md", b"asked" as &[u8])],
+        );
+        let first =
+            execute_with_fixed_clock(&first_snapshot, &store, &reviewer, &documents, &human, 70)
+                .unwrap();
+        assert_eq!(reviewer.calls().len(), 2);
+
+        let second_snapshot = snapshot_with_id(
+            2,
+            &store,
+            [
+                ("a.md", b"rejected" as &[u8]),
+                ("b.md", b"asked" as &[u8]),
+                ("unrelated.png", b"\x89PNG\r\n\x1a\n" as &[u8]),
+            ],
+        );
+        let second =
+            execute_with_fixed_clock(&second_snapshot, &store, &reviewer, &documents, &human, 80)
+                .unwrap();
+
+        assert_eq!(reviewer.calls().len(), 2, "nothing is asked twice");
+        for (before, after) in first
+            .document_outcomes()
+            .iter()
+            .zip(second.document_outcomes().iter())
+        {
+            assert_eq!(before.decision(), after.decision());
+            assert_eq!(before.id(), after.id());
+            assert_eq!(before.reviewer_report(), after.reviewer_report());
+        }
+        assert!(matches!(
+            second.document_outcomes()[0].decision(),
+            PublicPolicyDecision::ReviewRejected
+        ));
+    }
+
+    /// A failed attempt is not a conclusion: without a human decision, the next
+    /// snapshot asks the provider again.
+    #[test]
+    fn a_provider_failure_is_not_reused_as_a_conclusion() {
+        let directory = TestDirectory::new();
+        let store = directory.store();
+        let documents = SqliteReviewRunStore::open(directory.database()).unwrap();
+        let human = SqliteHumanReviewStore::open(directory.human_database()).unwrap();
+        let reviewer = RecordingReviewer::with_responses([(
+            "a.md",
+            Err(ReviewerError::new("provider unavailable")),
+        )]);
+
+        let first_snapshot = snapshot_with_id(1, &store, [("a.md", b"body" as &[u8])]);
+        execute_with_fixed_clock(&first_snapshot, &store, &reviewer, &documents, &human, 90)
+            .unwrap();
+        let second_snapshot = snapshot_with_id(2, &store, [("a.md", b"body" as &[u8])]);
+        execute_with_fixed_clock(&second_snapshot, &store, &reviewer, &documents, &human, 100)
+            .unwrap();
+
+        assert_eq!(
+            calls_for(&reviewer, "a.md"),
+            2,
+            "an attempt failure states nothing about the content"
+        );
+    }
+
+    /// A human approval survives a later snapshot: the failed attempt it answered is
+    /// reused, and the provider is never asked again.
+    #[test]
+    fn a_human_approval_survives_a_later_snapshot() {
+        let directory = TestDirectory::new();
+        let store = directory.store();
+        let documents = SqliteReviewRunStore::open(directory.database()).unwrap();
+        let human = SqliteHumanReviewStore::open(directory.human_database()).unwrap();
+        let assets = SqliteAssetReviewRunStore::open(directory.asset_database()).unwrap();
+        let reviewer = RecordingReviewer::with_responses([(
+            "a.md",
+            Err(ReviewerError::new("provider unavailable")),
+        )]);
+
+        let first_snapshot = snapshot_with_id(1, &store, [("a.md", b"body" as &[u8])]);
+        let first =
+            execute_with_fixed_clock(&first_snapshot, &store, &reviewer, &documents, &human, 110)
+                .unwrap();
+        let attempt = first.document_outcomes()[0].clone();
+        HumanReviewResolution::resolve_document(
+            &documents,
+            &human,
+            HumanReviewId::new(1).unwrap(),
+            attempt.id(),
+            HumanReviewDecision::Approve,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(30),
+            None,
+            None,
+        )
+        .unwrap();
+
+        let second_snapshot = snapshot_with_id(
+            2,
+            &store,
+            [
+                ("a.md", b"body" as &[u8]),
+                ("unrelated.png", b"\x89PNG\r\n\x1a\n" as &[u8]),
+            ],
+        );
+        let second =
+            execute_with_fixed_clock(&second_snapshot, &store, &reviewer, &documents, &human, 120)
+                .unwrap();
+
+        assert_eq!(
+            calls_for(&reviewer, "a.md"),
+            1,
+            "an approved subject never reaches the provider again"
+        );
+        assert_eq!(second.document_outcomes()[0].id(), attempt.id());
+        let effective = EffectiveReviewSet::build(
+            &second,
+            &AssetReviewWorkflowResult::empty(second_snapshot.id()),
+            &documents,
+            &assets,
+            &human,
+            &policy(),
+            &policy(),
+        )
+        .unwrap();
+        assert_eq!(
+            effective.documents()[0].decision(),
+            EffectiveDocumentDecision::Approved
+        );
+    }
+
     /// S6.5 acceptance: a provider outage asks a human, and that human's answer is
     /// reused by every later attempt of the same content under the same policy,
     /// without calling the provider again.
@@ -455,6 +827,8 @@ mod tests {
             &documents,
             &assets,
             &human,
+            &policy(),
+            &policy(),
         )
         .unwrap();
         assert_eq!(

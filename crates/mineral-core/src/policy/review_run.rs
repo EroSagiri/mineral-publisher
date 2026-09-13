@@ -236,5 +236,80 @@ pub trait ReviewRunStore {
 
     fn list_by_snapshot(&self, snapshot_id: SnapshotId) -> Result<Vec<ReviewRun>, Self::Error>;
 
+    /// Every durable review fact for one exact subject, in the order it was
+    /// recorded.
+    ///
+    /// A subject is the reviewed content under one policy; the snapshot a fact
+    /// happened to be captured in is provenance, not identity. This is the only
+    /// lookup a later review may reuse from, and it is never a scan of history:
+    /// it names one subject and returns that subject's facts.
+    fn list_by_subject(
+        &self,
+        subject: &ReviewSubjectIdentity,
+    ) -> Result<Vec<ReviewRun>, Self::Error>;
+
     fn list_pending_human_review(&self) -> Result<Vec<ReviewRun>, Self::Error>;
+}
+
+/// What one human decision is about: the exact reviewed content under one policy.
+///
+/// A human decision is never about "the attempt that happened to be pending when
+/// an operator looked". Attempts are re-executed whenever the provider is
+/// unavailable, and every execution mints a fresh audit identity, so a decision
+/// bound to one attempt cannot be recognised by the next one and the same question
+/// is asked forever. The content identity and the policy identity are the only
+/// facts that survive a re-run, so they are what a decision binds to.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReviewSubjectIdentity {
+    content_path: ContentPath,
+    content_sha256: Sha256,
+    policy: PolicyIdentity,
+}
+
+impl ReviewSubjectIdentity {
+    pub fn new(content_path: ContentPath, content_sha256: Sha256, policy: PolicyIdentity) -> Self {
+        Self {
+            content_path,
+            content_sha256,
+            policy,
+        }
+    }
+
+    pub fn content_path(&self) -> &ContentPath {
+        &self.content_path
+    }
+
+    pub fn content_sha256(&self) -> Sha256 {
+        self.content_sha256
+    }
+
+    pub fn policy(&self) -> &PolicyIdentity {
+        &self.policy
+    }
+}
+
+impl Ord for ReviewSubjectIdentity {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.content_path
+            .cmp(&other.content_path)
+            .then_with(|| {
+                self.content_sha256
+                    .as_bytes()
+                    .cmp(other.content_sha256.as_bytes())
+            })
+            .then_with(|| self.policy.name().cmp(other.policy.name()))
+            .then_with(|| self.policy.version().cmp(other.policy.version()))
+            .then_with(|| {
+                self.policy
+                    .hash()
+                    .as_bytes()
+                    .cmp(other.policy.hash().as_bytes())
+            })
+    }
+}
+
+impl PartialOrd for ReviewSubjectIdentity {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }

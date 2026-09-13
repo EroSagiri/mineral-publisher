@@ -4,14 +4,14 @@ use rusqlite::{Connection, OptionalExtension, params, types::Type};
 
 use crate::{
     domain::{ContentPath, Sha256, SnapshotId},
-    policy::PolicyIdentity,
+    policy::{PolicyIdentity, ReviewSubjectIdentity},
     workflow::{
         AssetHumanReviewReason, AssetReviewDecision, AssetReviewDisposition, AssetReviewOutcome,
         AssetReviewRun, AssetReviewRunId, AssetReviewRunStore,
     },
 };
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 /// Local SQLite implementation of the narrow Asset Review Run audit boundary.
 pub struct SqliteAssetReviewRunStore {
@@ -51,8 +51,24 @@ impl SqliteAssetReviewRunStore {
                    ON asset_review_runs(snapshot_id, content_path, id);
                  CREATE INDEX asset_review_runs_pending_human_review
                    ON asset_review_runs(outcome_kind, snapshot_id, content_path, id);
-                 PRAGMA user_version = 1;
+                 CREATE INDEX asset_review_runs_by_subject
+                   ON asset_review_runs(content_path, content_sha256,
+                                        policy_name, policy_version, policy_hash, id);
+                 PRAGMA user_version = 2;
                  COMMIT;",
+                )
+                .map_err(SqliteAssetReviewRunStoreError::Sqlite)?,
+            // Version 2 makes the durable facts of one exact review subject
+            // addressable; no row changes, because these columns were already the
+            // identity of the reviewed content.
+            1 => connection
+                .execute_batch(
+                    "BEGIN IMMEDIATE;
+                     CREATE INDEX asset_review_runs_by_subject
+                       ON asset_review_runs(content_path, content_sha256,
+                                            policy_name, policy_version, policy_hash, id);
+                     PRAGMA user_version = 2;
+                     COMMIT;",
                 )
                 .map_err(SqliteAssetReviewRunStoreError::Sqlite)?,
             SCHEMA_VERSION => {}
@@ -68,17 +84,15 @@ impl SqliteAssetReviewRunStore {
     fn load_many(
         &self,
         sql: &str,
-        parameter: Option<i64>,
+        parameters: &[&dyn rusqlite::ToSql],
     ) -> Result<Vec<AssetReviewRun>, SqliteAssetReviewRunStoreError> {
         let mut statement = self
             .connection
             .prepare(sql)
             .map_err(SqliteAssetReviewRunStoreError::Sqlite)?;
-        let rows = match parameter {
-            Some(value) => statement.query_map([value], row_to_asset_review_run),
-            None => statement.query_map([], row_to_asset_review_run),
-        }
-        .map_err(SqliteAssetReviewRunStoreError::Sqlite)?;
+        let rows = statement
+            .query_map(parameters, row_to_asset_review_run)
+            .map_err(SqliteAssetReviewRunStoreError::Sqlite)?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(SqliteAssetReviewRunStoreError::Sqlite)
     }
@@ -133,7 +147,29 @@ impl AssetReviewRunStore for SqliteAssetReviewRunStore {
             "SELECT id, snapshot_id, content_path, content_sha256, policy_name, policy_version, policy_hash,
                     outcome_kind, outcome_json, reviewer_called, created_at_unix_ms
              FROM asset_review_runs WHERE snapshot_id = ?1 ORDER BY content_path COLLATE BINARY ASC, id ASC",
-            Some(integer("snapshot id", snapshot_id.get())?),
+            &[&integer("snapshot id", snapshot_id.get())?],
+        )
+    }
+
+    fn list_by_subject(
+        &self,
+        subject: &ReviewSubjectIdentity,
+    ) -> Result<Vec<AssetReviewRun>, Self::Error> {
+        // One exact subject; the snapshot a fact was captured in is provenance.
+        self.load_many(
+            "SELECT id, snapshot_id, content_path, content_sha256, policy_name, policy_version, policy_hash,
+                    outcome_kind, outcome_json, reviewer_called, created_at_unix_ms
+             FROM asset_review_runs
+             WHERE content_path = ?1 AND content_sha256 = ?2
+               AND policy_name = ?3 AND policy_version = ?4 AND policy_hash = ?5
+             ORDER BY id ASC",
+            &[
+                &subject.content_path().as_str(),
+                &subject.content_sha256().as_bytes().as_slice(),
+                &subject.policy().name(),
+                &subject.policy().version(),
+                &subject.policy().hash().as_bytes().as_slice(),
+            ],
         )
     }
 
@@ -143,7 +179,8 @@ impl AssetReviewRunStore for SqliteAssetReviewRunStore {
                     outcome_kind, outcome_json, reviewer_called, created_at_unix_ms
              FROM asset_review_runs
              WHERE outcome_kind IN ('reviewer_needs_human_review', 'policy_needs_human_review', 'reviewer_failed')
-             ORDER BY snapshot_id ASC, content_path COLLATE BINARY ASC, id ASC", None,
+             ORDER BY snapshot_id ASC, content_path COLLATE BINARY ASC, id ASC",
+            &[],
         )
     }
 }
@@ -354,11 +391,18 @@ mod tests {
         Sha256::digest(value.as_bytes())
     }
     fn snapshot(id: u64, asset: &str, content: &str) -> Snapshot {
+        snapshot_of(id, &[(asset, content)])
+    }
+
+    fn snapshot_of(id: u64, assets: &[(&str, &str)]) -> Snapshot {
         Snapshot::new(
             SnapshotId::new(id).unwrap(),
             SystemTime::UNIX_EPOCH,
             SourceId::new("test").unwrap(),
-            vec![SnapshotFile::new(path(asset), 1, sha(content), None)],
+            assets
+                .iter()
+                .map(|(asset, content)| SnapshotFile::new(path(asset), 1, sha(content), None))
+                .collect(),
         )
         .unwrap()
     }
@@ -483,6 +527,108 @@ mod tests {
         assert_eq!(
             store.list_pending_human_review().unwrap(),
             vec![policy_human, reviewer_human]
+        );
+    }
+
+    /// The subject lookup spans snapshots and ignores other subjects.
+    #[test]
+    fn the_subject_lookup_spans_snapshots() {
+        let directory = TestDirectory::new();
+        let store = SqliteAssetReviewRunStore::open(directory.database()).unwrap();
+        let first_snapshot = snapshot(1, "a.png", "one");
+        let later_snapshot = snapshot_of(2, &[("a.png", "one"), ("b.png", "two")]);
+        let first = run(
+            1,
+            &first_snapshot,
+            "a.png",
+            "one",
+            AssetReviewDisposition::Reviewed(AssetReviewDecision::Approve),
+            Vec::new(),
+        );
+        let second = run(
+            2,
+            &later_snapshot,
+            "a.png",
+            "one",
+            AssetReviewDisposition::Reviewed(AssetReviewDecision::Reject),
+            Vec::new(),
+        );
+        let elsewhere = run(
+            3,
+            &later_snapshot,
+            "b.png",
+            "two",
+            AssetReviewDisposition::Reviewed(AssetReviewDecision::Approve),
+            Vec::new(),
+        );
+        for entry in [&first, &second, &elsewhere] {
+            store.save(entry).unwrap();
+        }
+
+        let subject = ReviewSubjectIdentity::new(path("a.png"), sha("one"), policy());
+        let found = store.list_by_subject(&subject).unwrap();
+        assert_eq!(
+            found.iter().map(|run| run.id().get()).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(
+            found
+                .iter()
+                .map(|run| run.snapshot_id().get())
+                .collect::<Vec<_>>(),
+            vec![1, 2],
+            "each fact keeps its origin snapshot"
+        );
+        assert!(
+            store
+                .list_by_subject(&ReviewSubjectIdentity::new(
+                    path("b.png"),
+                    sha("two"),
+                    policy()
+                ))
+                .unwrap()
+                .len()
+                == 1
+        );
+    }
+
+    /// A database written before the subject index existed upgrades in place.
+    #[test]
+    fn a_version_one_database_upgrades_and_answers_subject_queries() {
+        let directory = TestDirectory::new();
+        let database = directory.database();
+        let stored = run(
+            1,
+            &snapshot(1, "a.png", "one"),
+            "a.png",
+            "one",
+            AssetReviewDisposition::Reviewed(AssetReviewDecision::Approve),
+            Vec::new(),
+        );
+        {
+            let store = SqliteAssetReviewRunStore::open(&database).unwrap();
+            store.save(&stored).unwrap();
+            store
+                .connection
+                .execute_batch("DROP INDEX asset_review_runs_by_subject; PRAGMA user_version = 1;")
+                .unwrap();
+        }
+
+        let reopened = SqliteAssetReviewRunStore::open(&database).unwrap();
+        let version: i64 = reopened
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 2);
+        assert_eq!(
+            reopened
+                .list_by_subject(&ReviewSubjectIdentity::new(
+                    path("a.png"),
+                    sha("one"),
+                    policy()
+                ))
+                .unwrap(),
+            vec![stored]
         );
     }
 

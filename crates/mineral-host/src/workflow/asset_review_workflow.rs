@@ -6,10 +6,10 @@ use crate::{
 };
 
 use super::{
-    AssetInspector, AssetPolicy, AssetReviewEvaluator, AssetReviewRun, AssetReviewRunError,
-    AssetReviewRunId, AssetReviewRunIdGenerator, AssetReviewRunStore, AssetReviewWorkflowEntry,
-    AssetReviewWorkflowResult, AssetReviewer, CandidateAssetSet, HumanReviewKind,
-    HumanReviewResolution, HumanReviewStore,
+    AssetInspector, AssetPolicy, AssetPolicyOutcome, AssetReviewEvaluator, AssetReviewRun,
+    AssetReviewRunError, AssetReviewRunId, AssetReviewRunIdGenerator, AssetReviewRunStore,
+    AssetReviewWorkflowEntry, AssetReviewWorkflowResult, AssetReviewer, CandidateAssetSet,
+    HumanReviewKind, HumanReviewStore, HumanReviewSubject, ReviewReuseError, reuse_asset_review,
 };
 
 /// The boundary that stopped a workflow before it had a complete durable result.
@@ -22,6 +22,17 @@ pub enum AssetReviewWorkflowFailure<StoreError, IdError, CheckError, HumanError>
     ProgramCheck(CheckError),
     ReviewCacheLookup(StoreError),
     HumanReviewLookup(HumanError),
+    /// A human decided this subject, but no durable attempt awaiting that decision
+    /// exists for it.
+    HumanDecisionWithoutPendingAttempt {
+        path: ContentPath,
+        subject: Box<HumanReviewSubject>,
+    },
+    /// Two durable automatic conclusions about one subject disagree.
+    ConflictingReusableReviews {
+        path: ContentPath,
+        subject: Box<HumanReviewSubject>,
+    },
     ReviewRunId {
         path: ContentPath,
         source: IdError,
@@ -85,6 +96,14 @@ impl<
                     "could not look up human review decisions: {source}"
                 )
             }
+            AssetReviewWorkflowFailure::HumanDecisionWithoutPendingAttempt { path, .. } => write!(
+                formatter,
+                "a human decision answers {path} but no durable attempt awaits it"
+            ),
+            AssetReviewWorkflowFailure::ConflictingReusableReviews { path, .. } => write!(
+                formatter,
+                "durable automatic reviews disagree about {path} under the same policy"
+            ),
             AssetReviewWorkflowFailure::ReviewRunId { path, source } => {
                 write!(
                     formatter,
@@ -147,6 +166,69 @@ impl<'a, C: AssetInspector> AssetReviewWorkflowInput<'a, C> {
     }
 }
 
+/// The durable conclusion that answers one candidate, if any exists.
+///
+/// Keyed by the reviewed content and the policy, never by the snapshot the
+/// conclusion was first recorded in: identical content under an identical policy
+/// is the same question, and asking the provider again would re-introduce its
+/// sampling noise as a publication decision.
+#[allow(clippy::type_complexity)]
+fn subject_reuse<S, IdError, CheckError, H, C>(
+    policy_outcome: &AssetPolicyOutcome,
+    input: &AssetReviewWorkflowInput<'_, C>,
+    review_run_store: &S,
+    human_reviews: &H,
+    result: &AssetReviewWorkflowResult,
+) -> Result<Option<AssetReviewRun>, AssetReviewWorkflowError<S::Error, IdError, CheckError, H::Error>>
+where
+    S: AssetReviewRunStore + ?Sized,
+    H: HumanReviewStore + ?Sized,
+    C: AssetInspector,
+{
+    let Some(sha256) = input
+        .snapshot
+        .files()
+        .iter()
+        .find(|file| file.path() == policy_outcome.path())
+        .map(|file| file.sha256())
+    else {
+        return Ok(None);
+    };
+    let subject = HumanReviewSubject::for_path(
+        HumanReviewKind::Asset,
+        policy_outcome.path().clone(),
+        sha256,
+        input.policy.clone(),
+    );
+    let runs = review_run_store
+        .list_by_subject(subject.identity())
+        .map_err(|source| AssetReviewWorkflowError {
+            partial_result: result.clone(),
+            failure: Box::new(AssetReviewWorkflowFailure::ReviewCacheLookup(source)),
+        })?;
+    reuse_asset_review(&subject, &runs, human_reviews).map_err(|error| AssetReviewWorkflowError {
+        partial_result: result.clone(),
+        failure: Box::new(reuse_failure(policy_outcome.path().clone(), error)),
+    })
+}
+
+fn reuse_failure<StoreError, IdError, CheckError, HumanError>(
+    path: ContentPath,
+    error: ReviewReuseError<HumanError>,
+) -> AssetReviewWorkflowFailure<StoreError, IdError, CheckError, HumanError> {
+    match error {
+        ReviewReuseError::HumanStore(source) => {
+            AssetReviewWorkflowFailure::HumanReviewLookup(source)
+        }
+        ReviewReuseError::HumanDecisionWithoutPendingAttempt(subject) => {
+            AssetReviewWorkflowFailure::HumanDecisionWithoutPendingAttempt { path, subject }
+        }
+        ReviewReuseError::ConflictingConclusions(subject) => {
+            AssetReviewWorkflowFailure::ConflictingReusableReviews { path, subject }
+        }
+    }
+}
+
 impl AssetReviewWorkflow {
     /// Runs one complete asset-review workflow at the caller-supplied time.
     ///
@@ -194,45 +276,16 @@ impl AssetReviewWorkflow {
             })?;
         result.set_checks(checked.clone());
         let policy_result = AssetPolicy::evaluate(&checked);
-        let reusable = review_run_store
-            .list_by_snapshot(input.snapshot.id())
-            .map_err(|source| AssetReviewWorkflowError {
-                partial_result: result.clone(),
-                failure: Box::new(AssetReviewWorkflowFailure::ReviewCacheLookup(source)),
-            })?;
-        // A subject a human already decided is a final answer: the provider is not
-        // asked about it again, whatever the previous attempt recorded.
-        let human_answered = HumanReviewResolution::answered_paths(
-            human_reviews,
-            HumanReviewKind::Asset,
-            input.policy,
-            input
-                .snapshot
-                .files()
-                .iter()
-                .map(|file| (file.path(), file.sha256())),
-        )
-        .map_err(|source| AssetReviewWorkflowError {
-            partial_result: result.clone(),
-            failure: Box::new(AssetReviewWorkflowFailure::HumanReviewLookup(source)),
-        })?;
 
         if !evaluator.is_bounded() {
             for policy_outcome in policy_result.outcomes() {
-                let current_sha256 = input
-                    .snapshot
-                    .files()
-                    .iter()
-                    .find(|file| file.path() == policy_outcome.path())
-                    .map(|file| file.sha256());
-                if let Some(previous) = reusable.iter().find(|run| {
-                    run.content_path() == policy_outcome.path()
-                        && current_sha256.is_some_and(|sha| sha == run.content_sha256())
-                        && run.policy() == input.policy
-                        && (!run.reviewer_was_called()
-                            || run.outcome().reviewer_report().is_some()
-                            || human_answered.contains(policy_outcome.path()))
-                }) {
+                if let Some(previous) = subject_reuse(
+                    policy_outcome,
+                    &input,
+                    review_run_store,
+                    human_reviews,
+                    &result,
+                )? {
                     result.push_entry(AssetReviewWorkflowEntry::from_parts(
                         previous.content_path().clone(),
                         previous.id(),
@@ -283,21 +336,14 @@ impl AssetReviewWorkflow {
         let mut reused = std::collections::BTreeMap::new();
         let mut pending = Vec::new();
         for policy_outcome in policy_result.outcomes() {
-            let current_sha256 = input
-                .snapshot
-                .files()
-                .iter()
-                .find(|file| file.path() == policy_outcome.path())
-                .map(|file| file.sha256());
-            if let Some(previous) = reusable.iter().find(|run| {
-                run.content_path() == policy_outcome.path()
-                    && current_sha256.is_some_and(|sha| sha == run.content_sha256())
-                    && run.policy() == input.policy
-                    && (!run.reviewer_was_called()
-                        || run.outcome().reviewer_report().is_some()
-                        || human_answered.contains(policy_outcome.path()))
-            }) {
-                reused.insert(policy_outcome.path().clone(), previous.clone());
+            if let Some(previous) = subject_reuse(
+                policy_outcome,
+                &input,
+                review_run_store,
+                human_reviews,
+                &result,
+            )? {
+                reused.insert(policy_outcome.path().clone(), previous);
             } else {
                 pending.push(policy_outcome.clone());
             }
@@ -388,13 +434,13 @@ mod tests {
 
     use super::*;
     use crate::storage::{LocalContentStore, SqliteHumanReviewStore, SqliteReviewRunStore};
-    use crate::workflow::NoHumanReviews;
     use crate::workflow::{
         AssetProgramCheck, AssetProgramCheckError, AssetReviewDecision, AssetReviewDisposition,
         EffectiveReviewDecision, EffectiveReviewSet, HumanReviewDecision, HumanReviewId,
         PublicPolicyRunResult, SequentialAssetReviewRunIdGenerator,
         SequentialAssetReviewRunIdGeneratorError, SequentialAssetReviews,
     };
+    use crate::workflow::{HumanReviewResolution, NoHumanReviews, ReviewSubjectIdentity};
     use std::convert::Infallible;
 
     static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(1);
@@ -553,6 +599,25 @@ mod tests {
                 .collect())
         }
 
+        fn list_by_subject(
+            &self,
+            subject: &ReviewSubjectIdentity,
+        ) -> Result<Vec<AssetReviewRun>, Self::Error> {
+            let mut runs = self
+                .saved
+                .borrow()
+                .iter()
+                .filter(|run| {
+                    run.content_path() == subject.content_path()
+                        && run.content_sha256() == subject.content_sha256()
+                        && run.policy() == subject.policy()
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            runs.sort_by_key(|run| run.id().get());
+            Ok(runs)
+        }
+
         fn list_pending_human_review(&self) -> Result<Vec<AssetReviewRun>, Self::Error> {
             Ok(self
                 .saved
@@ -584,6 +649,14 @@ mod tests {
         store: &LocalContentStore,
         entries: impl IntoIterator<Item = (&'a str, Vec<u8>)>,
     ) -> Snapshot {
+        snapshot_with_id(7, store, entries)
+    }
+
+    fn snapshot_with_id<'a>(
+        id: u64,
+        store: &LocalContentStore,
+        entries: impl IntoIterator<Item = (&'a str, Vec<u8>)>,
+    ) -> Snapshot {
         let files = entries
             .into_iter()
             .map(|(content_path, bytes)| {
@@ -592,7 +665,7 @@ mod tests {
             })
             .collect();
         Snapshot::new(
-            SnapshotId::new(7).unwrap(),
+            SnapshotId::new(id).unwrap(),
             SystemTime::UNIX_EPOCH,
             SourceId::new("test").unwrap(),
             files,
@@ -786,11 +859,119 @@ mod tests {
             &documents,
             &run_store,
             &human,
+            &policy(),
+            &policy(),
         )
         .unwrap();
         assert_eq!(
             effective.assets()[0].decision(),
             EffectiveReviewDecision::Approved
+        );
+    }
+
+    /// S6.5.1: an asset conclusion is reused from an earlier snapshot, and the
+    /// durable fact keeps the snapshot it was first recorded in.
+    #[test]
+    fn an_asset_conclusion_is_reused_across_snapshots() {
+        let directory = TestDirectory::new();
+        let store = directory.store();
+        let human = SqliteHumanReviewStore::open(":memory:").unwrap();
+        let run_store = RecordingStore::default();
+        let reviewer = RecordingReviewer::with_responses([(
+            path("clean.png"),
+            Ok(AssetReviewDecision::Approve),
+        )]);
+
+        let first_snapshot = snapshot_with_id(1, &store, [("clean.png", png())]);
+        let first_candidates = candidates(first_snapshot.id(), [("clean.png", vec!["a.md"])]);
+        let first = execute_with_human(
+            &first_candidates,
+            &first_snapshot,
+            &store,
+            &reviewer,
+            &run_store,
+            &human,
+            70,
+        )
+        .unwrap();
+        assert_eq!(reviewer.calls(), [path("clean.png")]);
+
+        // A later snapshot with an unrelated file; the image is untouched.
+        let second_snapshot =
+            snapshot_with_id(2, &store, [("clean.png", png()), ("unrelated.png", png())]);
+        let second_candidates = candidates(second_snapshot.id(), [("clean.png", vec!["a.md"])]);
+        let second = execute_with_human(
+            &second_candidates,
+            &second_snapshot,
+            &store,
+            &reviewer,
+            &run_store,
+            &human,
+            80,
+        )
+        .unwrap();
+
+        assert_eq!(
+            reviewer.calls(),
+            [path("clean.png")],
+            "the provider must not be asked again"
+        );
+        assert_eq!(
+            second.entries()[0].review_run_id(),
+            first.entries()[0].review_run_id()
+        );
+        let reused = &run_store.saved()[0];
+        assert_eq!(
+            reused.snapshot_id(),
+            first_snapshot.id(),
+            "its origin snapshot is provenance and is not rewritten"
+        );
+    }
+
+    /// A failed asset attempt is not a conclusion: without a human decision, the
+    /// next snapshot asks the provider again.
+    #[test]
+    fn a_failed_asset_attempt_is_not_reused_as_a_conclusion() {
+        let directory = TestDirectory::new();
+        let store = directory.store();
+        let human = SqliteHumanReviewStore::open(":memory:").unwrap();
+        let run_store = RecordingStore::default();
+        let reviewer = RecordingReviewer::with_responses([(
+            path("clean.png"),
+            Err(super::super::AssetReviewerError::new(
+                "provider unavailable",
+            )),
+        )]);
+
+        let first_snapshot = snapshot_with_id(1, &store, [("clean.png", png())]);
+        let first_candidates = candidates(first_snapshot.id(), [("clean.png", vec!["a.md"])]);
+        execute_with_human(
+            &first_candidates,
+            &first_snapshot,
+            &store,
+            &reviewer,
+            &run_store,
+            &human,
+            90,
+        )
+        .unwrap();
+        let second_snapshot = snapshot_with_id(2, &store, [("clean.png", png())]);
+        let second_candidates = candidates(second_snapshot.id(), [("clean.png", vec!["a.md"])]);
+        execute_with_human(
+            &second_candidates,
+            &second_snapshot,
+            &store,
+            &reviewer,
+            &run_store,
+            &human,
+            100,
+        )
+        .unwrap();
+
+        assert_eq!(
+            reviewer.calls().len(),
+            2,
+            "an attempt failure states nothing about the image"
         );
     }
 

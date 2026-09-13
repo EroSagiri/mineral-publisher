@@ -11,7 +11,9 @@ use crate::{
     ports::BlobStore,
 };
 
-use super::{HumanReviewKind, HumanReviewResolution, HumanReviewStore};
+use super::{
+    HumanReviewKind, HumanReviewStore, HumanReviewSubject, ReviewReuseError, reuse_document_review,
+};
 
 /// Decides how a batch of review candidates is executed.
 ///
@@ -186,6 +188,17 @@ pub enum PublicPolicyRunFailure<StoreError, IdError, HumanError> {
     MarkdownAnalysis(Vec<SnapshotMarkdownAnalysisError>),
     ReviewCacheLookup(StoreError),
     HumanReviewLookup(HumanError),
+    /// A human decided this subject, but no durable attempt awaiting that decision
+    /// exists for it.
+    HumanDecisionWithoutPendingAttempt {
+        path: ContentPath,
+        subject: Box<HumanReviewSubject>,
+    },
+    /// Two durable automatic conclusions about one subject disagree.
+    ConflictingReusableReviews {
+        path: ContentPath,
+        subject: Box<HumanReviewSubject>,
+    },
     ReviewRunId {
         path: ContentPath,
         source: IdError,
@@ -234,6 +247,14 @@ impl<StoreError: fmt::Display, IdError: fmt::Display, HumanError: fmt::Display> 
                     "could not look up human review decisions: {source}"
                 )
             }
+            PublicPolicyRunFailure::HumanDecisionWithoutPendingAttempt { path, .. } => write!(
+                formatter,
+                "a human decision answers {path} but no durable attempt awaits it"
+            ),
+            PublicPolicyRunFailure::ConflictingReusableReviews { path, .. } => write!(
+                formatter,
+                "durable automatic reviews disagree about {path} under the same policy"
+            ),
             PublicPolicyRunFailure::ReviewCacheLookup(source) => {
                 write!(
                     formatter,
@@ -266,6 +287,56 @@ where
     IdError: Error + Send + Sync + 'static,
     HumanError: Error + Send + Sync + 'static,
 {
+}
+
+/// The durable conclusion that answers one candidate, if any exists.
+///
+/// Reuse is keyed by the reviewed content and the policy — never by the snapshot
+/// the conclusion was first recorded in: a snapshot is provenance, and re-asking a
+/// provider about identical content under an identical policy would re-introduce
+/// its sampling noise as a publication decision.
+fn subject_reuse<S, IdError, H>(
+    candidate: &PublicCandidateMarkdown,
+    policy: &PolicyIdentity,
+    review_run_store: &S,
+    human_reviews: &H,
+    result: &PublicPolicyRunResult,
+) -> Result<Option<ReviewRun>, PublicPolicyRunError<S::Error, IdError, H::Error>>
+where
+    S: ReviewRunStore + ?Sized,
+    H: HumanReviewStore + ?Sized,
+{
+    let subject = HumanReviewSubject::for_path(
+        HumanReviewKind::Document,
+        candidate.path().clone(),
+        candidate.analysis().file().sha256(),
+        policy.clone(),
+    );
+    let runs = review_run_store
+        .list_by_subject(subject.identity())
+        .map_err(|source| PublicPolicyRunError {
+            partial_result: result.clone(),
+            failure: Box::new(PublicPolicyRunFailure::ReviewCacheLookup(source)),
+        })?;
+    reuse_document_review(&subject, &runs, human_reviews).map_err(|error| PublicPolicyRunError {
+        partial_result: result.clone(),
+        failure: Box::new(reuse_failure(candidate.path().clone(), error)),
+    })
+}
+
+fn reuse_failure<StoreError, IdError, HumanError>(
+    path: ContentPath,
+    error: ReviewReuseError<HumanError>,
+) -> PublicPolicyRunFailure<StoreError, IdError, HumanError> {
+    match error {
+        ReviewReuseError::HumanStore(source) => PublicPolicyRunFailure::HumanReviewLookup(source),
+        ReviewReuseError::HumanDecisionWithoutPendingAttempt(subject) => {
+            PublicPolicyRunFailure::HumanDecisionWithoutPendingAttempt { path, subject }
+        }
+        ReviewReuseError::ConflictingConclusions(subject) => {
+            PublicPolicyRunFailure::ConflictingReusableReviews { path, subject }
+        }
+    }
 }
 
 /// Orchestrates the existing immutable-content, privacy, policy, and audit boundaries.
@@ -329,43 +400,17 @@ impl PublicPolicyRun {
         result.private_documents = private_documents;
         result.invalid_privacy_documents = invalid_privacy_documents;
 
-        let reusable = review_run_store
-            .list_by_snapshot(snapshot.id())
-            .map_err(|source| PublicPolicyRunError {
-                partial_result: result.clone(),
-                failure: Box::new(PublicPolicyRunFailure::ReviewCacheLookup(source)),
-            })?;
-        // A subject a human already decided is a final answer: the provider is not
-        // asked about it again, whatever the previous attempt recorded. That is what
-        // lets an approval survive the re-run after a provider outage instead of
-        // being invalidated by the next failed attempt.
-        let human_answered = HumanReviewResolution::answered_paths(
-            human_reviews,
-            HumanReviewKind::Document,
-            policy,
-            candidates
-                .iter()
-                .map(|candidate| (candidate.path(), candidate.analysis().file().sha256())),
-        )
-        .map_err(|source| PublicPolicyRunError {
-            partial_result: result.clone(),
-            failure: Box::new(PublicPolicyRunFailure::HumanReviewLookup(source)),
-        })?;
-
         if !evaluator.is_bounded() {
             for candidate in candidates {
                 let check = ProgramCheck::check(std::slice::from_ref(&candidate));
                 result.warnings.extend_from_slice(check.warnings());
-                if check.is_pass()
-                    && let Some(previous) = reusable.iter().find(|run| {
-                        run.content_path() == candidate.path()
-                            && run.content_sha256() == candidate.analysis().file().sha256()
-                            && run.policy() == policy
-                            && (run.reviewer_report().is_some()
-                                || human_answered.contains(candidate.path()))
-                    })
-                {
-                    result.document_outcomes.push(previous.clone());
+                let previous = if check.is_pass() {
+                    subject_reuse(&candidate, policy, review_run_store, human_reviews, &result)?
+                } else {
+                    None
+                };
+                if let Some(previous) = previous {
+                    result.document_outcomes.push(previous);
                     continue;
                 }
                 let outcome = PublicPolicy::evaluate(vec![candidate], reviewer)
@@ -414,20 +459,17 @@ impl PublicPolicyRun {
         let mut pending = Vec::new();
         for candidate in candidates {
             // Deterministic checks always run for the current Snapshot. Only a
-            // successfully validated semantic result is reusable.
+            // conclusion about this exact subject is reusable.
             let check = ProgramCheck::check(std::slice::from_ref(&candidate));
             result.warnings.extend_from_slice(check.warnings());
             let checks_pass = check.is_pass();
-            if checks_pass
-                && let Some(previous) = reusable.iter().find(|run| {
-                    run.content_path() == candidate.path()
-                        && run.content_sha256() == candidate.analysis().file().sha256()
-                        && run.policy() == policy
-                        && (run.reviewer_report().is_some()
-                            || human_answered.contains(candidate.path()))
-                })
-            {
-                reused.insert(candidate.path().clone(), previous.clone());
+            let previous = if checks_pass {
+                subject_reuse(&candidate, policy, review_run_store, human_reviews, &result)?
+            } else {
+                None
+            };
+            if let Some(previous) = previous {
+                reused.insert(candidate.path().clone(), previous);
             } else {
                 pending.push(candidate);
             }

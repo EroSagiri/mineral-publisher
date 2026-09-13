@@ -6,11 +6,11 @@ use crate::{
     domain::{ContentPath, Sha256, SnapshotId},
     policy::{
         HumanReviewReason, PolicyIdentity, PublicPolicyDecision, ReviewDecision, ReviewRun,
-        ReviewRunId, ReviewRunStore, ReviewerReport,
+        ReviewRunId, ReviewRunStore, ReviewSubjectIdentity, ReviewerReport,
     },
 };
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 /// Local SQLite implementation of the narrow Review Run persistence boundary.
 pub struct SqliteReviewRunStore {
@@ -60,7 +60,23 @@ impl SqliteReviewRunStore {
                          ON review_runs(snapshot_id, content_path, id);
                      CREATE INDEX review_runs_pending_human_review
                          ON review_runs(decision_kind, snapshot_id, content_path, id);
-                     PRAGMA user_version = 1;
+                     CREATE INDEX review_runs_by_subject
+                         ON review_runs(content_path, content_sha256,
+                                        policy_name, policy_version, policy_hash, id);
+                     PRAGMA user_version = 2;
+                     COMMIT;",
+                )
+                .map_err(SqliteReviewRunStoreError::Sqlite)?,
+            // Version 2 makes the durable facts of one exact review subject
+            // addressable. Nothing about the rows changes: a snapshot is provenance,
+            // and these columns were already the identity of the reviewed content.
+            1 => connection
+                .execute_batch(
+                    "BEGIN IMMEDIATE;
+                     CREATE INDEX review_runs_by_subject
+                         ON review_runs(content_path, content_sha256,
+                                        policy_name, policy_version, policy_hash, id);
+                     PRAGMA user_version = 2;
                      COMMIT;",
                 )
                 .map_err(SqliteReviewRunStoreError::Sqlite)?,
@@ -73,17 +89,15 @@ impl SqliteReviewRunStore {
     fn load_many(
         &self,
         sql: &str,
-        parameter: Option<i64>,
+        parameters: &[&dyn rusqlite::ToSql],
     ) -> Result<Vec<ReviewRun>, SqliteReviewRunStoreError> {
         let mut statement = self
             .connection
             .prepare(sql)
             .map_err(SqliteReviewRunStoreError::Sqlite)?;
-        let rows = match parameter {
-            Some(value) => statement.query_map([value], row_to_review_run),
-            None => statement.query_map([], row_to_review_run),
-        }
-        .map_err(SqliteReviewRunStoreError::Sqlite)?;
+        let rows = statement
+            .query_map(parameters, row_to_review_run)
+            .map_err(SqliteReviewRunStoreError::Sqlite)?;
 
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(SqliteReviewRunStoreError::Sqlite)
@@ -164,7 +178,34 @@ impl ReviewRunStore for SqliteReviewRunStore {
              FROM review_runs
              WHERE snapshot_id = ?1
              ORDER BY content_path COLLATE BINARY ASC, id ASC",
-            Some(to_sqlite_integer("snapshot id", snapshot_id.get())?),
+            &[&to_sqlite_integer("snapshot id", snapshot_id.get())?],
+        )
+    }
+
+    fn list_by_subject(
+        &self,
+        subject: &ReviewSubjectIdentity,
+    ) -> Result<Vec<ReviewRun>, Self::Error> {
+        // One exact subject: the reviewed content and the policy it was reviewed
+        // under. The snapshot a fact was recorded in is provenance, so it is not
+        // part of this lookup; the order is the order the facts were recorded, which
+        // is what lets the engine pick the same durable fact every time.
+        self.load_many(
+            "SELECT id, snapshot_id, content_path, content_sha256,
+                    policy_name, policy_version, policy_hash,
+                    decision_kind, decision_json, reviewer_report_json, reviewer_called,
+                    created_at_unix_ms
+             FROM review_runs
+             WHERE content_path = ?1 AND content_sha256 = ?2
+               AND policy_name = ?3 AND policy_version = ?4 AND policy_hash = ?5
+             ORDER BY id ASC",
+            &[
+                &subject.content_path().as_str(),
+                &subject.content_sha256().as_bytes().as_slice(),
+                &subject.policy().name(),
+                &subject.policy().version(),
+                &subject.policy().hash().as_bytes().as_slice(),
+            ],
         )
     }
 
@@ -177,7 +218,7 @@ impl ReviewRunStore for SqliteReviewRunStore {
              FROM review_runs
              WHERE decision_kind = 'needs_human_review'
              ORDER BY snapshot_id ASC, content_path COLLATE BINARY ASC, id ASC",
-            None,
+            &[],
         )
     }
 }
@@ -728,6 +769,126 @@ mod tests {
         assert_eq!(
             first,
             reverse_store.list_by_snapshot(snapshot_one.id()).unwrap()
+        );
+    }
+
+    /// The subject lookup spans snapshots, ignores other subjects, and returns the
+    /// facts in the order they were recorded.
+    #[test]
+    fn the_subject_lookup_spans_snapshots_and_orders_facts() {
+        let directory = TestDirectory::new();
+        let store = SqliteReviewRunStore::open(directory.database()).unwrap();
+        let first_snapshot = snapshot(1, vec![reviewed_file("a.md", "body")]);
+        let later_snapshot = snapshot(
+            2,
+            vec![reviewed_file("a.md", "body"), reviewed_file("b.md", "body")],
+        );
+        let rejected = outcome(
+            analyzed("a.md", "body", Vec::new()),
+            Ok(ReviewDecision::Reject),
+        );
+        let approved = outcome(
+            analyzed("a.md", "body", Vec::new()),
+            Ok(ReviewDecision::Approve),
+        );
+        let other_path = outcome(
+            analyzed("b.md", "body", Vec::new()),
+            Ok(ReviewDecision::Approve),
+        );
+        let first = run(1, &first_snapshot, &approved, 10);
+        let second = run(2, &later_snapshot, &rejected, 20);
+        let elsewhere = run(3, &later_snapshot, &other_path, 30);
+        for entry in [&first, &second, &elsewhere] {
+            store.save(entry).unwrap();
+        }
+
+        let subject = ReviewSubjectIdentity::new(path("a.md"), Sha256::digest(b"body"), policy());
+        let found = store.list_by_subject(&subject).unwrap();
+        assert_eq!(
+            found.iter().map(|run| run.id().get()).collect::<Vec<_>>(),
+            vec![1, 2],
+            "both snapshots' facts, in the order they were recorded"
+        );
+        assert_eq!(
+            found
+                .iter()
+                .map(|run| run.snapshot_id().get())
+                .collect::<Vec<_>>(),
+            vec![1, 2],
+            "each fact keeps its origin snapshot"
+        );
+
+        // Other content and other policies are other subjects.
+        assert_eq!(
+            store
+                .list_by_subject(&ReviewSubjectIdentity::new(
+                    path("b.md"),
+                    Sha256::digest(b"body"),
+                    policy()
+                ))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            store
+                .list_by_subject(&ReviewSubjectIdentity::new(
+                    path("a.md"),
+                    Sha256::digest(b"body"),
+                    PolicyIdentity::new("public", "public-v2", Sha256::new([43; 32])).unwrap()
+                ))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .list_by_subject(&ReviewSubjectIdentity::new(
+                    path("a.md"),
+                    Sha256::digest(b"other bytes"),
+                    policy()
+                ))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// A database written before the subject index existed upgrades in place.
+    #[test]
+    fn a_version_one_database_upgrades_and_answers_subject_queries() {
+        let directory = TestDirectory::new();
+        let database = directory.database();
+        let snapshot = snapshot(1, vec![reviewed_file("a.md", "body")]);
+        let approved = outcome(
+            analyzed("a.md", "body", Vec::new()),
+            Ok(ReviewDecision::Approve),
+        );
+        let stored = run(1, &snapshot, &approved, 10);
+        {
+            let store = SqliteReviewRunStore::open(&database).unwrap();
+            store.save(&stored).unwrap();
+            // Rewind to the version 1 schema: the table is identical, the subject
+            // index is what version 2 adds.
+            store
+                .connection
+                .execute_batch("DROP INDEX review_runs_by_subject; PRAGMA user_version = 1;")
+                .unwrap();
+        }
+
+        let reopened = SqliteReviewRunStore::open(&database).unwrap();
+        let version: i64 = reopened
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 2);
+        assert_eq!(
+            reopened
+                .list_by_subject(&ReviewSubjectIdentity::new(
+                    path("a.md"),
+                    Sha256::digest(b"body"),
+                    policy()
+                ))
+                .unwrap(),
+            vec![stored]
         );
     }
 

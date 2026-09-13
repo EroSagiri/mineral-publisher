@@ -33,11 +33,12 @@ pub use mineral_core::workflow::{
     ProjectionEntryKind, ProjectionTargetPath, ProjectionTargetPathError, PublicPolicyRun,
     PublicPolicyRunError, PublicPolicyRunFailure, PublicPolicyRunResult, PublicProjection,
     PublicProjectionError, PublicationFileMode, PublishOperation, PublishPlan, PublishPlanError,
-    PublishedAsset, ReviewRunIdGenerator, ReviewSubjectIdentity, SanitizationTransformation,
-    SanitizedAsset, SanitizedAssetSet, SequentialAssetReviewRunIdGenerator,
-    SequentialAssetReviewRunIdGeneratorError, SequentialAssetReviews, SequentialMarkdownReviews,
-    SequentialReviewRunIdGenerator, SequentialReviewRunIdGeneratorError, TextProjection,
-    TextProjectionFile,
+    PublishedAsset, ReviewReuseError, ReviewRunIdGenerator, ReviewSubjectIdentity,
+    SanitizationTransformation, SanitizedAsset, SanitizedAssetSet,
+    SequentialAssetReviewRunIdGenerator, SequentialAssetReviewRunIdGeneratorError,
+    SequentialAssetReviews, SequentialMarkdownReviews, SequentialReviewRunIdGenerator,
+    SequentialReviewRunIdGeneratorError, TextProjection, TextProjectionFile,
+    is_reusable_asset_conclusion, reuse_asset_review, reuse_document_review,
 };
 pub use publication_application::{
     CompletedPublication, ExplicitHumanReviewSelection, PublicationApplication,

@@ -19,7 +19,9 @@ mod human_review;
 mod public_policy_run;
 mod public_projection;
 mod publish_plan;
+mod review_reuse;
 
+pub use crate::policy::ReviewSubjectIdentity;
 pub use asset_check::{
     ActualAssetType, AssetCheckFinding, AssetCheckResult, AssetInspector, CheckedAsset,
     ImageDimensions,
@@ -65,7 +67,6 @@ pub use human_review::{
     EffectiveReviewDecision, EffectiveReviewDecisionError, HumanReviewAttempt, HumanReviewBinding,
     HumanReviewDecision, HumanReviewId, HumanReviewKind, HumanReviewRecord, HumanReviewRecordError,
     HumanReviewResolution, HumanReviewResolutionError, HumanReviewStore, HumanReviewSubject,
-    ReviewSubjectIdentity,
 };
 pub use public_policy_run::{
     MarkdownReviewEvaluator, PublicPolicyRun, PublicPolicyRunError, PublicPolicyRunFailure,
@@ -79,4 +80,7 @@ pub use public_projection::{
 pub use publish_plan::{
     CurrentTargetEntry, CurrentTargetState, CurrentTargetStateError, PublishOperation, PublishPlan,
     PublishPlanError,
+};
+pub use review_reuse::{
+    ReviewReuseError, is_reusable_asset_conclusion, reuse_asset_review, reuse_document_review,
 };
