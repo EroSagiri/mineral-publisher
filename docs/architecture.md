@@ -176,7 +176,8 @@ AssetReview
 
 ```text
 LocalSource   本地目录树（默认；不写 type 的旧配置就是它）
-R2Source      S3 兼容 bucket 里的一个 managed prefix（source.type: r2）
+R2Source      S3 兼容 bucket 里的一个 managed prefix（source.type: r2），
+              或显式写 `prefix: ""` 的整个 bucket
 ```
 
 未来可能支持 S3 / Git / 多源合并，但都不属于当前设计。

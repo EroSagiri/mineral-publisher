@@ -175,8 +175,10 @@ S7.1 增加 **R2 Source**：除本地目录树之外，source 现在可以是一
 
 * `SourceIdentity = H(identity version, source kind, canonical endpoint/bucket/prefix)`
   ——凭据永远不进 identity，换 bucket / 换 prefix 就是另一个 namespace；
-  prefix 必填、非空、canonical（用与 `ContentPath` 相同的规则校验），并以 `/` 结尾，
-  第一版禁止把整个 bucket 当 source；
+  prefix 必填、canonical（用与 `ContentPath` 相同的规则校验），非 root 时以 `/` 结尾；
+  **bucket root 只在显式写成空 prefix 时可用**（`prefix: ""`），缺失字段、`/`、`//` 仍然
+  fail closed；root source 与 publication namespace 在同一 bucket 时必然重叠，被 §29 的
+  检查拒绝，因此"读整个 bucket"不会变成把自己输出读回来的回路；
 * key → `ContentPath` 是**精确后缀剥离**（不 normalize、不 trim、不认 `./`/`../`/`\`/`//`），
   无法构成 canonical path 的 key 让整次 inventory fail closed；以 `/` 结尾且 size==0 的
   object 是 directory marker（跳过），以 `/` 结尾但非空则 fail closed；

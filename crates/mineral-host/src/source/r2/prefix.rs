@@ -2,40 +2,55 @@ use std::fmt;
 
 use crate::domain::{ContentPath, ContentPathError};
 
-/// The managed namespace one R2 source reads from.
+/// The namespace one R2 source reads from.
 ///
-/// A prefix is required and canonical: it is non-empty, it is a canonical relative
-/// path (the same contract a content path follows, so every key under it maps to a
-/// canonical [`ContentPath`]), and it always ends in `/`. A configured value
-/// without the trailing slash is canonicalized to the namespace form
-/// (`vault` → `vault/`); anything that is not already canonical is refused rather
-/// than normalized, because two spellings that mean the same namespace on one
-/// machine must not mean two namespaces in a durable binding.
+/// A prefix is required and canonical: it is a canonical relative path (the same
+/// contract a content path follows, so every key under it maps to a canonical
+/// [`ContentPath`]) and it always ends in `/`. A configured value without the
+/// trailing slash is canonicalized to the namespace form (`vault` → `vault/`);
+/// anything that is not already canonical is refused rather than normalized,
+/// because two spellings that mean the same namespace on one machine must not mean
+/// two namespaces in a durable binding.
 ///
-/// First version: a source may never be the bucket root.
+/// The bucket root is available, but only when it is asked for explicitly: the
+/// empty prefix means "every object in the bucket", while `/`, `//` and a missing
+/// value are still refused, so a source never becomes read-wide by accident. The
+/// composition root additionally refuses a root source that shares its bucket with
+/// the publication namespace, because that would make this engine read its own
+/// output back as input.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct R2SourcePrefix(String);
 
+/// The explicit spelling of the bucket root.
+pub const ROOT_SOURCE_PREFIX: &str = "";
+
 impl R2SourcePrefix {
     pub fn new(configured: &str) -> Result<Self, R2SourcePrefixError> {
-        if configured.is_empty() {
-            return Err(R2SourcePrefixError::Empty);
+        if configured == ROOT_SOURCE_PREFIX {
+            return Ok(Self(String::new()));
         }
         if configured.chars().any(char::is_control) {
             return Err(R2SourcePrefixError::ControlCharacter);
         }
         let body = configured.strip_suffix('/').unwrap_or(configured);
         if body.is_empty() {
-            // The bucket root is deliberately not a valid source namespace.
-            return Err(R2SourcePrefixError::Empty);
+            // `/` and `//` name the root ambiguously; `""` is the explicit spelling.
+            return Err(R2SourcePrefixError::NotCanonical(
+                ContentPathError::NotCanonical,
+            ));
         }
         let path = ContentPath::new(body).map_err(R2SourcePrefixError::NotCanonical)?;
         Ok(Self(format!("{}/", path.as_str())))
     }
 
-    /// The canonical prefix, always ending in `/`.
+    /// The canonical prefix: empty for the bucket root, otherwise ending in `/`.
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// Whether this source reads the whole bucket.
+    pub fn is_root(&self) -> bool {
+        self.0.is_empty()
     }
 
     /// Maps one remote key to its logical source path.
@@ -70,27 +85,23 @@ impl fmt::Display for R2SourcePrefix {
 /// Why a configured prefix is not a usable source namespace.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum R2SourcePrefixError {
-    /// An empty prefix would make the whole bucket the source.
-    Empty,
     /// A control character cannot be compared or sent reliably.
     ControlCharacter,
-    /// The prefix is not a canonical relative path.
+    /// The prefix is not a canonical relative path (the bucket root is `""`).
     NotCanonical(ContentPathError),
 }
 
 impl fmt::Display for R2SourcePrefixError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Empty => formatter.write_str(
-                "an R2 source prefix is required and may not be empty or cover the whole bucket",
-            ),
             Self::ControlCharacter => {
                 formatter.write_str("an R2 source prefix must not contain control characters")
             }
             Self::NotCanonical(error) => {
                 write!(
                     formatter,
-                    "an R2 source prefix must be a canonical path: {error}"
+                    "an R2 source prefix must be a canonical path, or the explicit empty \
+                     prefix for the bucket root: {error}"
                 )
             }
         }
@@ -140,9 +151,49 @@ mod tests {
     }
 
     #[test]
+    fn the_bucket_root_is_available_only_as_the_explicit_empty_prefix() {
+        let root = R2SourcePrefix::new(ROOT_SOURCE_PREFIX).unwrap();
+
+        assert!(root.is_root());
+        assert_eq!(root.as_str(), "");
+        assert_eq!(root.content_path("a/b.md").unwrap().as_str(), "a/b.md");
+        assert_eq!(
+            root.content_path(".history/x.md").unwrap().as_str(),
+            ".history/x.md",
+            "a root source still maps every key to a canonical path"
+        );
+        let path = ContentPath::new("notes/a.md").unwrap();
+        assert_eq!(root.object_key(&path), "notes/a.md");
+
+        // Every other spelling of "the whole bucket" is refused, so a source never
+        // becomes read-wide by accident.
+        for configured in ["/", "//", "///"] {
+            assert!(
+                R2SourcePrefix::new(configured).is_err(),
+                "{configured:?} was accepted as a root prefix"
+            );
+        }
+    }
+
+    #[test]
+    fn a_root_prefix_still_refuses_keys_that_are_not_canonical_paths() {
+        let root = R2SourcePrefix::new(ROOT_SOURCE_PREFIX).unwrap();
+
+        for key in [
+            "a//b.md",
+            "./a.md",
+            "../a.md",
+            "a/../b.md",
+            "back\\slash.md",
+            "/absolute.md",
+        ] {
+            assert!(root.content_path(key).is_err(), "{key:?} was accepted");
+        }
+    }
+
+    #[test]
     fn an_unusable_prefix_is_refused_instead_of_normalized() {
         for configured in [
-            "",
             "/",
             "//",
             "vault//",

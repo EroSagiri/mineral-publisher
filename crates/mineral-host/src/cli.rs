@@ -1626,15 +1626,44 @@ mod tests {
                 "prefix {prefix:?} was accepted: {error}"
             );
         }
-        // An empty prefix would make the whole bucket the source.
-        let empty = source_workspace(
-            "  id: r2-vault\n  type: r2\n  r2:\n    endpoint: https://account.r2.cloudflarestorage.com\n    bucket: mineral-vault\n    prefix: \"\"\n    access_key_id: A\n    secret_access_key_env: X\n",
-            "",
-        )
-        .err()
-        .map(|error| error.to_string())
-        .unwrap_or_default();
-        assert!(empty.contains("source.r2.prefix is unusable"), "{empty}");
+        // `/` names the same thing ambiguously, so it is refused.
+        let ambiguous = source_workspace(&r2_source_block("/"), "")
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_default();
+        assert!(
+            ambiguous.contains("source.r2.prefix is unusable"),
+            "{ambiguous}"
+        );
+    }
+
+    #[test]
+    fn an_explicit_root_prefix_reads_the_whole_bucket_but_never_the_publication_namespace() {
+        // The empty prefix is an explicit choice and is accepted.
+        let root = source_workspace(&r2_source_block("\"\""), "");
+        let root = match root {
+            Ok(workspace) => workspace,
+            Err(error) => panic!("an explicit root prefix was refused: {error}"),
+        };
+        assert_eq!(root.source_kind(), SourceType::R2);
+        assert_eq!(root.config.source.r2.as_ref().unwrap().prefix, "");
+
+        // A root source and the publication namespace cannot share one bucket: the
+        // root contains every publication key.
+        let overlapping =
+            match source_workspace(&r2_source_block("\"\""), &r2_assets_block("mineral-vault")) {
+                Ok(_) => panic!("a root source over the publication bucket was accepted"),
+                Err(error) => error.to_string(),
+            };
+        assert!(
+            overlapping.contains("overlaps the publication namespace"),
+            "{overlapping}"
+        );
+
+        // A different bucket is a different namespace, and the root is fine there.
+        assert!(
+            source_workspace(&r2_source_block("\"\""), &r2_assets_block("other-bucket")).is_ok()
+        );
     }
 
     #[test]

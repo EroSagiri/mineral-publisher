@@ -1045,15 +1045,19 @@ fn the_ingest_asks_its_source_for_bounded_chunks_only() {
 }
 
 #[test]
-fn a_prefix_that_could_read_the_whole_bucket_is_refused() {
-    assert!(matches!(
-        R2SourcePrefix::new(""),
-        Err(R2SourcePrefixError::Empty)
-    ));
+fn the_bucket_root_must_be_asked_for_explicitly() {
+    let root = R2SourcePrefix::new("").unwrap();
+
+    assert!(root.is_root());
+    assert_eq!(
+        root.content_path("daily/a.md").unwrap().as_str(),
+        "daily/a.md"
+    );
     assert!(matches!(
         R2SourcePrefix::new("/"),
-        Err(R2SourcePrefixError::Empty)
+        Err(R2SourcePrefixError::NotCanonical(_))
     ));
+    assert!(R2SourcePrefix::new("//").is_err());
 }
 
 /// The namespace the reader is configured for is part of every durable binding, and
