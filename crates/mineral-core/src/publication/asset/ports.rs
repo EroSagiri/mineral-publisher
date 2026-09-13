@@ -1,8 +1,8 @@
 use std::error::Error;
 
-use crate::workflow::AssetObjectKey;
+use crate::workflow::{AssetObjectKey, PublishedAsset};
 
-use super::{AssetTargetState, VerifiedAssetContent};
+use super::{AssetTargetState, ImmutableBlobSource};
 
 /// The only way the engine touches asset storage.
 ///
@@ -28,15 +28,27 @@ pub trait AssetTarget {
     /// Reports what the target currently holds under one frozen object key.
     fn inspect(&self, object_key: &AssetObjectKey) -> Result<AssetTargetState, Self::Error>;
 
-    /// Places one asset's verified published representation at its frozen key.
+    /// Places one asset's frozen representation at its frozen key.
     ///
-    /// The content carries both the frozen facts and the verified bytes, so an
-    /// implementation never needs to consult current configuration. Reporting
-    /// success is not evidence that the object is readable: the engine re-inspects
-    /// and re-verifies before anything is allowed to depend on it.
+    /// The asset carries every frozen fact (key, media type, size, identity) and
+    /// `source` yields the bytes in bounded chunks, so an implementation never
+    /// consults current configuration and never has to materialize the object.
     ///
-    /// A content-addressed object can only ever mean one thing, so an
-    /// implementation must fail closed rather than overwrite an object it finds
-    /// holding different content.
-    fn publish(&self, content: VerifiedAssetContent<'_>) -> Result<(), Self::Error>;
+    /// Two rules bind every implementation:
+    ///
+    /// * It must read `source` through [`ImmutableBlobSource::read_chunk`] and may
+    ///   not require the whole object at once.
+    /// * It must fold every chunk into an [`super::IncrementalBlobVerifier`] and
+    ///   refuse to commit the object unless that verifier accepts the frozen
+    ///   facts. A content-addressed key can only ever mean one thing, so an
+    ///   implementation must fail closed rather than overwrite (or commit
+    ///   unverified bytes over) an object it finds holding different content.
+    ///
+    /// Reporting success is still not evidence that the object is readable: the
+    /// engine re-inspects and re-verifies before anything may depend on it.
+    fn publish(
+        &self,
+        asset: &PublishedAsset,
+        source: &mut dyn ImmutableBlobSource,
+    ) -> Result<(), Self::Error>;
 }

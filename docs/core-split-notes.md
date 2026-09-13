@@ -97,6 +97,14 @@ S6.3 又新增了一类**不可回滚的外部对象**：published asset 放在 
 SQLite 三者之间同样没有事务。因此这里的原则不变：**顺序 + 幂等**，
 content-addressed 的 staged orphan 允许存在，重试时重新 observe 而不是回滚。
 
+S6.4 把这条路径的**运行时边界**从"完整内存 bytes"推进到 bounded streaming：
+engine 仍然只持有 frozen facts 和自己的验证规则，host 侧 driver 逐块读取
+immutable blob、边读边喂 `IncrementalBlobVerifier`，并且只有在验证通过之后才
+`finish()` 提交写入。于是 20.92 MB 的 JPEG 不再需要被 materialize 成一个内存
+buffer。真实对象存储由 host 的 R2 adapter（SigV4 自实现 + 临时 spool + 定长 PUT）
+承担；**没有任何 R2 / HTTP / SDK 类型进入 mineral-core**，core 里的
+`AssetTarget` 端口只看到 `ImmutableBlobSource`。
+
 ### 2.3 已批准的 schema 变更
 
 `publish-runs.sqlite3`：`user_version 1 → 2`

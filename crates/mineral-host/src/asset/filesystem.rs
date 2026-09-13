@@ -9,33 +9,31 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     asset::{
-        AssetByteIdentity, AssetTarget, AssetTargetFacts, AssetTargetState, VerifiedAssetContent,
+        AssetByteIdentity, AssetTargetFacts, AssetTargetState, ObjectStoreTransport, ObjectWriter,
     },
     domain::Sha256,
-    workflow::{AssetContentType, AssetObjectKey},
+    workflow::{AssetContentType, AssetObjectKey, PublishedAsset},
 };
 
 static NEXT_TEMPORARY: AtomicU64 = AtomicU64::new(1);
 
-/// A filesystem-backed object target.
+/// A filesystem-backed object store.
 ///
-/// This is the native runtime's stand-in for object storage: objects live under
-/// one root at their frozen content-addressed key, exactly as they would live in a
-/// bucket. It is a real adapter rather than a test double — it hashes the bytes it
-/// serves on every inspection, refuses to overwrite an object holding different
-/// content, and derives nothing: the key, the content type, and the bytes all come
-/// from the frozen value the engine passes in.
+/// This is the native runtime's object storage: objects live under one root at
+/// their frozen content-addressed key, exactly as they would in a bucket. It
+/// hashes the bytes it serves on every inspection and never overwrites an object
+/// holding different content.
 ///
-/// A media type cannot be recovered from a file's bytes without guessing from its
-/// name, so it is stored beside the object as target metadata, exactly as an
-/// object store stores it as an HTTP header. Everything else — size and byte
-/// identity — is observed from the object itself.
+/// A media type cannot be recovered from an object's bytes without guessing from
+/// its name, so it is stored beside the object as target metadata, exactly as an
+/// object store keeps it as an HTTP header. Size and byte identity are always
+/// observed from the object itself.
 #[derive(Clone, Debug)]
-pub struct FilesystemAssetTarget {
+pub struct FilesystemObjectStore {
     root: PathBuf,
 }
 
-impl FilesystemAssetTarget {
+impl FilesystemObjectStore {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self { root: root.into() }
     }
@@ -47,7 +45,7 @@ impl FilesystemAssetTarget {
     fn object_path(
         &self,
         object_key: &AssetObjectKey,
-    ) -> Result<PathBuf, FilesystemAssetTargetError> {
+    ) -> Result<PathBuf, FilesystemObjectStoreError> {
         let key = object_key.as_str();
         // The key is content-addressed and can only be built by the engine, so this
         // cannot fire today; it exists so a runtime never joins an unvalidated
@@ -59,7 +57,7 @@ impl FilesystemAssetTarget {
                 .split('/')
                 .any(|segment| matches!(segment, "" | "." | ".."))
         {
-            return Err(FilesystemAssetTargetError::UnsafeObjectKey {
+            return Err(FilesystemObjectStoreError::UnsafeObjectKey {
                 object_key: key.to_owned(),
             });
         }
@@ -71,7 +69,7 @@ impl FilesystemAssetTarget {
     fn metadata_path(
         &self,
         object_key: &AssetObjectKey,
-    ) -> Result<PathBuf, FilesystemAssetTargetError> {
+    ) -> Result<PathBuf, FilesystemObjectStoreError> {
         let object = self.object_path(object_key)?;
         let mut name = object
             .file_name()
@@ -80,10 +78,46 @@ impl FilesystemAssetTarget {
         name.push(".mineral-metadata");
         Ok(object.with_file_name(name))
     }
+
+    /// Checks that an object already present under a frozen key is exactly the
+    /// frozen representation, so it can be reused instead of rewritten.
+    fn verify_existing(
+        &self,
+        asset: &PublishedAsset,
+        object_path: &Path,
+        metadata_path: &Path,
+    ) -> Result<(), FilesystemObjectStoreError> {
+        let existing = fs::read(object_path).map_err(|source| {
+            FilesystemObjectStoreError::io("read existing asset object", object_path, source)
+        })?;
+        let existing_sha256 = Sha256::digest(&existing);
+        if existing_sha256 != asset.published_sha256()
+            || existing.len() as u64 != asset.published_size()
+        {
+            return Err(FilesystemObjectStoreError::ConflictingObject {
+                object_key: asset.object_key().clone(),
+                expected_sha256: asset.published_sha256(),
+                expected_size: asset.published_size(),
+                observed_sha256: existing_sha256,
+                observed_size: existing.len() as u64,
+            });
+        }
+        if metadata_path.is_file() {
+            let metadata = read_metadata(metadata_path)?;
+            if metadata.content_type != *asset.published_content_type() {
+                return Err(FilesystemObjectStoreError::ConflictingObjectMetadata {
+                    object_key: asset.object_key().clone(),
+                    expected: asset.published_content_type().to_string(),
+                    observed: metadata.content_type.to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
 }
 
-impl AssetTarget for FilesystemAssetTarget {
-    type Error = FilesystemAssetTargetError;
+impl ObjectStoreTransport for FilesystemObjectStore {
+    type Error = FilesystemObjectStoreError;
 
     fn inspect(&self, object_key: &AssetObjectKey) -> Result<AssetTargetState, Self::Error> {
         let object_path = self.object_path(object_key)?;
@@ -95,20 +129,20 @@ impl AssetTarget for FilesystemAssetTarget {
             (false, false) => Ok(AssetTargetState::Missing),
             // Half an object is not something to guess about: the namespace is
             // immutable, so a missing half is target corruption.
-            (true, false) => Err(FilesystemAssetTargetError::MetadataMissing { object_path }),
+            (true, false) => Err(FilesystemObjectStoreError::MetadataMissing { object_path }),
             (false, true) => {
-                Err(FilesystemAssetTargetError::MetadataWithoutObject { metadata_path })
+                Err(FilesystemObjectStoreError::MetadataWithoutObject { metadata_path })
             }
             (true, true) => {
                 let bytes = fs::read(&object_path).map_err(|source| {
-                    FilesystemAssetTargetError::io("read asset object", &object_path, source)
+                    FilesystemObjectStoreError::io("read asset object", &object_path, source)
                 })?;
                 let metadata = read_metadata(&metadata_path)?;
                 Ok(AssetTargetState::Present(AssetTargetFacts::new(
                     object_key.clone(),
                     bytes.len() as u64,
                     metadata.content_type,
-                    // The bytes this target serves were read and hashed here; the
+                    // The bytes this store serves were read and hashed here; the
                     // value is never an ETag or any other store-supplied digest.
                     AssetByteIdentity::Verified(Sha256::digest(&bytes)),
                 )))
@@ -116,51 +150,138 @@ impl AssetTarget for FilesystemAssetTarget {
         }
     }
 
-    fn publish(&self, content: VerifiedAssetContent<'_>) -> Result<(), Self::Error> {
-        let asset = content.asset();
+    fn open_writer(
+        &self,
+        asset: &PublishedAsset,
+    ) -> Result<Box<dyn ObjectWriter<Error = Self::Error> + '_>, Self::Error> {
         let object_key = asset.object_key();
         let object_path = self.object_path(object_key)?;
         let metadata_path = self.metadata_path(object_key)?;
 
-        if object_path.is_file() {
-            // A content-addressed key can only ever mean one thing. Anything else
-            // under it is corruption, and this adapter never resolves that by
-            // overwriting.
-            let existing = fs::read(&object_path).map_err(|source| {
-                FilesystemAssetTargetError::io("read existing asset object", &object_path, source)
+        match (object_path.is_file(), metadata_path.is_file()) {
+            // Anything already under the frozen key must be exactly the frozen
+            // representation; the writer then only completes missing metadata.
+            (true, metadata_exists) => {
+                self.verify_existing(asset, &object_path, &metadata_path)?;
+                Ok(Box::new(ReuseWriter {
+                    metadata_path: (!metadata_exists).then_some(metadata_path),
+                    content_type: asset.published_content_type().clone(),
+                }))
+            }
+            (false, true) => {
+                Err(FilesystemObjectStoreError::MetadataWithoutObject { metadata_path })
+            }
+            (false, false) => Ok(Box::new(CreateWriter {
+                root: self.root.clone(),
+                object_path,
+                metadata_path,
+                content_type: asset.published_content_type().clone(),
+                temporary_path: None,
+            })),
+        }
+    }
+}
+
+/// A writer that leaves an already-correct object alone.
+///
+/// The bytes the driver sends are discarded on purpose: the object under this
+/// content-addressed key has been checked to be exactly the frozen
+/// representation, and a content-addressed key is never rewritten. Only the
+/// publisher's own metadata, if an earlier attempt failed to record it, is
+/// completed — that is not overwriting content.
+struct ReuseWriter {
+    metadata_path: Option<PathBuf>,
+    content_type: AssetContentType,
+}
+
+impl ObjectWriter for ReuseWriter {
+    type Error = FilesystemObjectStoreError;
+
+    fn write(&mut self, _: &[u8]) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn finish(self: Box<Self>) -> Result<(), Self::Error> {
+        match self.metadata_path {
+            None => Ok(()),
+            Some(path) => write_metadata(&path, &self.content_type),
+        }
+    }
+}
+
+/// A writer that streams a new object into a temporary file and links it into
+/// place without ever replacing an existing object.
+struct CreateWriter {
+    root: PathBuf,
+    object_path: PathBuf,
+    metadata_path: PathBuf,
+    content_type: AssetContentType,
+    temporary_path: Option<PathBuf>,
+}
+
+impl CreateWriter {
+    fn temporary_path(&mut self) -> Result<PathBuf, FilesystemObjectStoreError> {
+        if self.temporary_path.is_none() {
+            if let Some(parent) = self.object_path.parent() {
+                fs::create_dir_all(parent).map_err(|source| {
+                    FilesystemObjectStoreError::io("create asset directory", parent, source)
+                })?;
+            }
+            let sequence = NEXT_TEMPORARY.fetch_add(1, Ordering::Relaxed);
+            self.temporary_path = Some(self.root.join(format!(
+                ".mineral-asset-{}-{sequence}.tmp",
+                std::process::id()
+            )));
+        }
+        Ok(self
+            .temporary_path
+            .clone()
+            .expect("the temporary path was just set"))
+    }
+}
+
+impl ObjectWriter for CreateWriter {
+    type Error = FilesystemObjectStoreError;
+
+    fn write(&mut self, chunk: &[u8]) -> Result<(), Self::Error> {
+        let path = self.temporary_path()?;
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|source| {
+                FilesystemObjectStoreError::io("open temporary asset", &path, source)
             })?;
-            let existing_sha256 = Sha256::digest(&existing);
-            if existing_sha256 != asset.published_sha256()
-                || existing.len() as u64 != asset.published_size()
-            {
-                return Err(FilesystemAssetTargetError::ConflictingObject {
-                    object_key: object_key.clone(),
-                    expected_sha256: asset.published_sha256(),
-                    expected_size: asset.published_size(),
-                    observed_sha256: existing_sha256,
-                    observed_size: existing.len() as u64,
+        io::Write::write_all(&mut file, chunk).map_err(|source| {
+            FilesystemObjectStoreError::io("write temporary asset", &path, source)
+        })?;
+        Ok(())
+    }
+
+    fn finish(self: Box<Self>) -> Result<(), Self::Error> {
+        let mut writer = self;
+        let temporary = writer.temporary_path()?;
+        // Create-new: an existing object is never replaced, even by a writer that
+        // raced this one.
+        match fs::hard_link(&temporary, &writer.object_path) {
+            Ok(()) => {}
+            Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
+                let _ = fs::remove_file(&temporary);
+                return Err(FilesystemObjectStoreError::ConcurrentObject {
+                    object_path: writer.object_path.clone(),
                 });
             }
-            if metadata_path.is_file() {
-                let metadata = read_metadata(&metadata_path)?;
-                if metadata.content_type != *asset.published_content_type() {
-                    return Err(FilesystemAssetTargetError::ConflictingObjectMetadata {
-                        object_key: object_key.clone(),
-                        expected: asset.published_content_type().to_string(),
-                        observed: metadata.content_type.to_string(),
-                    });
-                }
-                return Ok(());
+            Err(source) => {
+                let _ = fs::remove_file(&temporary);
+                return Err(FilesystemObjectStoreError::io(
+                    "publish asset object",
+                    &writer.object_path,
+                    source,
+                ));
             }
-            // Identical bytes, but this publisher's own metadata never landed.
-            // Completing it is not overwriting content.
-            return write_metadata(&metadata_path, asset.published_content_type());
         }
-
-        // Bytes first, metadata second, both through a temporary file and a rename,
-        // so a reader never sees a partially written object.
-        write_atomically(&object_path, content.bytes())?;
-        write_metadata(&metadata_path, asset.published_content_type())
+        let _ = fs::remove_file(&temporary);
+        write_metadata(&writer.metadata_path, &writer.content_type)
     }
 }
 
@@ -170,10 +291,10 @@ struct ObjectMetadata {
     content_type: AssetContentType,
 }
 
-fn read_metadata(path: &Path) -> Result<ObjectMetadata, FilesystemAssetTargetError> {
+fn read_metadata(path: &Path) -> Result<ObjectMetadata, FilesystemObjectStoreError> {
     let bytes = fs::read(path)
-        .map_err(|source| FilesystemAssetTargetError::io("read asset metadata", path, source))?;
-    serde_json::from_slice(&bytes).map_err(|error| FilesystemAssetTargetError::UnreadableMetadata {
+        .map_err(|source| FilesystemObjectStoreError::io("read asset metadata", path, source))?;
+    serde_json::from_slice(&bytes).map_err(|error| FilesystemObjectStoreError::UnreadableMetadata {
         metadata_path: path.to_path_buf(),
         error: error.to_string(),
     })
@@ -182,31 +303,27 @@ fn read_metadata(path: &Path) -> Result<ObjectMetadata, FilesystemAssetTargetErr
 fn write_metadata(
     path: &Path,
     content_type: &AssetContentType,
-) -> Result<(), FilesystemAssetTargetError> {
+) -> Result<(), FilesystemObjectStoreError> {
     let encoded = serde_json::to_vec(&ObjectMetadata {
         content_type: content_type.clone(),
     })
     .expect("asset metadata is always representable as JSON");
-    write_atomically(path, &encoded)
-}
-
-fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), FilesystemAssetTargetError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|source| {
-            FilesystemAssetTargetError::io("create asset directory", parent, source)
+            FilesystemObjectStoreError::io("create asset directory", parent, source)
         })?;
     }
     let sequence = NEXT_TEMPORARY.fetch_add(1, Ordering::Relaxed);
-    let temporary = path.with_extension(format!("tmp-{}-{sequence}", std::process::id()));
-    fs::write(&temporary, bytes).map_err(|source| {
-        FilesystemAssetTargetError::io("write asset object", &temporary, source)
+    let temporary = path.with_extension(format!("meta-{}-{sequence}.tmp", std::process::id()));
+    fs::write(&temporary, &encoded).map_err(|source| {
+        FilesystemObjectStoreError::io("write asset metadata", &temporary, source)
     })?;
     fs::rename(&temporary, path)
-        .map_err(|source| FilesystemAssetTargetError::io("publish asset object", path, source))
+        .map_err(|source| FilesystemObjectStoreError::io("publish asset metadata", path, source))
 }
 
 #[derive(Debug)]
-pub enum FilesystemAssetTargetError {
+pub enum FilesystemObjectStoreError {
     UnsafeObjectKey {
         object_key: String,
     },
@@ -234,6 +351,10 @@ pub enum FilesystemAssetTargetError {
         expected: String,
         observed: String,
     },
+    /// Another writer created the object first; nothing was overwritten.
+    ConcurrentObject {
+        object_path: PathBuf,
+    },
     Io {
         operation: &'static str,
         path: PathBuf,
@@ -241,7 +362,7 @@ pub enum FilesystemAssetTargetError {
     },
 }
 
-impl FilesystemAssetTargetError {
+impl FilesystemObjectStoreError {
     fn io(operation: &'static str, path: &Path, source: io::Error) -> Self {
         Self::Io {
             operation,
@@ -251,7 +372,7 @@ impl FilesystemAssetTargetError {
     }
 }
 
-impl fmt::Display for FilesystemAssetTargetError {
+impl fmt::Display for FilesystemObjectStoreError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::UnsafeObjectKey { object_key } => {
@@ -283,6 +404,11 @@ impl fmt::Display for FilesystemAssetTargetError {
                 formatter,
                 "asset target already advertises another media type for: {object_key}"
             ),
+            Self::ConcurrentObject { object_path } => write!(
+                formatter,
+                "another writer created this object first: {}",
+                object_path.display()
+            ),
             Self::Io {
                 operation, path, ..
             } => write!(formatter, "could not {operation}: {}", path.display()),
@@ -290,7 +416,7 @@ impl fmt::Display for FilesystemAssetTargetError {
     }
 }
 
-impl Error for FilesystemAssetTargetError {
+impl Error for FilesystemObjectStoreError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Io { source, .. } => Some(source),
@@ -299,7 +425,7 @@ impl Error for FilesystemAssetTargetError {
     }
 }
 
-impl AsRef<Path> for FilesystemAssetTarget {
+impl AsRef<Path> for FilesystemObjectStore {
     fn as_ref(&self) -> &Path {
         &self.root
     }
@@ -314,7 +440,7 @@ mod tests {
     };
 
     use crate::{
-        asset::{AssetTargetState, AssetVerification},
+        asset::{AssetVerification, ImmutableBlobSource, VerifiedBytesSource},
         domain::{ContentPath, Sha256},
         workflow::{AssetContentType, AssetDeliveryConfig, PublishedAsset},
     };
@@ -323,27 +449,25 @@ mod tests {
 
     static NEXT: AtomicU64 = AtomicU64::new(1);
 
-    struct TestTarget {
+    struct TestStore {
         root: PathBuf,
-        target: FilesystemAssetTarget,
+        store: FilesystemObjectStore,
     }
 
-    impl TestTarget {
+    impl TestStore {
         fn new() -> Self {
             let root = std::env::temp_dir().join(format!(
-                "mineral-publisher-asset-target-{}-{}",
+                "mineral-publisher-object-store-{}-{}",
                 std::process::id(),
                 NEXT.fetch_add(1, Ordering::Relaxed)
             ));
             fs::create_dir_all(&root).unwrap();
             Self {
-                target: FilesystemAssetTarget::new(&root),
+                store: FilesystemObjectStore::new(&root),
                 root,
             }
         }
 
-        /// The raw path the target stores one object at, so a test can corrupt the
-        /// namespace from outside.
         fn object_path(&self, asset: &PublishedAsset) -> PathBuf {
             self.root.join(
                 asset
@@ -359,9 +483,19 @@ mod tests {
             name.push(".mineral-metadata");
             object.with_file_name(name)
         }
+
+        /// A writer that hashes nothing: it exists to show what the *transport*
+        /// does with bytes it is handed.
+        fn write(&self, asset: &PublishedAsset, bytes: &[u8]) {
+            let mut writer = self.store.open_writer(asset).unwrap();
+            for chunk in bytes.chunks(3) {
+                writer.write(chunk).unwrap();
+            }
+            writer.finish().unwrap();
+        }
     }
 
-    impl Drop for TestTarget {
+    impl Drop for TestStore {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
@@ -379,29 +513,26 @@ mod tests {
     }
 
     #[test]
-    fn an_object_is_published_and_then_verified_from_its_own_bytes() {
-        let fixture = TestTarget::new();
+    fn an_object_is_written_and_then_verified_from_its_own_bytes() {
+        let fixture = TestStore::new();
         let asset = asset("img/photo.png", b"published bytes", "image/png");
-
         assert_eq!(
-            fixture.target.inspect(asset.object_key()).unwrap(),
+            fixture.store.inspect(asset.object_key()).unwrap(),
             AssetTargetState::Missing
         );
 
-        let content = asset.verify_bytes(b"published bytes").unwrap();
-        fixture.target.publish(content).unwrap();
+        fixture.write(&asset, b"published bytes");
 
-        let state = fixture.target.inspect(asset.object_key()).unwrap();
-        let AssetTargetState::Present(facts) = state else {
-            panic!("the published object must be present");
+        let AssetTargetState::Present(facts) = fixture.store.inspect(asset.object_key()).unwrap()
+        else {
+            panic!("the written object must be present");
         };
         assert_eq!(facts.object_key(), asset.object_key());
         assert_eq!(facts.size(), asset.published_size());
         assert_eq!(facts.content_type(), asset.published_content_type());
         assert_eq!(
             facts.bytes(),
-            AssetByteIdentity::Verified(asset.published_sha256()),
-            "the target hashed the object it serves"
+            AssetByteIdentity::Verified(asset.published_sha256())
         );
         assert_eq!(
             asset.judge(&AssetTargetState::Present(facts)),
@@ -413,127 +544,169 @@ mod tests {
         );
     }
 
+    /// The bytes the driver sends must be the verified ones; what the object store
+    /// does with a *second* write under the same key is to ignore it, because the
+    /// object already there is exactly the frozen representation.
     #[test]
-    fn publishing_the_same_representation_repeatedly_is_idempotent() {
-        let fixture = TestTarget::new();
+    fn an_exact_object_is_reused_and_never_rewritten() {
+        let fixture = TestStore::new();
         let asset = asset("img/photo.png", b"published bytes", "image/png");
+        fixture.write(&asset, b"published bytes");
 
-        for _ in 0..3 {
-            fixture
-                .target
-                .publish(asset.verify_bytes(b"published bytes").unwrap())
-                .unwrap();
-        }
+        let mut writer = fixture.store.open_writer(&asset).unwrap();
+        writer.write(b"not the frozen bytes").unwrap();
+        writer.finish().unwrap();
 
-        let state = fixture.target.inspect(asset.object_key()).unwrap();
+        assert_eq!(
+            fs::read(fixture.object_path(&asset)).unwrap(),
+            b"published bytes"
+        );
+        let state = fixture.store.inspect(asset.object_key()).unwrap();
         assert_eq!(asset.judge(&state), AssetVerification::Ready);
     }
 
     #[test]
-    fn the_content_type_is_the_stored_metadata_not_the_file_name() {
-        let fixture = TestTarget::new();
-        // A `.png` path whose published bytes are a JPEG.
-        let asset = asset("img/photo.png", b"jpeg bytes", "image/jpeg");
-
-        fixture
-            .target
-            .publish(asset.verify_bytes(b"jpeg bytes").unwrap())
-            .unwrap();
-
-        let AssetTargetState::Present(facts) = fixture.target.inspect(asset.object_key()).unwrap()
-        else {
-            panic!("the published object must be present");
-        };
-        assert_eq!(facts.content_type().as_str(), "image/jpeg");
-    }
-
-    #[test]
     fn a_conflicting_object_is_never_overwritten() {
-        let fixture = TestTarget::new();
+        let fixture = TestStore::new();
         let asset = asset("img/photo.png", b"published bytes", "image/png");
-        // Something else already sits at the frozen content-addressed key.
         let path = fixture.object_path(&asset);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, b"a different object").unwrap();
-
-        let error = fixture
-            .target
-            .publish(asset.verify_bytes(b"published bytes").unwrap())
-            .unwrap_err();
+        fs::write(
+            fixture.metadata_path(&asset),
+            b"{\"content_type\":\"image/png\"}",
+        )
+        .unwrap();
 
         assert!(matches!(
-            error,
-            FilesystemAssetTargetError::ConflictingObject { .. }
+            fixture.store.open_writer(&asset),
+            Err(FilesystemObjectStoreError::ConflictingObject { .. })
         ));
         assert_eq!(fs::read(&path).unwrap(), b"a different object");
     }
 
     #[test]
-    fn an_object_without_its_metadata_fails_closed() {
-        let fixture = TestTarget::new();
-        let asset = asset("img/photo.png", b"published bytes", "image/png");
-        let path = fixture.object_path(&asset);
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, b"published bytes").unwrap();
+    fn a_wrong_content_type_under_the_frozen_key_is_a_conflict() {
+        let fixture = TestStore::new();
+        let frozen = asset("img/photo.png", b"published bytes", "image/jpeg");
+        fixture.write(&frozen, b"published bytes");
+        let other = asset("img/photo.png", b"published bytes", "image/png");
 
         assert!(matches!(
-            fixture.target.inspect(asset.object_key()),
-            Err(FilesystemAssetTargetError::MetadataMissing { .. })
+            fixture.store.open_writer(&other),
+            Err(FilesystemObjectStoreError::ConflictingObjectMetadata { .. })
         ));
     }
 
     #[test]
+    fn an_object_without_its_metadata_fails_inspection_but_can_be_completed() {
+        let fixture = TestStore::new();
+        let asset = asset("img/photo.png", b"published bytes", "image/png");
+        fixture.write(&asset, b"published bytes");
+        fs::remove_file(fixture.metadata_path(&asset)).unwrap();
+
+        assert!(matches!(
+            fixture.store.inspect(asset.object_key()),
+            Err(FilesystemObjectStoreError::MetadataMissing { .. })
+        ));
+
+        // The bytes are exactly the frozen representation, so completing the
+        // publisher's own metadata is not overwriting content.
+        let mut writer = fixture.store.open_writer(&asset).unwrap();
+        writer.write(b"ignored").unwrap();
+        writer.finish().unwrap();
+
+        let state = fixture.store.inspect(asset.object_key()).unwrap();
+        assert_eq!(asset.judge(&state), AssetVerification::Ready);
+        assert_eq!(
+            fs::read(fixture.object_path(&asset)).unwrap(),
+            b"published bytes"
+        );
+    }
+
+    #[test]
     fn metadata_without_an_object_fails_closed() {
-        let fixture = TestTarget::new();
+        let fixture = TestStore::new();
         let asset = asset("img/photo.png", b"published bytes", "image/png");
         let path = fixture.metadata_path(&asset);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, b"{\"content_type\":\"image/png\"}").unwrap();
 
         assert!(matches!(
-            fixture.target.inspect(asset.object_key()),
-            Err(FilesystemAssetTargetError::MetadataWithoutObject { .. })
+            fixture.store.inspect(asset.object_key()),
+            Err(FilesystemObjectStoreError::MetadataWithoutObject { .. })
+        ));
+        assert!(matches!(
+            fixture.store.open_writer(&asset),
+            Err(FilesystemObjectStoreError::MetadataWithoutObject { .. })
         ));
     }
 
     #[test]
     fn unreadable_metadata_fails_closed() {
-        let fixture = TestTarget::new();
+        let fixture = TestStore::new();
         let asset = asset("img/photo.png", b"published bytes", "image/png");
-        fixture
-            .target
-            .publish(asset.verify_bytes(b"published bytes").unwrap())
-            .unwrap();
+        fixture.write(&asset, b"published bytes");
         fs::write(fixture.metadata_path(&asset), b"not json").unwrap();
 
         assert!(matches!(
-            fixture.target.inspect(asset.object_key()),
-            Err(FilesystemAssetTargetError::UnreadableMetadata { .. })
+            fixture.store.inspect(asset.object_key()),
+            Err(FilesystemObjectStoreError::UnreadableMetadata { .. })
         ));
     }
 
-    /// Identical bytes with missing publisher metadata are completed rather than
-    /// treated as a conflict: nothing is being overwritten.
     #[test]
-    fn missing_metadata_for_correct_bytes_is_completed_on_republish() {
-        let fixture = TestTarget::new();
+    fn the_content_type_is_the_stored_metadata_not_the_file_name() {
+        let fixture = TestStore::new();
+        let asset = asset("img/photo.png", b"jpeg bytes", "image/jpeg");
+        fixture.write(&asset, b"jpeg bytes");
+
+        let AssetTargetState::Present(facts) = fixture.store.inspect(asset.object_key()).unwrap()
+        else {
+            panic!("the written object must be present");
+        };
+        assert_eq!(facts.content_type().as_str(), "image/jpeg");
+    }
+
+    /// Committing is an explicit step: a writer that is dropped without finishing
+    /// leaves nothing behind, which is what makes it safe for the driver to abort
+    /// a write whose bytes it could not verify.
+    #[test]
+    fn a_writer_that_is_dropped_without_finishing_creates_no_object() {
+        let fixture = TestStore::new();
         let asset = asset("img/photo.png", b"published bytes", "image/png");
-        fixture
-            .target
-            .publish(asset.verify_bytes(b"published bytes").unwrap())
-            .unwrap();
-        fs::remove_file(fixture.metadata_path(&asset)).unwrap();
 
-        fixture
-            .target
-            .publish(asset.verify_bytes(b"published bytes").unwrap())
-            .unwrap();
+        {
+            let mut writer = fixture.store.open_writer(&asset).unwrap();
+            writer.write(b"published").unwrap();
+        }
 
-        let state = fixture.target.inspect(asset.object_key()).unwrap();
-        assert_eq!(asset.judge(&state), AssetVerification::Ready);
         assert_eq!(
-            fs::read(fixture.object_path(&asset)).unwrap(),
-            b"published bytes"
+            fixture.store.inspect(asset.object_key()).unwrap(),
+            AssetTargetState::Missing
         );
+    }
+
+    /// The in-memory seam from S6.3 still drives the same transport.
+    #[test]
+    fn verified_bytes_can_be_streamed_into_the_store() {
+        let fixture = TestStore::new();
+        let asset = asset("img/photo.png", b"published bytes", "image/png");
+        let content = asset.verify_bytes(b"published bytes").unwrap();
+        let mut source = VerifiedBytesSource::new(&content);
+
+        let mut writer = fixture.store.open_writer(&asset).unwrap();
+        let mut buffer = [0_u8; 4];
+        loop {
+            let read = source.read_chunk(&mut buffer).unwrap();
+            if read == 0 {
+                break;
+            }
+            writer.write(&buffer[..read]).unwrap();
+        }
+        writer.finish().unwrap();
+
+        let state = fixture.store.inspect(asset.object_key()).unwrap();
+        assert_eq!(asset.judge(&state), AssetVerification::Ready);
     }
 }

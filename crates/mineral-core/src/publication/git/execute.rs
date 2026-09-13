@@ -994,7 +994,7 @@ mod tests {
         publication::asset::{
             AssetByteIdentity, AssetContentError, AssetObservationId, AssetObservationIdGenerator,
             AssetObservationStore, AssetTarget, AssetTargetFacts, AssetTargetObservation,
-            AssetTargetState, VerifiedAssetContent,
+            AssetTargetState, ImmutableBlobSource,
         },
         publication::git::{
             GitCommitSpec, GitCurrentTarget, GitRefTarget, GitTreeOid, RemoteRefState,
@@ -1577,6 +1577,7 @@ mod tests {
         publish_result: RefCell<Result<(), PortFailure>>,
         inspect_calls: Cell<u32>,
         publish_calls: Cell<u32>,
+        chunk_reads: Cell<u32>,
         inspected: RefCell<Vec<AssetObjectKey>>,
         published: RefCell<Vec<(AssetObjectKey, Vec<u8>, String)>>,
     }
@@ -1588,6 +1589,7 @@ mod tests {
                 publish_result: RefCell::new(Ok(())),
                 inspect_calls: Cell::new(0),
                 publish_calls: Cell::new(0),
+                chunk_reads: Cell::new(0),
                 inspected: RefCell::new(Vec::new()),
                 published: RefCell::new(Vec::new()),
             }
@@ -1618,6 +1620,11 @@ mod tests {
             self.publish_calls.get()
         }
 
+        /// How many bounded pieces the driver needed for the objects it placed.
+        fn chunk_reads(&self) -> u32 {
+            self.chunk_reads.get()
+        }
+
         fn inspected(&self) -> Vec<AssetObjectKey> {
             self.inspected.borrow().clone()
         }
@@ -1645,13 +1652,32 @@ mod tests {
             Ok(self.next_state())
         }
 
-        fn publish(&self, content: VerifiedAssetContent<'_>) -> Result<(), Self::Error> {
+        fn publish(
+            &self,
+            asset: &PublishedAsset,
+            source: &mut dyn ImmutableBlobSource,
+        ) -> Result<(), Self::Error> {
             self.publish_calls.set(self.publish_calls.get() + 1);
             (*self.publish_result.borrow())?;
+            // Drain the bounded source exactly as a runtime would, recording how
+            // many pieces it took so a test can show the object was not handed
+            // over in one buffer.
+            let mut bytes = Vec::new();
+            let mut buffer = vec![0_u8; 4];
+            loop {
+                let read = source
+                    .read_chunk(&mut buffer)
+                    .map_err(|_| PortFailure("asset source failed"))?;
+                if read == 0 {
+                    break;
+                }
+                self.chunk_reads.set(self.chunk_reads.get() + 1);
+                bytes.extend_from_slice(&buffer[..read]);
+            }
             self.published.borrow_mut().push((
-                content.asset().object_key().clone(),
-                content.bytes().to_vec(),
-                content.asset().published_content_type().as_str().to_owned(),
+                asset.object_key().clone(),
+                bytes,
+                asset.published_content_type().as_str().to_owned(),
             ));
             Ok(())
         }
@@ -2705,12 +2731,16 @@ mod tests {
         assert_eq!(harness.assets.inspect_calls(), 2);
         assert_eq!(harness.assets.publish_calls(), 1);
         assert_eq!(harness.asset_observations.save_calls(), 2);
-        // The very bytes that were verified are the bytes the target received.
+        // The very bytes that were verified are the bytes the target received,
+        // and they arrive as bounded pieces rather than one buffer: the fake
+        // target reads four bytes at a time, so a ten-byte object takes three.
         let published = harness.assets.published();
         assert_eq!(published.len(), 1);
         assert_eq!(published[0].0, *fixture.asset.object_key());
         assert_eq!(published[0].1, fixture.bytes);
         assert_eq!(published[0].2, "image/png");
+        assert_eq!(fixture.bytes.len(), 10);
+        assert_eq!(harness.assets.chunk_reads(), 3);
         assert_eq!(harness.remote.compare_and_swap_calls(), 1);
     }
 
@@ -2729,13 +2759,16 @@ mod tests {
         );
         harness.blobs.remove(fixture.asset.published_sha256());
 
+        // The engine cannot even open the frozen blob, so nothing is offered to
+        // the target and the Git target is never touched.
         assert!(matches!(
             harness.execute(),
             Err(DeliveryPublicationExecuteError::Assets(
-                AssetPublicationError::BlobRead { .. }
+                AssetPublicationError::BlobOpen { .. }
             ))
         ));
         assert_eq!(harness.assets.publish_calls(), 0);
+        assert_eq!(harness.assets.inspect_calls(), 1);
         assert_eq!(harness.remote.compare_and_swap_calls(), 0);
     }
 

@@ -13,7 +13,10 @@ use std::{
 };
 
 use mineral_publisher::{
-    asset::{AssetPublicationOutcome, FilesystemAssetTarget, UuidAssetObservationIdGenerator},
+    asset::{
+        AssetPublicationOutcome, ConfiguredAssetTarget, R2ObjectStore, R2ObjectStoreConfig,
+        R2SecretKey, UuidAssetObservationIdGenerator,
+    },
     domain::{Sha256, Snapshot, SnapshotId, SourceId},
     policy::{
         PolicyIdentity, ReviewCandidate, ReviewRunId, ReviewRunStore, Reviewer, ReviewerError,
@@ -60,7 +63,16 @@ git:
   message: Publish Mineral content
 assets:
   public_base_url: https://assets.example.com
+  # Exactly one target: the native store on this machine, or an S3-compatible
+  # bucket. The secret key is never written here, only the variable that holds it.
   target_path: ./asset-target
+  # r2:
+  #   endpoint: https://<account>.r2.cloudflarestorage.com
+  #   bucket: mineral-assets
+  #   access_key_id: <access key id>
+  #   secret_access_key_env: MINERAL_R2_SECRET_ACCESS_KEY
+  #   region: auto
+  #   timeout_seconds: 300
 review:
   api_base_url: https://api.deepseek.com
   markdown_model: deepseek-flash
@@ -126,9 +138,30 @@ impl GitConfig {
 struct AssetsConfig {
     /// Absolute HTTPS base URL every published asset URL is built from.
     public_base_url: String,
-    /// Where the native runtime places published objects. The Cloudflare runtime
-    /// implements the same asset-target port over object storage instead.
-    target_path: PathBuf,
+    /// Where the native runtime places published objects.
+    #[serde(default)]
+    target_path: Option<PathBuf>,
+    /// An S3-compatible bucket, for runtimes that publish to object storage.
+    #[serde(default)]
+    r2: Option<R2Config>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct R2Config {
+    /// Absolute endpoint of the service, without the bucket and without a
+    /// trailing slash.
+    endpoint: String,
+    bucket: String,
+    access_key_id: String,
+    /// The name of the environment variable that holds the secret access key.
+    /// The key itself never belongs in a configuration file.
+    secret_access_key_env: String,
+    /// R2 accepts `auto`; a generic S3 endpoint may need its own region.
+    #[serde(default)]
+    region: Option<String>,
+    #[serde(default)]
+    timeout_seconds: Option<u64>,
 }
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -169,7 +202,24 @@ impl Workspace {
         config.state.path = absolute(base, &config.state.path)?;
         config.git.repository = absolute(base, &config.git.repository)?;
         if let Some(assets) = &mut config.assets {
-            assets.target_path = absolute(base, &assets.target_path)?;
+            // One target, chosen explicitly: a workspace that names both (or
+            // neither) must fail before a publication picks one for it.
+            match (&assets.target_path, &assets.r2) {
+                (Some(_), Some(_)) => {
+                    return Err(
+                        "assets.target_path and assets.r2 are both configured; choose one".into(),
+                    );
+                }
+                (None, None) => {
+                    return Err(
+                        "assets must configure either target_path or r2 before publishing".into(),
+                    );
+                }
+                _ => {}
+            }
+            if let Some(target_path) = &assets.target_path {
+                assets.target_path = Some(absolute(base, target_path)?);
+            }
         }
         Ok(Self {
             config,
@@ -204,12 +254,44 @@ impl Workspace {
     }
     fn assets(&self) -> Result<&AssetsConfig, Box<dyn Error>> {
         self.config.assets.as_ref().ok_or(
-            "assets.public_base_url and assets.target_path must be configured before publishing"
+            "assets.public_base_url and one asset target must be configured before publishing"
                 .into(),
         )
     }
-    fn asset_target(&self) -> Result<FilesystemAssetTarget, Box<dyn Error>> {
-        Ok(FilesystemAssetTarget::new(&self.assets()?.target_path))
+
+    /// Builds the configured target, reading the secret access key from the
+    /// environment. This is the only place an asset-target credential is read,
+    /// and it never reaches the engine or a durable record.
+    fn asset_target(&self) -> Result<ConfiguredAssetTarget, Box<dyn Error>> {
+        let assets = self.assets()?;
+        if let Some(target_path) = &assets.target_path {
+            return Ok(ConfiguredAssetTarget::filesystem(target_path));
+        }
+        let r2 = assets
+            .r2
+            .as_ref()
+            .ok_or("assets must configure either target_path or r2 before publishing")?;
+        let mut config = R2ObjectStoreConfig::new(
+            r2.endpoint.clone(),
+            r2.bucket.clone(),
+            r2.access_key_id.clone(),
+            R2SecretKey::new(env::var(&r2.secret_access_key_env).map_err(|_| {
+                format!(
+                    "assets.r2.secret_access_key_env names {}, which is not set",
+                    r2.secret_access_key_env
+                )
+            })?)?,
+        )?;
+        if let Some(region) = &r2.region {
+            config = config.with_region(region.clone())?;
+        }
+        if let Some(seconds) = r2.timeout_seconds {
+            config = config.with_timeout(std::time::Duration::from_secs(seconds));
+        }
+        Ok(ConfiguredAssetTarget::r2(R2ObjectStore::new(
+            config,
+            self.config.state.path.join("asset-spool"),
+        )?))
     }
     fn asset_observations_db(&self) -> PathBuf {
         self.config.state.path.join("asset-observations.sqlite3")
@@ -333,7 +415,7 @@ fn publish(workspace: Workspace) -> Result<(), Box<dyn Error>> {
     let publish_runs = SqlitePublishRunStore::open(workspace.publish_db())?;
     let delivery_projections = SqliteDeliveryProjectionStore::open(workspace.delivery_db())?;
     let asset_target = workspace.asset_target()?;
-    let asset_root = asset_target.root().to_path_buf();
+    let asset_location = asset_target.description();
     let asset_observations = SqliteAssetObservationStore::open(workspace.asset_observations_db())?;
     let observations = SqliteRemoteObservationStore::open(workspace.observation_db())?;
     let markdown_reviewer = LazyMarkdownReviewer {
@@ -412,11 +494,11 @@ fn publish(workspace: Workspace) -> Result<(), Box<dyn Error>> {
         &asset_evaluator,
     )?;
     eprintln!("[4/4] Publication workflow finished.");
-    render_publication(outcome, &asset_root);
+    render_publication(outcome, &asset_location);
     Ok(())
 }
 
-fn render_publication(outcome: PublicationApplicationOutcome, asset_root: &Path) {
+fn render_publication(outcome: PublicationApplicationOutcome, asset_location: &str) {
     match outcome {
         PublicationApplicationOutcome::NeedsHumanReview { trace } => {
             println!(
@@ -483,7 +565,7 @@ fn render_publication(outcome: PublicationApplicationOutcome, asset_root: &Path)
                 completed.publication_set().markdown_paths().len(),
                 completed.publication_set().asset_paths().len(),
                 assets,
-                asset_root.display()
+                asset_location
             );
             if status == "noop" {
                 println!("  No changes to publish.");
@@ -916,7 +998,73 @@ fn sqlite_positive_id(value: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, DEFAULT_CONFIG, sqlite_positive_id};
+    use super::{Config, DEFAULT_CONFIG, Workspace, sqlite_positive_id};
+
+    /// The three asset-target shapes a configuration can have: the native store,
+    /// neither target, and both. Only the first is publishable, and the two that
+    /// are not are refused while the workspace is loaded rather than when a
+    /// publication is already under way.
+    #[test]
+    fn a_workspace_must_name_exactly_one_asset_target() {
+        let directory =
+            std::env::temp_dir().join(format!("mineral-cli-assets-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let r2 = "  r2:\n    endpoint: https://account.r2.cloudflarestorage.com\n    bucket: mineral-assets\n    access_key_id: AKIDEXAMPLE\n    secret_access_key_env: MINERAL_R2_SECRET_ACCESS_KEY\n";
+
+        let native = DEFAULT_CONFIG.to_owned();
+        let neither = DEFAULT_CONFIG.replace("  target_path: ./asset-target\n", "");
+        let both = DEFAULT_CONFIG.replace(
+            "  target_path: ./asset-target\n",
+            &format!("  target_path: ./asset-target\n{r2}"),
+        );
+
+        for (name, text, refusal) in [
+            ("native", &native, None),
+            ("neither", &neither, Some("either target_path or r2")),
+            ("both", &both, Some("choose one")),
+        ] {
+            let path = directory.join(format!("{name}.yml"));
+            std::fs::write(&path, text).unwrap();
+            match (refusal, Workspace::load(path)) {
+                (None, Ok(workspace)) => {
+                    let target = workspace.asset_target().unwrap();
+                    assert!(target.description().starts_with("filesystem:"));
+                }
+                (None, Err(error)) => panic!("the native configuration must load: {error}"),
+                (Some(_), Ok(_)) => panic!("{name} must be refused"),
+                (Some(fragment), Err(error)) => {
+                    let error = error.to_string();
+                    assert!(error.contains(fragment), "{name}: {error}");
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// The secret key is never read from the configuration file: it comes from
+    /// the environment, and a workspace that names a variable which is not set
+    /// fails closed instead of publishing with an empty credential.
+    #[test]
+    fn an_r2_target_reads_its_secret_from_the_environment() {
+        let directory = std::env::temp_dir().join(format!("mineral-cli-r2-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let text = DEFAULT_CONFIG.replace(
+            "  target_path: ./asset-target\n",
+            "  r2:\n    endpoint: https://account.r2.cloudflarestorage.com\n    bucket: mineral-assets\n    access_key_id: AKIDEXAMPLE\n    secret_access_key_env: MINERAL_R2_TEST_UNSET_SECRET\n",
+        );
+        let path = directory.join("r2.yml");
+        std::fs::write(&path, text).unwrap();
+        let workspace = Workspace::load(path).unwrap();
+
+        let error = workspace
+            .asset_target()
+            .err()
+            .expect("an unset secret must be refused")
+            .to_string();
+
+        assert!(error.contains("MINERAL_R2_TEST_UNSET_SECRET"), "{error}");
+        let _ = std::fs::remove_dir_all(&directory);
+    }
 
     #[test]
     fn default_config_has_no_managed_root_and_legacy_override_is_rejected() {

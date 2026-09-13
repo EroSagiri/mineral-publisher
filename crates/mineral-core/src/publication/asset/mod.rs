@@ -10,6 +10,7 @@ mod model;
 mod observation;
 mod ports;
 mod publish;
+mod stream;
 
 pub use model::{
     AssetByteIdentity, AssetContentError, AssetTargetConflict, AssetTargetFacts, AssetTargetState,
@@ -21,3 +22,6 @@ pub use observation::{
 };
 pub use ports::AssetTarget;
 pub use publish::{AssetPublication, AssetPublicationError, AssetPublicationOutcome};
+pub use stream::{
+    BufferedBlobSource, ImmutableBlobSource, IncrementalBlobVerifier, VerifiedBytesSource,
+};

@@ -10,7 +10,14 @@ use crate::{
 use super::{
     AssetContentError, AssetObservationIdGenerator, AssetObservationStore, AssetTarget,
     AssetTargetConflict, AssetTargetObservation, AssetTargetState, AssetVerification,
+    IncrementalBlobVerifier,
 };
+
+/// How much of a published blob the engine reads at a time.
+///
+/// The value bounds the engine's own working set; a runtime may stream in smaller
+/// pieces, and the object store absorbs the difference.
+pub const VERIFY_CHUNK_SIZE: usize = 64 * 1024;
 
 /// What the asset side of one publication attempt did.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -126,23 +133,21 @@ impl AssetPublication {
             }
 
             // The object is missing, so the frozen representation must be placed.
-            // Only bytes this engine verified itself are ever published, and they
-            // are the same bytes the target receives.
-            let bytes = blobs.read(asset.published_sha256()).map_err(|source| {
-                AssetPublicationError::BlobRead {
+            //
+            // It is proven locally first, over a bounded stream and with no side
+            // effect anywhere: the same rule the in-memory seam applies, so a
+            // corrupt or truncated published blob fails before any target is
+            // touched. The runtime then receives a fresh stream of the very same
+            // immutable blob and verifies it again as it sends it.
+            Self::verify_published_blob::<T, S, G, B>(asset, blobs)?;
+            let mut source = blobs.open(asset.published_sha256()).map_err(|source| {
+                AssetPublicationError::BlobOpen {
                     logical_path: asset.logical_path().clone(),
                     source,
                 }
             })?;
-            let content =
-                asset
-                    .verify_bytes(&bytes)
-                    .map_err(|source| AssetPublicationError::Content {
-                        logical_path: asset.logical_path().clone(),
-                        source,
-                    })?;
             target
-                .publish(content)
+                .publish(asset, source.as_mut())
                 .map_err(AssetPublicationError::TargetPublish)?;
             published += 1;
 
@@ -188,6 +193,53 @@ impl AssetPublication {
         })
     }
 
+    /// Proves one published blob is the frozen representation, in bounded chunks.
+    #[allow(clippy::type_complexity)]
+    fn verify_published_blob<T, S, G, B>(
+        asset: &PublishedAsset,
+        blobs: &B,
+    ) -> Result<(), AssetPublicationError<T::Error, S::Error, G::Error>>
+    where
+        T: AssetTarget,
+        S: AssetObservationStore,
+        G: AssetObservationIdGenerator,
+        B: BlobStore,
+    {
+        let mut source = blobs.open(asset.published_sha256()).map_err(|source| {
+            AssetPublicationError::BlobOpen {
+                logical_path: asset.logical_path().clone(),
+                source,
+            }
+        })?;
+        if source.identity() != asset.published_sha256() {
+            return Err(AssetPublicationError::BlobIdentityMismatch {
+                logical_path: asset.logical_path().clone(),
+                expected: asset.published_sha256(),
+                actual: source.identity(),
+            });
+        }
+        let mut verifier = IncrementalBlobVerifier::new();
+        let mut buffer = vec![0_u8; VERIFY_CHUNK_SIZE];
+        loop {
+            let read = source.read_chunk(&mut buffer).map_err(|source| {
+                AssetPublicationError::BlobRead {
+                    logical_path: asset.logical_path().clone(),
+                    source,
+                }
+            })?;
+            if read == 0 {
+                break;
+            }
+            verifier.update(&buffer[..read]);
+        }
+        verifier
+            .verify(asset)
+            .map_err(|source| AssetPublicationError::Content {
+                logical_path: asset.logical_path().clone(),
+                source,
+            })
+    }
+
     /// Persists one asset-target fact before anything is allowed to depend on it.
     #[allow(clippy::type_complexity)]
     fn record<T, S, G>(
@@ -229,10 +281,21 @@ pub enum AssetPublicationError<T: Error, S: Error, G: Error> {
     TargetInspect(T),
     /// The runtime could not place the verified representation.
     TargetPublish(T),
+    /// The immutable content store could not open the published blob.
+    BlobOpen {
+        logical_path: ContentPath,
+        source: ContentStoreError,
+    },
     /// The immutable content store could not produce the published bytes.
     BlobRead {
         logical_path: ContentPath,
         source: ContentStoreError,
+    },
+    /// The source reads from another blob than the one the asset froze.
+    BlobIdentityMismatch {
+        logical_path: ContentPath,
+        expected: crate::domain::Sha256,
+        actual: crate::domain::Sha256,
     },
     /// The bytes the content store returned are not the frozen representation.
     Content {
@@ -266,12 +329,22 @@ impl<T: Error, S: Error, G: Error> fmt::Display for AssetPublicationError<T, S, 
                 write!(formatter, "could not inspect asset target: {error}")
             }
             Self::TargetPublish(error) => write!(formatter, "could not publish asset: {error}"),
+            Self::BlobOpen { logical_path, .. } => {
+                write!(
+                    formatter,
+                    "could not open published blob for {logical_path}"
+                )
+            }
             Self::BlobRead { logical_path, .. } => {
                 write!(
                     formatter,
                     "could not read published bytes for {logical_path}"
                 )
             }
+            Self::BlobIdentityMismatch { logical_path, .. } => write!(
+                formatter,
+                "the published blob source for {logical_path} reads another identity"
+            ),
             Self::Content { logical_path, .. } => {
                 write!(
                     formatter,
@@ -318,7 +391,7 @@ impl<T: Error + 'static, S: Error + 'static, G: Error + 'static> Error
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::TargetInspect(error) | Self::TargetPublish(error) => Some(error),
-            Self::BlobRead { source, .. } => Some(source),
+            Self::BlobOpen { source, .. } | Self::BlobRead { source, .. } => Some(source),
             Self::Content { source, .. } => Some(source),
             Self::ObservationId(error) => Some(error),
             Self::ObservationPersistence(error) => Some(error),
@@ -326,6 +399,7 @@ impl<T: Error + 'static, S: Error + 'static, G: Error + 'static> Error
             Self::Conflict { .. }
             | Self::Unverifiable { .. }
             | Self::PublishedObjectMissing { .. }
+            | Self::BlobIdentityMismatch { .. }
             | Self::ClockUnavailable => None,
         }
     }

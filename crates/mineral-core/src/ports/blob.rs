@@ -1,6 +1,9 @@
 use std::{error::Error, fmt, io, path::PathBuf};
 
-use crate::domain::Sha256;
+use crate::{
+    domain::Sha256,
+    publication::asset::{BufferedBlobSource, ImmutableBlobSource},
+};
 
 /// Content-addressed blob access required by the portable engine.
 ///
@@ -11,6 +14,23 @@ use crate::domain::Sha256;
 pub trait BlobStore {
     fn read(&self, identity: Sha256) -> Result<Vec<u8>, ContentStoreError>;
     fn store(&self, content: &[u8]) -> Result<Sha256, ContentStoreError>;
+
+    /// Opens a bounded, streaming reader over one immutable blob.
+    ///
+    /// The default implementation reads the blob completely and hands it out in
+    /// chunks: that keeps every store honest about the *shape* of the contract,
+    /// but it still holds the whole object in memory. A runtime that publishes
+    /// large media must override this with a real stream, so that an asset is
+    /// never fully materialized on the way to the object store.
+    fn open(
+        &self,
+        identity: Sha256,
+    ) -> Result<Box<dyn ImmutableBlobSource + '_>, ContentStoreError> {
+        Ok(Box::new(BufferedBlobSource::new(
+            identity,
+            self.read(identity)?,
+        )))
+    }
 }
 
 /// A borrowed blob source is a blob source.
@@ -25,6 +45,13 @@ impl<B: BlobStore> BlobStore for &B {
 
     fn store(&self, content: &[u8]) -> Result<Sha256, ContentStoreError> {
         (**self).store(content)
+    }
+
+    fn open(
+        &self,
+        identity: Sha256,
+    ) -> Result<Box<dyn ImmutableBlobSource + '_>, ContentStoreError> {
+        (**self).open(identity)
     }
 }
 

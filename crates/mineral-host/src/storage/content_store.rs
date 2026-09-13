@@ -8,6 +8,7 @@ use std::{
 
 use crate::domain::Sha256;
 use mineral_core::ports::{BlobStore, ContentStoreError};
+use mineral_core::publication::asset::ImmutableBlobSource;
 
 static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(0);
 
@@ -110,6 +111,17 @@ impl LocalContentStore {
         Ok(content)
     }
 
+    /// Opens a bounded, streaming reader over one blob.
+    ///
+    /// The reader holds an open file and one caller-provided buffer, so an asset of
+    /// any size moves through this process without ever being materialized in
+    /// memory. Integrity is not assumed from the file name: the engine verifies the
+    /// stream it reads against the frozen published facts, so a blob that changed
+    /// under us is refused rather than uploaded.
+    pub fn open_blob(&self, identity: Sha256) -> Result<LocalBlobSource, ContentStoreError> {
+        LocalBlobSource::open(&self.blob_path(identity), identity)
+    }
+
     fn blob_path(&self, identity: Sha256) -> PathBuf {
         self.root.join(identity.to_string())
     }
@@ -149,6 +161,61 @@ impl BlobStore for LocalContentStore {
 
     fn store(&self, content: &[u8]) -> Result<Sha256, ContentStoreError> {
         LocalContentStore::store(self, content)
+    }
+
+    fn open(
+        &self,
+        identity: Sha256,
+    ) -> Result<Box<dyn ImmutableBlobSource + '_>, ContentStoreError> {
+        Ok(Box::new(self.open_blob(identity)?))
+    }
+}
+
+/// A bounded streaming reader over one local content-addressed blob.
+///
+/// It owns an open file and reads at most what the caller's buffer holds, so the
+/// process working set is one buffer regardless of the object's size. It makes no
+/// claim about the bytes: the engine verifies them.
+pub struct LocalBlobSource {
+    identity: Sha256,
+    path: PathBuf,
+    file: fs::File,
+}
+
+impl LocalBlobSource {
+    fn open(path: &Path, identity: Sha256) -> Result<Self, ContentStoreError> {
+        let file = match fs::File::open(path) {
+            Ok(file) => file,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {
+                return Err(ContentStoreError::Missing(identity));
+            }
+            Err(source) => {
+                return Err(ContentStoreError::io("open blob", path, source));
+            }
+        };
+        Ok(Self {
+            identity,
+            path: path.to_path_buf(),
+            file,
+        })
+    }
+}
+
+impl ImmutableBlobSource for LocalBlobSource {
+    fn identity(&self) -> Sha256 {
+        self.identity
+    }
+
+    fn read_chunk(&mut self, buffer: &mut [u8]) -> Result<usize, ContentStoreError> {
+        loop {
+            match std::io::Read::read(&mut self.file, buffer) {
+                Ok(read) => return Ok(read),
+                Err(source) if source.kind() == io::ErrorKind::Interrupted => continue,
+                Err(source) => {
+                    return Err(ContentStoreError::io("read blob", &self.path, source));
+                }
+            }
+        }
     }
 }
 
@@ -219,6 +286,52 @@ mod tests {
 
         assert!(matches!(
             store.read(identity),
+            Err(ContentStoreError::Missing(missing)) if missing == identity
+        ));
+    }
+
+    #[test]
+    fn a_blob_can_be_streamed_in_bounded_pieces() {
+        let directory = TestDirectory::new();
+        let store = LocalContentStore::new(directory.path());
+        let body = b"a published blob that is longer than one small read";
+        let identity = store.store(body).unwrap();
+
+        let mut source = store.open_blob(identity).unwrap();
+        assert_eq!(source.identity(), identity);
+
+        let mut collected = Vec::new();
+        let mut buffer = [0_u8; 7];
+        let mut reads = 0;
+        loop {
+            let read = source.read_chunk(&mut buffer).unwrap();
+            if read == 0 {
+                break;
+            }
+            assert!(read <= buffer.len());
+            reads += 1;
+            collected.extend_from_slice(&buffer[..read]);
+        }
+
+        assert_eq!(collected, body);
+        assert!(reads > 1, "a seven-byte buffer must need several reads");
+        // The stream reads the very file the identity names, with no full copy.
+        assert_eq!(
+            fs::metadata(directory.path().join(identity.to_string()))
+                .unwrap()
+                .len(),
+            body.len() as u64
+        );
+    }
+
+    #[test]
+    fn opening_a_missing_blob_is_an_explicit_error() {
+        let directory = TestDirectory::new();
+        let store = LocalContentStore::new(directory.path());
+        let identity = Sha256::digest(b"missing");
+
+        assert!(matches!(
+            store.open_blob(identity),
             Err(ContentStoreError::Missing(missing)) if missing == identity
         ));
     }
