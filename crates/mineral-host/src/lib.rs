@@ -22,6 +22,7 @@ mod conformance_public_policy_run;
 #[cfg(test)]
 mod conformance_publish_reconciliation;
 
+pub mod application;
 pub mod asset;
 pub mod backup;
 pub mod config;

@@ -41,16 +41,24 @@ crates/mineral-host/src/
 │   ├── load.rs             读文件、按扩展名选择格式
 │   ├── validate.rs         校验 + 规范化（fail closed，顺序与错误信息稳定）
 │   ├── secrets.rs          SecretName / SecretValue / SecretProvider
+│   ├── tests.rs
 │   └── mod.rs
 ├── runtime/                composition root
-│   ├── workspace.rs        WorkspaceRuntime：配置 + 已构造的 host 能力
-│   ├── composition.rs      CAS / 各 SQLite store / source / reviewer / target / lfs
-│   └── mod.rs
+│   ├── workspace.rs        WorkspaceRuntime：配置 + SecretProvider + CAS
+│   ├── composition.rs      CAS / 各 SQLite store / source / reviewer / target /
+│   │                       git / lfs / 身份分配：谁被构造、用哪个实现
+│   ├── progress.rs         Progress / NoProgress / StderrProgress
+│   ├── tests.rs
+│   └── （bounded / clock / evaluators 为既有实现，未搬动）
 ├── application/            一次 use case 一个模块，结构化输入输出
 │   ├── publish.rs backup.rs review.rs status.rs doctor.rs
-│   └── mod.rs
+│   ├── tests.rs            验收测试：完全不经过 CLI
+│   └── mod.rs              ApplicationError（typed）
 ├── cli/                    同级入口之一：解析 → 调用 → 呈现
-│   ├── args.rs commands/ output.rs mod.rs
+│   ├── args.rs             words → Invocation
+│   ├── commands.rs         Invocation → application request
+│   ├── output.rs           outcome → 文本（本 crate 唯一的 println!）
+│   └── mod.rs
 └── （现有 adapter 暂不物理搬动）
     asset/ publisher/ reviewer/ runtime/ source/ storage/ backup/
 ```
@@ -128,3 +136,60 @@ cargo check -p mineral-core --target wasm32-unknown-unknown
 ```
 
 Public Pipeline（URL rewrite / R2 assets / privacy / review / sanitization / Git CAS）的行为不得改变。
+
+## 交付记录
+
+四个阶段已全部落地，每个阶段各自通过全门禁：
+
+| 阶段 | 提交 | 内容 |
+|---|---|---|
+| A | `refactor(host): extract the configuration layer from the CLI` | `config/{model,load,validate,secrets}`，TOML 与 YAML 并存，`mineral init --toml` |
+| B | `refactor(host): move the composition root into a runtime layer` | `runtime/{workspace,composition}`，CLI 不再构造任何 adapter |
+| C+D | `refactor(host): add the application layer and reduce the CLI to an entry point` | `application/{publish,backup,review,status,doctor}`，`cli/{args,commands,output}` |
+
+### Application API 的最终形状
+
+```rust
+// 输入是值，时间也是输入，凭据来自 runtime 的 SecretProvider
+pub struct PublishRequest { pub created_at: SystemTime, pub human_reviews: ExplicitHumanReviewSelection }
+pub struct BackupRequest  { pub created_at: TimestampMillis }
+
+// 输出承载渲染所需的一切
+pub fn publish(runtime, PublishRequest, &Arc<dyn Progress>) -> Result<PublishOutcome, ApplicationError>;
+pub fn backup (runtime, BackupRequest, &dyn Progress)      -> Result<BackupResult, BackupError>;
+pub fn backup_status(runtime) -> Result<BackupStatusOutcome, ApplicationError>;
+pub fn backup_verify(runtime) -> Result<BackupVerifyOutcome, ApplicationError>;
+pub fn backup_init  (runtime) -> Result<BackupInitOutcome, ApplicationError>;
+pub fn review(runtime, &ReviewRequest) -> Result<ReviewOutcome, ApplicationError>;
+pub fn status(runtime) -> Result<StatusOutcome, ApplicationError>;
+pub fn doctor(runtime) -> Result<DoctorOutcome, ApplicationError>;
+```
+
+三个不变量由代码结构保证，而不是靠约定：
+
+1. **零打印。** 整个 binary 的 `println!` 只在 `cli/output.rs`；进度走 `Progress` sink
+   （`NoProgress` 给测试，`StderrProgress` 给终端）。
+2. **零环境读取。** 应用层不出现 `std::env`；凭据由 `SecretProvider` 解析，
+   `SecretProvider: Debug` 且 `StaticSecretProvider` 打印变量名而从不打印值。
+3. **typed failure。** `RuntimeError`（Configuration / Credential / Connection）、
+   `ApplicationError`（Runtime / Operation / Unsupported / NotFound / Conflict）、
+   以及 backup 独有的 `BackupError::NoBaseCommit`——调用方 match 枚举即可，
+   不需要解析字符串。
+
+### 验收复现
+
+```bash
+./scripts/verify-cli-independence.sh
+```
+
+脚本删除 `crates/mineral-host/src/cli/`、把 `main.rs` 打桩（被删除的正是入口本身），
+然后跑 `cargo test --workspace --all-targets --all-features` 与
+`cargo test -p mineral-publisher --lib application::tests`，结束时无论成败都还原工作树。
+
+实测结果：CLI 删除后 **406 core + 424 host** 测试全绿，其中
+`application::tests` 的 8 个用例分别直接调用 publish / backup（含
+status、verify、init 的未配置与类型化失败路径）/ review（list、show、
+approve 幂等、reject 冲突、未知名与非法名）/ status / doctor，
+全部不经过参数解析、不经过打印。
+
+也就是说：**Web UI 只需要给现有 Application 层套一层 HTTP 壳**。

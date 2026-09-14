@@ -16,9 +16,11 @@ use std::{
     process::Command,
     sync::{Arc, OnceLock, atomic::AtomicUsize},
     time::Duration,
+    time::SystemTime,
 };
 
 use mineral_core::backup::BackupRunId;
+use mineral_core::source::{DEFAULT_MAX_SCAN_ATTEMPTS, stabilize_scan};
 
 use crate::{
     asset::{ConfiguredAssetTarget, R2ObjectStore, R2ObjectStoreConfig, R2SecretKey},
@@ -29,12 +31,13 @@ use crate::{
         },
         lfs_http::{LfsHttpConfig, LfsHttpRemote, LfsToken},
     },
+    config::SourceType,
     config::{
         DEFAULT_BACKUP_AUTHOR_EMAIL, DEFAULT_BACKUP_AUTHOR_NAME,
         DEFAULT_BACKUP_LFS_TIMEOUT_SECONDS, DEFAULT_BACKUP_MESSAGE, ReviewConfig, SecretName,
         SecretProvider, SecretValue, ValidatedConfig,
     },
-    domain::{Sha256, SourceId},
+    domain::{Sha256, Snapshot, SnapshotFile, SnapshotId, SourceId},
     policy::{ReviewCandidate, Reviewer, ReviewerError, ReviewerReport},
     publisher::{GitCommitMetadata, GitCommitOid, GitRefTarget, GitRemoteAdapter, RemoteRefState},
     reviewer::{
@@ -51,8 +54,10 @@ use crate::{
     workflow::{AssetReviewCandidate, AssetReviewer, AssetReviewerError, AssetReviewerReport},
 };
 
+use super::progress::Progress;
 use super::workspace::RuntimeError;
 use crate::backup::application::BackupRunIdGenerator;
+use sha2::Digest;
 
 /// Resolves one credential, naming the configuration key that asked for it.
 ///
@@ -424,13 +429,15 @@ pub struct LazyMarkdownReviewer {
     api_key_name: SecretName,
     secrets: Arc<dyn SecretProvider>,
     store: LocalContentStore,
+    progress: Arc<dyn Progress>,
     completed: AtomicUsize,
     reviewer: OnceLock<Result<DeepSeekMarkdownReviewer, String>>,
 }
 
 impl Reviewer for LazyMarkdownReviewer {
     fn review(&self, candidate: &ReviewCandidate) -> Result<ReviewerReport, ReviewerError> {
-        eprintln!("      Markdown review: {}", candidate.path());
+        self.progress
+            .detail(&format!("      Markdown review: {}", candidate.path()));
         let reviewer = self.reviewer.get_or_init(|| {
             (|| -> Result<_, RuntimeError> {
                 let key = DeepSeekApiKey::new(
@@ -459,7 +466,8 @@ impl Reviewer for LazyMarkdownReviewer {
             .completed
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             + 1;
-        eprintln!("      Markdown reviews completed: {completed}");
+        self.progress
+            .detail(&format!("      Markdown reviews completed: {completed}"));
         result
     }
 }
@@ -470,6 +478,7 @@ pub struct LazyAssetReviewer {
     api_key_name: SecretName,
     secrets: Arc<dyn SecretProvider>,
     store: LocalContentStore,
+    progress: Arc<dyn Progress>,
     completed: AtomicUsize,
     reviewer: OnceLock<Result<DeepSeekAssetReviewer, String>>,
 }
@@ -479,7 +488,8 @@ impl AssetReviewer for LazyAssetReviewer {
         &self,
         candidate: &AssetReviewCandidate,
     ) -> Result<AssetReviewerReport, AssetReviewerError> {
-        eprintln!("[3/4] Asset review: {}", candidate.path());
+        self.progress
+            .detail(&format!("[3/4] Asset review: {}", candidate.path()));
         let reviewer = self.reviewer.get_or_init(|| {
             (|| -> Result<_, RuntimeError> {
                 let key = DeepSeekApiKey::new(
@@ -507,7 +517,8 @@ impl AssetReviewer for LazyAssetReviewer {
             .completed
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             + 1;
-        eprintln!("      Asset reviews completed: {completed}");
+        self.progress
+            .detail(&format!("      Asset reviews completed: {completed}"));
         result
     }
 }
@@ -517,12 +528,14 @@ pub fn markdown_reviewer(
     config: &ValidatedConfig,
     secrets: Arc<dyn SecretProvider>,
     store: LocalContentStore,
+    progress: Arc<dyn Progress>,
 ) -> Result<LazyMarkdownReviewer, RuntimeError> {
     Ok(LazyMarkdownReviewer {
         config: config.review().clone(),
         api_key_name: config.review_api_key_name()?,
         secrets,
         store,
+        progress,
         completed: AtomicUsize::new(0),
         reviewer: OnceLock::new(),
     })
@@ -533,12 +546,14 @@ pub fn asset_reviewer(
     config: &ValidatedConfig,
     secrets: Arc<dyn SecretProvider>,
     store: LocalContentStore,
+    progress: Arc<dyn Progress>,
 ) -> Result<LazyAssetReviewer, RuntimeError> {
     Ok(LazyAssetReviewer {
         config: config.review().clone(),
         api_key_name: config.review_api_key_name()?,
         secrets,
         store,
+        progress,
         completed: AtomicUsize::new(0),
         reviewer: OnceLock::new(),
     })
@@ -715,4 +730,81 @@ impl crate::workflow::AssetReviewRunIdGenerator for RandomAssetIds {
 pub fn random_human_id()
 -> Result<crate::workflow::HumanReviewId, crate::workflow::HumanReviewRecordError> {
     crate::workflow::HumanReviewId::new(random_u64())
+}
+
+// ---------------------------------------------------------------------------
+// Reading the source
+// ---------------------------------------------------------------------------
+
+/// Reads one complete source state as an immutable Snapshot.
+///
+/// The identity is derived from the source id and every file's path, size and
+/// content identity — never from the source kind — so identical bytes from a
+/// local directory and from R2 describe the same state.
+pub fn snapshot(
+    config: &ValidatedConfig,
+    secrets: &dyn SecretProvider,
+    store: &LocalContentStore,
+    progress: &dyn Progress,
+) -> Result<Snapshot, RuntimeError> {
+    let source_id = SourceId::new(config.source.id.clone()).map_err(connection)?;
+    match config.source_kind() {
+        SourceType::Local => {
+            let source = local_source(config, store.clone(), source_id.clone())?;
+            let provisional = source
+                .snapshot(SnapshotId::new(1).map_err(connection)?, SystemTime::now())
+                .map_err(connection)?;
+            let id = snapshot_id(&source_id, provisional.files());
+            source
+                .snapshot(SnapshotId::new(id).map_err(connection)?, SystemTime::now())
+                .map_err(connection)
+        }
+        SourceType::R2 => {
+            // One stabilized scan, one assembled state. The identity is computed
+            // from the materialized bytes only, so the same bytes from a local
+            // directory and from R2 describe the same source state.
+            let source = r2_source(config, secrets, store.clone())?;
+            let stabilized = stabilize_scan(&source, DEFAULT_MAX_SCAN_ATTEMPTS)
+                .map_err(|error| connection(format!("could not read the R2 source: {error}")))?;
+            progress.detail(&format!(
+                "[1/4] R2 source {} prefix {}: {} file(s), {} read, {} reused, inventory {}",
+                source.describe(),
+                source.prefix(),
+                stabilized.materialized().len(),
+                source.fetched_objects(),
+                source.reused_objects(),
+                stabilized.inventory_identity(),
+            ));
+            let provisional = stabilized
+                .snapshot(
+                    SnapshotId::new(1).map_err(connection)?,
+                    SystemTime::now(),
+                    source_id.clone(),
+                )
+                .map_err(connection)?;
+            let id = snapshot_id(&source_id, provisional.files());
+            stabilized
+                .snapshot(
+                    SnapshotId::new(id).map_err(connection)?,
+                    SystemTime::now(),
+                    source_id,
+                )
+                .map_err(connection)
+        }
+    }
+}
+
+/// The deterministic snapshot identity of one complete source state.
+pub fn snapshot_id(source_id: &SourceId, files: &[SnapshotFile]) -> u64 {
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(source_id.as_str().as_bytes());
+    for file in files {
+        hasher.update(file.path().as_str().as_bytes());
+        hasher.update(file.size().to_le_bytes());
+        hasher.update(file.sha256().as_bytes());
+    }
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 8];
+    bytes.copy_from_slice(&digest[..8]);
+    sqlite_positive_id(u64::from_be_bytes(bytes))
 }

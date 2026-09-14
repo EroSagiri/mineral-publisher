@@ -9,6 +9,7 @@ mod bounded;
 mod clock;
 pub mod composition;
 mod evaluators;
+pub mod progress;
 #[cfg(test)]
 mod tests;
 pub mod workspace;
@@ -16,4 +17,5 @@ pub mod workspace;
 pub(crate) use bounded::bounded_map;
 pub use clock::SystemClock;
 pub use evaluators::{HostAssetReviews, HostMarkdownReviews};
+pub use progress::{NoProgress, Progress, StderrProgress};
 pub use workspace::{RuntimeError, WorkspaceRuntime};

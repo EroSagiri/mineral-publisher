@@ -1,0 +1,284 @@
+//! Outcomes to text.
+//!
+//! Every `println!` in this binary lives in this module. An outcome carries the
+//! facts; this is where they become the words an operator reads, and nowhere
+//! else has an opinion about formatting.
+
+use mineral_publisher::{
+    application::{
+        backup::{BackupInitOutcome, BackupOutcome, BackupStatusOutcome, BackupVerifyOutcome},
+        doctor::DoctorOutcome,
+        publish::PublishOutcome,
+        review::ReviewOutcome,
+        status::StatusOutcome,
+    },
+    asset::AssetPublicationOutcome,
+    domain::SnapshotId,
+    publisher::{GitPublicationExecution, GitRefTarget},
+    workflow::PublicationApplicationOutcome,
+};
+
+/// The report of one publication.
+pub fn publication(outcome: &PublishOutcome) {
+    match &outcome.outcome {
+        PublicationApplicationOutcome::NeedsHumanReview { trace } => {
+            println!(
+                "Publication\n  status: waiting_for_human_review\n  snapshot: {}\n  files: {}\n\nMarkdown\n  documents: {}\n  private: {}\n  invalid_privacy: {}\n  needs human review: {}\n\nAssets\n  reviewed: {}\n  needs human review: {}\n\nNext:\n  mineral-publisher review list",
+                trace.snapshot().id().get(),
+                trace.snapshot().files().len(),
+                trace.markdown_reviews().document_outcomes().len(),
+                trace.markdown_reviews().private_documents().len(),
+                trace.markdown_reviews().invalid_privacy_documents().len(),
+                trace.effective_reviews().pending_documents().len(),
+                trace.asset_reviews().entries().len(),
+                trace.effective_reviews().pending_assets().len()
+            );
+            println!("  public scope: {}", trace.public_scope());
+            warnings(trace.markdown_reviews());
+        }
+        PublicationApplicationOutcome::Completed { trace, completed } => {
+            let publication = completed.publication();
+            let delivery = publication.workflow();
+            let git = git_execution(delivery.git());
+            // A Git target holding the right Markdown is not a finished delivery:
+            // its documents point at objects, and those have to be verified too.
+            let status = if delivery.is_satisfied() {
+                git
+            } else {
+                "incomplete"
+            };
+            let assets = match delivery.assets() {
+                AssetPublicationOutcome::NoDurableProjection => "not_required".to_owned(),
+                AssetPublicationOutcome::NotAttempted => "not_attempted".to_owned(),
+                AssetPublicationOutcome::Satisfied {
+                    verified,
+                    published,
+                } => format!("{verified} verified, {published} published"),
+            };
+            println!(
+                "Publication\n  status: {status}\n  git: {git}\n  run: {}\n  snapshot: {}\n  projection: {}\n  delivery: {}\n  markdown: {}\n  assets: {}\n  asset delivery: {}\n  asset target: {}",
+                publication.publish_run_id().get(),
+                trace.snapshot().id().get(),
+                completed.projection().projection_sha256(),
+                publication.delivery_sha256(),
+                completed.publication_set().markdown_paths().len(),
+                completed.publication_set().asset_paths().len(),
+                assets,
+                outcome.asset_location
+            );
+            println!(
+                "  public scope: {} ({} rule(s))",
+                trace.public_scope(),
+                outcome.public_scope.len()
+            );
+            if status == "noop" {
+                println!("  No changes to publish.");
+            }
+            warnings(trace.markdown_reviews());
+        }
+    }
+}
+
+/// The navigation warnings a policy run collected.
+fn warnings(result: &mineral_publisher::workflow::PublicPolicyRunResult) {
+    println!("\nWarnings\n  navigation: {}", result.warnings().len());
+    for warning in result.warnings() {
+        println!(
+            "  {} {:?} target={} span={:?}",
+            warning.document_path(),
+            warning.origin().kind(),
+            warning.origin().target(),
+            warning.origin().span()
+        );
+    }
+}
+
+/// The operator's word for what happened to the publication ref.
+fn git_execution(execution: &GitPublicationExecution) -> &'static str {
+    match execution {
+        GitPublicationExecution::NoopSatisfied { .. } => "noop",
+        GitPublicationExecution::Published { .. }
+        | GitPublicationExecution::AlreadyPublished { .. } => "published",
+        GitPublicationExecution::RemoteChanged { .. } => "conflict",
+        GitPublicationExecution::Indeterminate { .. } => "indeterminate",
+        GitPublicationExecution::TargetMissing { .. } => "target_missing",
+        GitPublicationExecution::PushFailedButRemoteUnchanged { .. }
+        | GitPublicationExecution::RemoteUnchangedAfterSuccessfulPush { .. } => "not_published",
+    }
+}
+
+/// The workspace's state.
+pub fn status(outcome: &StatusOutcome) {
+    println!(
+        "Mineral status\n  source: {} ({})\n  state: {}\n  publication target: {} {}\n  last publication: {}\n  pending Markdown reviews: {}\n  pending Asset reviews: {}",
+        outcome.source_id,
+        outcome.source,
+        outcome.state_path.display(),
+        outcome.target_remote,
+        outcome.target_reference,
+        outcome
+            .last_publication
+            .clone()
+            .unwrap_or_else(|| "none".to_owned()),
+        outcome.pending_documents,
+        outcome.pending_assets
+    );
+}
+
+/// Every health check, pass or fail.
+pub fn doctor(outcome: &DoctorOutcome) {
+    println!("Mineral doctor");
+    for check in &outcome.checks {
+        println!(
+            "  {}: {} ({})",
+            check.name,
+            if check.ok { "ok" } else { "failed" },
+            check.detail
+        );
+    }
+}
+
+/// The review queue, one attempt, or a recorded decision.
+pub fn review(outcome: &ReviewOutcome) {
+    match outcome {
+        ReviewOutcome::List { documents, assets } => {
+            println!("Markdown");
+            for pending in documents {
+                println!("  {}  {}", pending.subject, pending.content_path);
+            }
+            println!("Assets");
+            for pending in assets {
+                println!("  {}  {}", pending.subject, pending.content_path);
+            }
+        }
+        ReviewOutcome::Shown(detail) => {
+            println!(
+                "Review\n  id: {}\n  subject: {}\n  path: {}\n  sha256: {}\n  decision: {}\n  contract: {} {} {}",
+                detail.subject,
+                detail.kind,
+                detail.content_path,
+                detail.content_sha256,
+                detail.decision,
+                detail.policy_name,
+                detail.policy_version,
+                detail.policy_hash
+            );
+            if let (Some(codes), Some(summary)) = (&detail.reason_codes, &detail.summary) {
+                println!("  reason_codes: {codes}\n  summary: {summary}");
+            }
+            println!(
+                "  human_resolution: {}",
+                if detail.human_resolution {
+                    "resolved"
+                } else {
+                    "pending"
+                }
+            );
+        }
+        ReviewOutcome::Resolved {
+            decision, already, ..
+        } => {
+            if *already {
+                println!("Review already {decision:?}.");
+            } else {
+                println!("Review {decision:?}.");
+            }
+        }
+    }
+}
+
+/// The workspace does not back up.
+pub fn backup_not_configured(what: &str) {
+    println!("Backup is not configured for this workspace; {what}.");
+}
+
+/// The ref a backup builds on does not exist yet.
+pub fn backup_missing_ref(target: &GitRefTarget, snapshot_id: SnapshotId, files: usize) {
+    println!(
+        "Backup\n  status: ref missing\n  ref: {} {}\n  snapshot: {}\n  files: {}",
+        target.remote_name(),
+        target.destination_ref(),
+        snapshot_id.get(),
+        files
+    );
+}
+
+/// What one backup attempt did.
+pub fn backup_outcome(outcome: &BackupOutcome) {
+    let status = match &outcome.execution {
+        mineral_core::backup::BackupExecutionOutcome::BackedUp { .. } => "backed up",
+        mineral_core::backup::BackupExecutionOutcome::AlreadyBackedUp { .. } => "already backed up",
+        mineral_core::backup::BackupExecutionOutcome::RemoteChanged { .. } => "remote changed",
+    };
+    println!(
+        "Backup\n  status: {status}\n  run: {}\n  snapshot: {}\n  files: {}\n  lfs objects: {}\n  ref: {} {}\n  endpoint: {}",
+        outcome
+            .run_id
+            .map(|id| id.get().to_string())
+            .unwrap_or_else(|| "none (already up to date)".to_owned()),
+        outcome.snapshot_id.get(),
+        outcome.files,
+        outcome.lfs_objects,
+        outcome.target.remote_name(),
+        outcome.target.destination_ref(),
+        outcome.endpoint
+    );
+}
+
+/// The observed backup ref and the newest durable intent.
+pub fn backup_status(outcome: &BackupStatusOutcome) {
+    println!("Mineral backup");
+    match outcome {
+        BackupStatusOutcome::NotConfigured => println!("  backup: not configured"),
+        BackupStatusOutcome::Reported {
+            remote,
+            reference,
+            reference_state,
+            newest_run,
+        } => {
+            println!("  ref: {remote} {reference} {reference_state}");
+            match newest_run {
+                Some(run) => println!(
+                    "  newest run: {}\n  snapshot: {}\n  delivery: {}",
+                    run.run_id, run.snapshot_id, run.delivery_sha256
+                ),
+                None => println!("  newest run: none"),
+            }
+        }
+    }
+}
+
+/// The result of verifying the backup ref.
+pub fn backup_verify(outcome: &BackupVerifyOutcome) {
+    match outcome {
+        BackupVerifyOutcome::NotConfigured => {
+            backup_not_configured("nothing to verify");
+        }
+        BackupVerifyOutcome::Verified {
+            commit,
+            files,
+            lfs_objects,
+        } => println!(
+            "Backup verify\n  status: verified\n  commit: {commit}\n  files: {files}\n  lfs objects: {lfs_objects}"
+        ),
+    }
+}
+
+/// The result of bootstrapping the backup ref.
+pub fn backup_init(outcome: &BackupInitOutcome, target: &GitRefTarget) {
+    match outcome {
+        BackupInitOutcome::NotConfigured => backup_not_configured("nothing to initialize"),
+        BackupInitOutcome::AlreadyPresent { commit_oid } => println!(
+            "Backup ref {} {} already exists at {}; nothing changed.",
+            target.remote_name(),
+            target.destination_ref(),
+            commit_oid
+        ),
+        BackupInitOutcome::Created { commit_oid } => println!(
+            "Initialized backup ref {} {} at {}.",
+            target.remote_name(),
+            target.destination_ref(),
+            commit_oid
+        ),
+    }
+}

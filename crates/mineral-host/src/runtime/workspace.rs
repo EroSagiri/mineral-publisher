@@ -17,7 +17,7 @@ use crate::{
     asset::ConfiguredAssetTarget,
     backup::{git_backup::GitBackupRepository, lfs_http::LfsHttpRemote},
     config::{ConfigError, EnvSecretProvider, SecretName, SecretProvider, ValidatedConfig},
-    domain::{Sha256, SourceId},
+    domain::{Sha256, Snapshot, SourceId},
     publisher::{GitCommitMetadata, GitCommitOid, GitRefTarget, GitRemoteAdapter, RemoteRefState},
     source::{LocalSource, r2::R2Source},
     storage::{
@@ -28,7 +28,7 @@ use crate::{
     },
 };
 
-use super::composition;
+use super::{composition, progress::Progress};
 
 /// Every construction failure the runtime can report.
 ///
@@ -169,6 +169,20 @@ impl WorkspaceRuntime {
         LocalContentStore::new(self.config.cas())
     }
 
+    /// Creates the directories a run writes into.
+    ///
+    /// A workspace that was never initialized has no state directory, and every
+    /// store would fail on the same missing parent. Preparing once, here, keeps
+    /// that from being discovered in the middle of a run.
+    pub fn prepare(&self) -> Result<(), RuntimeError> {
+        for directory in [self.config.state_path(), &self.config.cas()] {
+            std::fs::create_dir_all(directory).map_err(|error| RuntimeError::Connection {
+                message: format!("could not create {}: {error}", directory.display()),
+            })?;
+        }
+        Ok(())
+    }
+
     /// The local source root, as a reader.
     pub fn local_source(&self, source_id: SourceId) -> Result<LocalSource, RuntimeError> {
         composition::local_source(&self.config, self.content_store(), source_id)
@@ -241,21 +255,39 @@ impl WorkspaceRuntime {
         composition::push_backup_root_commit(&self.config, target, commit)
     }
 
+    /// Reads one complete source state as an immutable Snapshot.
+    pub fn snapshot(&self, progress: &dyn Progress) -> Result<Snapshot, RuntimeError> {
+        composition::snapshot(
+            &self.config,
+            self.secrets(),
+            &self.content_store(),
+            progress,
+        )
+    }
+
     /// The Markdown reviewer one publication runs.
-    pub fn markdown_reviewer(&self) -> Result<composition::LazyMarkdownReviewer, RuntimeError> {
+    pub fn markdown_reviewer(
+        &self,
+        progress: Arc<dyn Progress>,
+    ) -> Result<composition::LazyMarkdownReviewer, RuntimeError> {
         composition::markdown_reviewer(
             &self.config,
             Arc::clone(&self.secrets),
             self.content_store(),
+            progress,
         )
     }
 
     /// The asset reviewer one publication runs.
-    pub fn asset_reviewer(&self) -> Result<composition::LazyAssetReviewer, RuntimeError> {
+    pub fn asset_reviewer(
+        &self,
+        progress: Arc<dyn Progress>,
+    ) -> Result<composition::LazyAssetReviewer, RuntimeError> {
         composition::asset_reviewer(
             &self.config,
             Arc::clone(&self.secrets),
             self.content_store(),
+            progress,
         )
     }
 
