@@ -6,6 +6,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod backup;
 pub mod content;
 pub mod domain;
 pub mod policy;

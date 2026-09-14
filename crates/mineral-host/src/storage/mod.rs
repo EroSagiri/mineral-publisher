@@ -1,6 +1,7 @@
 mod content_store;
 mod sqlite_asset_observation_store;
 mod sqlite_asset_review_run_store;
+mod sqlite_backup_run_store;
 mod sqlite_delivery_projection_store;
 mod sqlite_human_review_store;
 mod sqlite_publish_run_store;
@@ -16,6 +17,7 @@ pub use sqlite_asset_observation_store::{
 pub use sqlite_asset_review_run_store::{
     SqliteAssetReviewRunStore, SqliteAssetReviewRunStoreError,
 };
+pub use sqlite_backup_run_store::{SqliteBackupRunStore, SqliteBackupRunStoreError};
 pub use sqlite_delivery_projection_store::{
     SqliteDeliveryProjectionStore, SqliteDeliveryProjectionStoreError,
 };

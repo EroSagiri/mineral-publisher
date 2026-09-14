@@ -23,6 +23,7 @@ mod conformance_public_policy_run;
 mod conformance_publish_reconciliation;
 
 pub mod asset;
+pub mod backup;
 pub mod object_store;
 pub mod publisher;
 pub mod reviewer;
