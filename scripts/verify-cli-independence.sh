@@ -49,6 +49,10 @@ cargo test --workspace --all-targets --all-features
 echo "== the use cases are reachable through the application API =="
 cargo test -p mineral-publisher --lib application::tests
 
+echo "== and through the operation API, which is what a Web adapter will use =="
+cargo test -p mineral-publisher --lib operations::tests
+
 echo
 echo "OK: publish / backup / backup verify / review list|show|approve|reject / status / doctor"
-echo "    all remain available and directly testable without crates/mineral-host/src/cli/."
+echo "    all remain available and directly testable without crates/mineral-host/src/cli/,"
+echo "    both as application use cases and as observable operations."

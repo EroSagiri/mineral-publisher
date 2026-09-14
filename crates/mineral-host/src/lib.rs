@@ -27,6 +27,7 @@ pub mod asset;
 pub mod backup;
 pub mod config;
 pub mod object_store;
+pub mod operations;
 pub mod publisher;
 pub mod reviewer;
 pub mod runtime;

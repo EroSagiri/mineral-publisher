@@ -16,8 +16,6 @@ macro_rules! emit {
     }};
 }
 
-pub(crate) use emit;
-
 use mineral_publisher::{
     application::{
         backup::{BackupInitOutcome, BackupOutcome, BackupStatusOutcome, BackupVerifyOutcome},
@@ -28,9 +26,49 @@ use mineral_publisher::{
     },
     asset::AssetPublicationOutcome,
     domain::SnapshotId,
+    operations::{OperationResult, ProgressEvent},
     publisher::{GitPublicationExecution, GitRefTarget},
+    runtime::WorkspaceRuntime,
     workflow::PublicationApplicationOutcome,
 };
+
+/// Streams one progress line.
+///
+/// Progress goes to standard error, not standard output: it is not the result,
+/// and a caller that pipes the report must not have to filter it out.
+pub fn progress(event: &ProgressEvent) {
+    use ::std::io::Write as _;
+    let _ = ::std::writeln!(::std::io::stderr().lock(), "{}", event.message);
+}
+
+/// Renders whatever an operation produced.
+pub fn operated(result: &OperationResult) {
+    match result {
+        OperationResult::Published(outcome) => publication(outcome),
+        OperationResult::BackedUp(backup) => match backup {
+            mineral_publisher::application::backup::BackupResult::NotConfigured => {
+                backup_not_configured("nothing to do");
+            }
+            mineral_publisher::application::backup::BackupResult::Attempted(outcome) => {
+                backup_outcome(outcome);
+            }
+        },
+        OperationResult::BackupVerified(outcome) => backup_verify(outcome),
+        OperationResult::BackupInitialized(outcome) => backup_init(outcome),
+        OperationResult::Diagnosed(outcome) => doctor(outcome),
+        OperationResult::ReviewResolved(outcome) => review(outcome),
+    }
+}
+
+/// The workspace `init` just created.
+pub fn initialized(workspace: &WorkspaceRuntime) {
+    emit!(
+        "Initialized Mineral workspace\n  config: {}\n  state: {}\n  source: {}",
+        workspace.config_path.display(),
+        workspace.config.state.path.display(),
+        workspace.source_description()
+    );
+}
 
 /// The report of one publication.
 pub fn publication(outcome: &PublishOutcome) {
@@ -281,16 +319,16 @@ pub fn backup_verify(outcome: &BackupVerifyOutcome) {
 }
 
 /// The result of bootstrapping the backup ref.
-pub fn backup_init(outcome: &BackupInitOutcome, target: &GitRefTarget) {
+pub fn backup_init(outcome: &BackupInitOutcome) {
     match outcome {
         BackupInitOutcome::NotConfigured => backup_not_configured("nothing to initialize"),
-        BackupInitOutcome::AlreadyPresent { commit_oid } => emit!(
+        BackupInitOutcome::AlreadyPresent { target, commit_oid } => emit!(
             "Backup ref {} {} already exists at {}; nothing changed.",
             target.remote_name(),
             target.destination_ref(),
             commit_oid
         ),
-        BackupInitOutcome::Created { commit_oid } => emit!(
+        BackupInitOutcome::Created { target, commit_oid } => emit!(
             "Initialized backup ref {} {} at {}.",
             target.remote_name(),
             target.destination_ref(),

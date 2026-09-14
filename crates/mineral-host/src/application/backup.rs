@@ -272,14 +272,23 @@ pub fn backup_verify(runtime: &WorkspaceRuntime) -> Result<BackupVerifyOutcome, 
 }
 
 /// What bootstrapping the backup ref did.
+///
+/// The ref is part of every answer, so a renderer never has to look at the
+/// configuration again to describe what happened.
 #[derive(Debug)]
 pub enum BackupInitOutcome {
     /// This workspace does not back up.
     NotConfigured,
     /// The ref already exists and was not touched.
-    AlreadyPresent { commit_oid: String },
+    AlreadyPresent {
+        target: GitRefTarget,
+        commit_oid: String,
+    },
     /// The empty root commit was created and pushed.
-    Created { commit_oid: String },
+    Created {
+        target: GitRefTarget,
+        commit_oid: String,
+    },
 }
 
 /// Bootstraps the backup ref with one empty root commit.
@@ -294,6 +303,7 @@ pub fn backup_init(runtime: &WorkspaceRuntime) -> Result<BackupInitOutcome, Appl
     let target = runtime.backup_target()?;
     match runtime.observe_backup_ref(&target)? {
         RemoteRefState::Present { commit_oid } => Ok(BackupInitOutcome::AlreadyPresent {
+            target,
             commit_oid: commit_oid.as_str().to_owned(),
         }),
         RemoteRefState::Missing => {
@@ -301,6 +311,7 @@ pub fn backup_init(runtime: &WorkspaceRuntime) -> Result<BackupInitOutcome, Appl
             let commit = runtime.backup_root_commit(&metadata)?;
             runtime.push_backup_root_commit(&target, &commit)?;
             Ok(BackupInitOutcome::Created {
+                target,
                 commit_oid: commit.as_str().to_owned(),
             })
         }
