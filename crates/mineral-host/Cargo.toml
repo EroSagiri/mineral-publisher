@@ -7,8 +7,14 @@ edition = "2024"
 name = "mineral"
 path = "src/main.rs"
 
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+
 [dependencies]
 mineral-core = { path = "../mineral-core" }
+axum = "0.7"
+futures-core = "0.3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
 base64 = "0.22.1"
 image = { version = "0.25.10", default-features = false, features = ["bmp", "gif", "jpeg", "png", "tiff", "webp"] }
 infer = "0.22.0"

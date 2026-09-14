@@ -9,6 +9,7 @@ use std::{sync::Arc, time::SystemTime};
 
 use crate::{
     policy::PolicyIdentity,
+    publisher::GitPublicationExecution,
     reviewer::{ASSET_REVIEWER_PROMPT_VERSION, MARKDOWN_REVIEWER_PROMPT_VERSION},
     runtime::{HostAssetReviews, HostMarkdownReviews, Progress, WorkspaceRuntime, composition},
     workflow::{
@@ -51,6 +52,50 @@ pub struct PublishOutcome {
     pub asset_location: String,
     /// The validated public scope this run applied.
     pub public_scope: PublicExclusionRules,
+}
+
+impl PublishOutcome {
+    /// The overall result, as a stable code a client matches on.
+    ///
+    /// The fact lives here rather than in a renderer because both the terminal
+    /// and the wire protocol need the same answer, and deriving it twice is how
+    /// two adapters start disagreeing.
+    pub fn status_code(&self) -> &'static str {
+        match &self.outcome {
+            PublicationApplicationOutcome::NeedsHumanReview { .. } => "waiting_for_human_review",
+            PublicationApplicationOutcome::Completed { completed, .. } => {
+                // A Git target holding the right Markdown is not a finished
+                // delivery: its documents point at objects, and those have to be
+                // verified too.
+                if !completed.publication().workflow().is_satisfied() {
+                    return "incomplete";
+                }
+                self.git_code().unwrap_or("not_published")
+            }
+        }
+    }
+
+    /// What happened to the publication ref, when a publication was attempted.
+    pub fn git_code(&self) -> Option<&'static str> {
+        let PublicationApplicationOutcome::Completed { completed, .. } = &self.outcome else {
+            return None;
+        };
+        Some(match completed.publication().workflow().git() {
+            GitPublicationExecution::NoopSatisfied { .. } => "noop",
+            GitPublicationExecution::Published { .. }
+            | GitPublicationExecution::AlreadyPublished { .. } => "published",
+            GitPublicationExecution::RemoteChanged { .. } => "conflict",
+            GitPublicationExecution::Indeterminate { .. } => "indeterminate",
+            GitPublicationExecution::TargetMissing { .. } => "target_missing",
+            GitPublicationExecution::PushFailedButRemoteUnchanged { .. }
+            | GitPublicationExecution::RemoteUnchangedAfterSuccessfulPush { .. } => "not_published",
+        })
+    }
+
+    /// Whether the publication changed anything.
+    pub fn is_noop(&self) -> bool {
+        self.status_code() == "noop"
+    }
 }
 
 /// Runs one publication.

@@ -179,6 +179,34 @@ pub fn backup(workspace: WorkspaceRuntime, args: &[String]) -> Result<(), Box<dy
     }
 }
 
+/// Serves the local HTTP API until the process is stopped.
+///
+/// The default address is loopback: this interface can publish, back up and
+/// approve content, and it has no authentication. A caller that binds elsewhere
+/// is told exactly what it is doing.
+pub fn web(workspace: WorkspaceRuntime, bind: Option<&str>) -> Result<(), Box<dyn Error>> {
+    let address: std::net::SocketAddr = bind
+        .unwrap_or(mineral_publisher::web::DEFAULT_BIND)
+        .parse()
+        .map_err(|error| format!("--bind needs an address like 127.0.0.1:8787: {error}"))?;
+    if !mineral_publisher::web::is_loopback(&address) {
+        eprintln!(
+            "warning: binding {address}, which is not loopback.\n         \
+             This interface can publish, back up and approve content, and it has no\n         \
+             authentication or TLS. Only do this on a network you trust."
+        );
+    }
+    let state = Arc::new(mineral_publisher::web::WebState::new(Arc::new(workspace)));
+    output::serving(address);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| format!("could not start the async runtime: {error}"))?;
+    runtime
+        .block_on(mineral_publisher::web::serve(state, address))
+        .map_err(|error| format!("the server stopped: {error}").into())
+}
+
 /// The positional argument a subcommand requires.
 fn required(args: &[String], index: usize, message: &str) -> Result<String, Box<dyn Error>> {
     Ok(args.get(index).ok_or(message)?.to_owned())

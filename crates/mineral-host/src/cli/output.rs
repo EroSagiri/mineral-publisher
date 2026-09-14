@@ -27,7 +27,7 @@ use mineral_publisher::{
     asset::AssetPublicationOutcome,
     domain::SnapshotId,
     operations::{OperationResult, ProgressEvent},
-    publisher::{GitPublicationExecution, GitRefTarget},
+    publisher::GitRefTarget,
     runtime::WorkspaceRuntime,
     workflow::PublicationApplicationOutcome,
 };
@@ -58,6 +58,11 @@ pub fn operated(result: &OperationResult) {
         OperationResult::Diagnosed(outcome) => doctor(outcome),
         OperationResult::ReviewResolved(outcome) => review(outcome),
     }
+}
+
+/// The address the local API is listening on.
+pub fn serving(address: std::net::SocketAddr) {
+    emit!("Mineral Web API listening on http://{address}/api/v1");
 }
 
 /// The workspace `init` just created.
@@ -91,14 +96,8 @@ pub fn publication(outcome: &PublishOutcome) {
         PublicationApplicationOutcome::Completed { trace, completed } => {
             let publication = completed.publication();
             let delivery = publication.workflow();
-            let git = git_execution(delivery.git());
-            // A Git target holding the right Markdown is not a finished delivery:
-            // its documents point at objects, and those have to be verified too.
-            let status = if delivery.is_satisfied() {
-                git
-            } else {
-                "incomplete"
-            };
+            let status = outcome.status_code();
+            let git = outcome.git_code().unwrap_or("not_published");
             let assets = match delivery.assets() {
                 AssetPublicationOutcome::NoDurableProjection => "not_required".to_owned(),
                 AssetPublicationOutcome::NotAttempted => "not_attempted".to_owned(),
@@ -123,7 +122,7 @@ pub fn publication(outcome: &PublishOutcome) {
                 trace.public_scope(),
                 outcome.public_scope.len()
             );
-            if status == "noop" {
+            if outcome.is_noop() {
                 emit!("  No changes to publish.");
             }
             warnings(trace.markdown_reviews());
@@ -142,20 +141,6 @@ fn warnings(result: &mineral_publisher::workflow::PublicPolicyRunResult) {
             warning.origin().target(),
             warning.origin().span()
         );
-    }
-}
-
-/// The operator's word for what happened to the publication ref.
-fn git_execution(execution: &GitPublicationExecution) -> &'static str {
-    match execution {
-        GitPublicationExecution::NoopSatisfied { .. } => "noop",
-        GitPublicationExecution::Published { .. }
-        | GitPublicationExecution::AlreadyPublished { .. } => "published",
-        GitPublicationExecution::RemoteChanged { .. } => "conflict",
-        GitPublicationExecution::Indeterminate { .. } => "indeterminate",
-        GitPublicationExecution::TargetMissing { .. } => "target_missing",
-        GitPublicationExecution::PushFailedButRemoteUnchanged { .. }
-        | GitPublicationExecution::RemoteUnchangedAfterSuccessfulPush { .. } => "not_published",
     }
 }
 
@@ -210,13 +195,13 @@ pub fn review(outcome: &ReviewOutcome) {
                 detail.kind,
                 detail.content_path,
                 detail.content_sha256,
-                detail.decision,
+                detail.decision.detail,
                 detail.policy_name,
                 detail.policy_version,
                 detail.policy_hash
             );
-            if let (Some(codes), Some(summary)) = (&detail.reason_codes, &detail.summary) {
-                emit!("  reason_codes: {codes}\n  summary: {summary}");
+            if let (Some(reasons), Some(summary)) = (&detail.reason_codes, &detail.summary) {
+                emit!("  reason_codes: {}\n  summary: {summary}", reasons.detail);
             }
             emit!(
                 "  human_resolution: {}",

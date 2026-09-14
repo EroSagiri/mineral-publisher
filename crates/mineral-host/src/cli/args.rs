@@ -25,6 +25,11 @@ pub enum Invocation {
     Review { config: PathBuf, args: Vec<String> },
     /// Run or inspect the private backup.
     Backup { config: PathBuf, args: Vec<String> },
+    /// Serve the local HTTP API.
+    Web {
+        config: PathBuf,
+        bind: Option<String>,
+    },
 }
 
 /// Parses the arguments after the program name.
@@ -79,6 +84,22 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Invocation, Box<dyn E
             config: config_path,
             args: rest,
         }),
+        // `--bind` is the one place this server is told to leave loopback, so it
+        // is parsed explicitly rather than tolerated among the arguments.
+        "web" => {
+            let bind = match rest.first().map(String::as_str) {
+                None => None,
+                Some("--bind") => Some(rest.get(1).ok_or("--bind requires an address")?.to_owned()),
+                Some(other) => return Err(format!("unknown web option: {other}").into()),
+            };
+            if rest.len() > 2 {
+                return Err("too many arguments for web".into());
+            }
+            Ok(Invocation::Web {
+                config: config_path,
+                bind,
+            })
+        }
         "help" | "--help" | "-h" => Ok(Invocation::Help),
         _ => Err(format!("unknown command: {command}").into()),
     }
@@ -122,6 +143,7 @@ pub fn usage() -> String {
         "  mineral [--config PATH] backup verify",
         "  mineral [--config PATH] backup init",
         "  mineral [--config PATH] doctor",
+        "  mineral [--config PATH] web [--bind ADDRESS]",
     ]
     .join("\n")
 }

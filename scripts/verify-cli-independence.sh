@@ -52,7 +52,10 @@ cargo test -p mineral-publisher --lib application::tests
 echo "== and through the operation API, which is what a Web adapter will use =="
 cargo test -p mineral-publisher --lib operations::tests
 
+echo "== and through the HTTP adapter, which is a sibling entry point =="
+cargo test -p mineral-publisher --lib web::tests
+
 echo
 echo "OK: publish / backup / backup verify / review list|show|approve|reject / status / doctor"
 echo "    all remain available and directly testable without crates/mineral-host/src/cli/,"
-echo "    both as application use cases and as observable operations."
+echo "    as application use cases, as observable operations, and over HTTP."

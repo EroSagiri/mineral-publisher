@@ -1,3 +1,17 @@
 [workspace]
 resolver = "3"
 members = ["crates/mineral-core", "crates/mineral-host"]
+
+# The host's dependency tree is large (an HTTP server, an object-store client, a
+# bundled SQLite, image codecs), and full debug info for all of it costs several
+# gigabytes of disk for information nobody reads: one almost never steps into a
+# dependency in a debugger.
+#
+# So this workspace keeps file and line for *backtraces in its own crates* and
+# drops variable/type debug info everywhere, and drops debug info from
+# dependencies entirely. A panic still reports the exact source location.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false

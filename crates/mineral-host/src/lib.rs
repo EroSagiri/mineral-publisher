@@ -33,4 +33,5 @@ pub mod reviewer;
 pub mod runtime;
 pub mod source;
 pub mod storage;
+pub mod web;
 pub mod workflow;

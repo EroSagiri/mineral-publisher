@@ -41,6 +41,16 @@ impl OperationId {
         Self(self.0 + 1)
     }
 
+    /// Rebuilds an identity from its number, for a caller that read one off the
+    /// wire.
+    ///
+    /// This is not a way to invent an operation: the supervisor only answers for
+    /// the identities it allocated, so an unknown number resolves to nothing
+    /// rather than to a different operation.
+    pub fn from_number(value: u64) -> Self {
+        Self(value)
+    }
+
     pub fn get(self) -> u64 {
         self.0
     }
@@ -265,6 +275,14 @@ pub enum OperationErrorCode {
     DiagnosisFailed,
     /// A use case panicked. The workspace is left as the use case left it.
     OperationPanicked,
+    /// No such endpoint exists.
+    EndpointNotFound,
+    /// No operation with that identity is known to this supervisor.
+    ///
+    /// It means the identity was never allocated, has been evicted by retention,
+    /// or belonged to a previous process. A client must not guess: it should
+    /// read the durable state instead.
+    OperationNotFound,
 }
 
 impl OperationErrorCode {
@@ -285,6 +303,29 @@ impl OperationErrorCode {
             Self::VerificationFailed => "verification_failed",
             Self::DiagnosisFailed => "diagnosis_failed",
             Self::OperationPanicked => "operation_panicked",
+            Self::OperationNotFound => "operation_not_found",
+            Self::EndpointNotFound => "endpoint_not_found",
+        }
+    }
+}
+
+impl OperationErrorCode {
+    /// The code one application failure maps to, given the code its use case
+    /// implies.
+    ///
+    /// The default comes from *which* use case ran; the refinement comes from
+    /// the error's own variant. This is the single place the application layer's
+    /// error vocabulary meets the public one, so the CLI and the HTTP API cannot
+    /// classify the same failure differently.
+    pub fn classify(default: Self, error: &ApplicationError) -> Self {
+        match error {
+            ApplicationError::Runtime(RuntimeError::Configuration(_)) => Self::ConfigurationInvalid,
+            ApplicationError::Runtime(RuntimeError::Credential { .. }) => Self::CredentialMissing,
+            ApplicationError::Runtime(RuntimeError::Connection { .. }) => Self::ConnectionFailed,
+            ApplicationError::Unsupported { .. } => Self::InvalidRequest,
+            ApplicationError::NotFound { .. } => Self::ReviewNotFound,
+            ApplicationError::Conflict { .. } => Self::ReviewConflict,
+            ApplicationError::Operation { .. } => default,
         }
     }
 }
@@ -366,21 +407,7 @@ impl OperationFailure {
     /// application layer's error type to a stable public code, and it is the
     /// only place the two vocabularies meet.
     pub fn classify(default: OperationErrorCode, error: &ApplicationError) -> Self {
-        let code = match error {
-            ApplicationError::Runtime(RuntimeError::Configuration(_)) => {
-                OperationErrorCode::ConfigurationInvalid
-            }
-            ApplicationError::Runtime(RuntimeError::Credential { .. }) => {
-                OperationErrorCode::CredentialMissing
-            }
-            ApplicationError::Runtime(RuntimeError::Connection { .. }) => {
-                OperationErrorCode::ConnectionFailed
-            }
-            ApplicationError::Unsupported { .. } => OperationErrorCode::InvalidRequest,
-            ApplicationError::NotFound { .. } => OperationErrorCode::ReviewNotFound,
-            ApplicationError::Conflict { .. } => OperationErrorCode::ReviewConflict,
-            ApplicationError::Operation { .. } => default,
-        };
+        let code = OperationErrorCode::classify(default, error);
         let mut causes = Vec::new();
         let mut source = error.source();
         while let Some(cause) = source {

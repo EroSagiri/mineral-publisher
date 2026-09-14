@@ -36,6 +36,29 @@ pub enum ReviewRequest {
     Reject(String),
 }
 
+/// What the automatic reviewer decided.
+///
+/// The `code` is what a client matches on and may never be reworded; the
+/// `detail` is the domain's own rendering of the decision, which is what a
+/// human reads and what a terminal prints.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReviewDecisionSummary {
+    /// A stable code: `program_issues`, `review_approved`, `review_rejected`
+    /// or `needs_human_review`.
+    pub code: &'static str,
+    /// The decision as the domain renders it.
+    pub detail: String,
+}
+
+/// The reviewer's own reasons for its decision.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReviewReasonSummary {
+    /// Stable snake_case names a client matches on.
+    pub codes: Vec<String>,
+    /// The domain's own rendering, which is what a human reads.
+    pub detail: String,
+}
+
 /// The facts about one review attempt.
 ///
 /// It carries the *values* the domain recorded — the subject, its content
@@ -52,7 +75,7 @@ pub struct ReviewDetail {
     /// The content identity the attempt froze.
     pub content_sha256: String,
     /// The decision the automatic reviewer reached.
-    pub decision: String,
+    pub decision: ReviewDecisionSummary,
     /// The policy contract's name.
     pub policy_name: String,
     /// The policy contract's version.
@@ -60,7 +83,7 @@ pub struct ReviewDetail {
     /// The policy contract's hash.
     pub policy_hash: String,
     /// The reviewer's reason codes, when it reported any.
-    pub reason_codes: Option<String>,
+    pub reason_codes: Option<ReviewReasonSummary>,
     /// The reviewer's summary, when it reported one.
     pub summary: Option<String>,
     /// Whether a human decision already answers this attempt.
@@ -180,6 +203,57 @@ pub fn parse_attempt(value: &str) -> Result<HumanReviewAttempt, ApplicationError
     }
 }
 
+/// The automatic decision about one document, as a stable code plus the
+/// domain's own rendering.
+fn document_decision(decision: &crate::policy::PublicPolicyDecision) -> ReviewDecisionSummary {
+    use crate::policy::PublicPolicyDecision;
+    let code = match decision {
+        PublicPolicyDecision::ProgramIssues(_) => "program_issues",
+        PublicPolicyDecision::ReviewApproved => "review_approved",
+        PublicPolicyDecision::ReviewRejected => "review_rejected",
+        PublicPolicyDecision::NeedsHumanReview(_) => "needs_human_review",
+    };
+    ReviewDecisionSummary {
+        code,
+        detail: format!("{decision:?}"),
+    }
+}
+
+/// The automatic decision about one asset, as a stable code plus the domain's
+/// own rendering.
+fn asset_decision(disposition: &crate::workflow::AssetReviewDisposition) -> ReviewDecisionSummary {
+    use crate::workflow::AssetReviewDisposition;
+    let code = match disposition {
+        AssetReviewDisposition::Reviewed(_) => "reviewed",
+        AssetReviewDisposition::NeedsHumanReview(_) => "needs_human_review",
+        AssetReviewDisposition::Blocked => "blocked",
+    };
+    ReviewDecisionSummary {
+        code,
+        detail: format!("{disposition:?}"),
+    }
+}
+
+/// The stable snake_case name of a document reason code.
+///
+/// The name comes from the domain enum's own serialised form, so it cannot
+/// drift from the value the engine records; the enum type itself never leaves
+/// this layer.
+fn reason_code_name(code: &crate::policy::ReviewReasonCode) -> String {
+    serde_json::to_value(code)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+
+/// The stable snake_case name of an asset reason code.
+fn asset_reason_code_name(code: &crate::workflow::AssetReviewReasonCode) -> String {
+    serde_json::to_value(code)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+
 /// The facts about one attempt.
 fn detail(
     subject: &str,
@@ -201,11 +275,14 @@ fn detail(
                 "Markdown",
                 run.content_path().to_string(),
                 run.content_sha256().to_string(),
-                format!("{:?}", run.decision()),
+                document_decision(run.decision()),
                 run.policy().clone(),
                 report.map(|report| {
                     (
-                        format!("{:?}", report.reason_codes()),
+                        ReviewReasonSummary {
+                            codes: report.reason_codes().iter().map(reason_code_name).collect(),
+                            detail: format!("{:?}", report.reason_codes()),
+                        },
                         report.summary().to_owned(),
                     )
                 }),
@@ -223,11 +300,18 @@ fn detail(
                 "Asset",
                 run.content_path().to_string(),
                 run.content_sha256().to_string(),
-                format!("{:?}", run.outcome().disposition()),
+                asset_decision(run.outcome().disposition()),
                 run.policy().clone(),
                 report.map(|report| {
                     (
-                        format!("{:?}", report.reason_codes()),
+                        ReviewReasonSummary {
+                            codes: report
+                                .reason_codes()
+                                .iter()
+                                .map(asset_reason_code_name)
+                                .collect(),
+                            detail: format!("{:?}", report.reason_codes()),
+                        },
                         report.summary().to_owned(),
                     )
                 }),
@@ -268,7 +352,7 @@ fn detail(
         policy_name: policy.name().to_owned(),
         policy_version: policy.version().to_owned(),
         policy_hash: policy.hash().to_string(),
-        reason_codes: report.as_ref().map(|(codes, _)| codes.clone()),
+        reason_codes: report.as_ref().map(|(reasons, _)| reasons.clone()),
         summary: report.map(|(_, summary)| summary),
         human_resolution: resolution.is_some(),
     })

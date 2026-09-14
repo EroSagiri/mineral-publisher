@@ -44,9 +44,17 @@ use super::{
     },
 };
 
+/// How many finished operations a supervisor keeps by default.
+///
+/// An operation is not a durable fact — a publication run and a backup run are
+/// — so its record is in-process state, and keeping every one of them forever
+/// would be a leak with a friendly name. Running operations are never evicted.
+pub const DEFAULT_COMPLETED_OPERATIONS: usize = 100;
+
 /// Starts operations and lets callers observe them.
 pub struct OperationSupervisor {
     executor: Arc<dyn OperationExecutor>,
+    completed_limit: usize,
     shared: Arc<Mutex<Shared>>,
 }
 
@@ -75,7 +83,13 @@ struct RecordInner {
     next_sequence: u64,
     result: Option<Arc<OperationResult>>,
     failure: Option<OperationFailure>,
-    subscribers: Vec<Sender<OperationEvent>>,
+    subscribers: Vec<Subscriber>,
+}
+
+/// One live subscription and the sequence it has already been given.
+struct Subscriber {
+    after: u64,
+    sender: Sender<OperationEvent>,
 }
 
 impl Record {
@@ -108,9 +122,14 @@ impl Record {
         };
         inner.progress.push(event.clone());
         for subscriber in &inner.subscribers {
+            if event.sequence <= subscriber.after {
+                continue;
+            }
             // A subscriber that has gone away is not an error: the record keeps
             // the history, and anyone may subscribe later and read it.
-            let _ = subscriber.send(OperationEvent::Progress(event.clone()));
+            let _ = subscriber
+                .sender
+                .send(OperationEvent::Progress(event.clone()));
         }
     }
 
@@ -146,7 +165,7 @@ impl Record {
         // Sending before clearing is what guarantees a subscriber observes the
         // terminal event: dropping the senders is what ends its iteration.
         for subscriber in &inner.subscribers {
-            let _ = subscriber.send(OperationEvent::Finished { state });
+            let _ = subscriber.sender.send(OperationEvent::Finished { state });
         }
         inner.subscribers.clear();
     }
@@ -199,10 +218,21 @@ impl Iterator for Subscription {
 }
 
 impl OperationSupervisor {
-    /// Builds a supervisor over one executor.
+    /// Builds a supervisor over one executor, keeping the default number of
+    /// finished operations.
     pub fn new(executor: Arc<dyn OperationExecutor>) -> Self {
+        Self::with_completed_limit(executor, DEFAULT_COMPLETED_OPERATIONS)
+    }
+
+    /// Builds a supervisor that keeps at most `completed_limit` finished
+    /// operations. Running operations are always kept, whatever the limit.
+    pub fn with_completed_limit(
+        executor: Arc<dyn OperationExecutor>,
+        completed_limit: usize,
+    ) -> Self {
         Self {
             executor,
+            completed_limit,
             shared: Arc::new(Mutex::new(Shared {
                 next_id: OperationId::first(),
                 active_mutation: None,
@@ -239,6 +269,9 @@ impl OperationSupervisor {
             if kind.is_mutating() {
                 shared.active_mutation = Some(id);
             }
+            // Retention is applied where the map is already locked, so it can
+            // never race the operation that just finished.
+            evict_finished(&mut shared, self.completed_limit);
             (id, record)
         };
 
@@ -305,18 +338,34 @@ impl OperationSupervisor {
 
     /// Streams one operation's progress and completion.
     pub fn subscribe(&self, id: OperationId) -> Option<Subscription> {
+        self.subscribe_after(id, 0)
+    }
+
+    /// Streams only what happened after `sequence`.
+    ///
+    /// This is what a reconnecting client needs: an `EventSource` that went away
+    /// sends `Last-Event-ID`, and replaying everything it already saw would make
+    /// it render its whole history a second time.
+    pub fn subscribe_after(&self, id: OperationId, sequence: u64) -> Option<Subscription> {
         let record = self.record(id)?;
         let (sender, receiver) = channel();
         let mut inner = record.lock();
         // Replay makes a late subscriber indistinguishable from an early one.
-        for event in &inner.progress {
+        for event in inner
+            .progress
+            .iter()
+            .filter(|event| event.sequence > sequence)
+        {
             let _ = sender.send(OperationEvent::Progress(event.clone()));
         }
         if inner.state.is_terminal() {
             let _ = sender.send(OperationEvent::Finished { state: inner.state });
             drop(sender);
         } else {
-            inner.subscribers.push(sender);
+            inner.subscribers.push(Subscriber {
+                after: sequence,
+                sender,
+            });
         }
         Some(Subscription { receiver })
     }
@@ -351,6 +400,26 @@ impl OperationSupervisor {
         self.shared
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+/// Drops the oldest finished operations beyond the retention limit.
+///
+/// Only finished records are candidates, and the oldest are dropped first, so a
+/// client holding an identity either finds it or finds a typed `404` — it never
+/// finds a *different* operation wearing the same identity.
+fn evict_finished(shared: &mut Shared, limit: usize) {
+    let finished = shared
+        .records
+        .iter()
+        .filter(|(_, record)| record.is_terminal())
+        .map(|(id, _)| *id)
+        .collect::<Vec<_>>();
+    let excess = finished.len().saturating_sub(limit);
+    for id in finished.into_iter().take(excess) {
+        // `BTreeMap` iterates in identity order, and identities are allocated in
+        // order, so this removes the oldest finished operations first.
+        shared.records.remove(&id);
     }
 }
 
