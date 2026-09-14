@@ -2,5 +2,7 @@
 /.env
 /.mineral
 /mineral.yaml
+/mineral.backup.yaml
+/mineral.toml
 crates/mineral-host/examples/fixtures/deepseek_markdown_reviewer_smoke
 /backup-repo

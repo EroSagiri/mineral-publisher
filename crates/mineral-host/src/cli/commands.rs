@@ -19,6 +19,7 @@ use mineral_publisher::{
 };
 
 use super::output;
+use super::output::emit;
 
 /// A sink that streams a use case's progress to standard error.
 fn progress() -> Arc<dyn Progress> {
@@ -52,7 +53,7 @@ pub fn init(path: &Path, format: ConfigFormat) -> Result<(), Box<dyn Error>> {
     }
     workspace.prepare()?;
     workspace.open_stores()?;
-    println!(
+    emit!(
         "Initialized Mineral workspace\n  config: {}\n  state: {}\n  source: {}",
         workspace.config_path.display(),
         workspace.config.state.path.display(),
