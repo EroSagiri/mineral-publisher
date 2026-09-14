@@ -87,7 +87,11 @@ impl fmt::Debug for SecretValue {
 /// depends on this and never on `std::env`, so a web host can resolve its
 /// credentials from a request-scoped store and a test can resolve them from
 /// memory.
-pub trait SecretProvider: Send + Sync {
+///
+/// `Debug` is a supertrait on purpose. A provider holds values, so every
+/// implementation must be safe to render in a dump or a log; requiring it here
+/// means a new provider cannot be added without answering that question.
+pub trait SecretProvider: Send + Sync + fmt::Debug {
     /// Resolves one credential, failing closed when it is not available.
     fn resolve(&self, name: &SecretName) -> Result<SecretValue, SecretError>;
 
@@ -122,9 +126,20 @@ impl SecretProvider for EnvSecretProvider {
 /// Tests and embedded hosts use this to supply a credential without touching the
 /// process environment — which edition 2024 makes `unsafe`, and which this
 /// project forbids.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct StaticSecretProvider {
     values: BTreeMap<String, String>,
+}
+
+/// A provider holds values, so its `Debug` names the variables it can resolve
+/// and never what they hold. A dump of a runtime must be safe to log.
+impl fmt::Debug for StaticSecretProvider {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StaticSecretProvider")
+            .field("names", &self.values.keys().collect::<Vec<_>>())
+            .finish()
+    }
 }
 
 impl StaticSecretProvider {

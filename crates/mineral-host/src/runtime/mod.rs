@@ -7,8 +7,13 @@
 
 mod bounded;
 mod clock;
+pub mod composition;
 mod evaluators;
+#[cfg(test)]
+mod tests;
+pub mod workspace;
 
 pub(crate) use bounded::bounded_map;
 pub use clock::SystemClock;
 pub use evaluators::{HostAssetReviews, HostMarkdownReviews};
+pub use workspace::{RuntimeError, WorkspaceRuntime};

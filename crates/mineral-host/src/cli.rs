@@ -1,75 +1,45 @@
 use std::{
-    convert::Infallible,
     env,
     error::Error,
     fs,
     path::{Path, PathBuf},
-    process::Command,
-    sync::{
-        OnceLock,
-        atomic::{AtomicUsize, Ordering},
-    },
-    time::{Duration, SystemTime},
+    time::SystemTime,
 };
 
 use mineral_core::backup::{
-    BackupExecutionOutcome, BackupRunId, BackupRunStore, TypeFirstBackupRepresentationPolicy,
-    verify_backup,
+    BackupExecutionOutcome, BackupRunStore, TypeFirstBackupRepresentationPolicy, verify_backup,
 };
 use mineral_core::source::{DEFAULT_MAX_SCAN_ATTEMPTS, stabilize_scan};
 use mineral_publisher::{
-    asset::{
-        AssetPublicationOutcome, ConfiguredAssetTarget, R2ObjectStore, R2ObjectStoreConfig,
-        R2SecretKey, UuidAssetObservationIdGenerator,
+    asset::{AssetPublicationOutcome, UuidAssetObservationIdGenerator},
+    backup::application::{
+        BackupApplicationError, BackupApplicationOutcome, BackupApplicationRequest, run_backup,
     },
-    backup::{
-        application::{
-            BackupApplicationError, BackupApplicationOutcome, BackupApplicationRequest,
-            BackupRunIdGenerator, run_backup,
-        },
-        git_backup::{GitBackupRepository, backup_commit_metadata, observe_backup_ref},
-        lfs_http::{LfsHttpConfig, LfsHttpRemote, LfsToken},
-    },
-    domain::{Sha256, Snapshot, SnapshotFile, SnapshotId, SourceId, TimestampMillis},
-    policy::{
-        PolicyIdentity, ReviewCandidate, ReviewRunId, ReviewRunStore, Reviewer, ReviewerError,
-        ReviewerReport,
-    },
+    backup::lfs_http::LfsHttpRemote,
+    domain::{Snapshot, SnapshotFile, SnapshotId, SourceId, TimestampMillis},
+    policy::{PolicyIdentity, ReviewRunId, ReviewRunStore},
     publisher::{
-        GitCommitMetadata, GitCommitOid, GitPublicationExecution, GitRefTarget, GitRemoteAdapter,
-        PublishRunStore, RemoteRefState, UuidPublishRunIdGenerator,
-        UuidRemoteObservationIdGenerator,
+        GitPublicationExecution, GitRefTarget, PublishRunStore, RemoteRefState,
+        UuidPublishRunIdGenerator, UuidRemoteObservationIdGenerator,
     },
-    reviewer::{
-        ASSET_REVIEWER_PROMPT_VERSION, DeepSeekApiKey, DeepSeekAssetReviewer,
-        DeepSeekAssetReviewerConfig, DeepSeekMarkdownReviewer, DeepSeekMarkdownReviewerConfig,
-        MARKDOWN_REVIEWER_PROMPT_VERSION,
+    reviewer::{ASSET_REVIEWER_PROMPT_VERSION, MARKDOWN_REVIEWER_PROMPT_VERSION},
+    runtime::{
+        HostAssetReviews, HostMarkdownReviews, WorkspaceRuntime,
+        composition::{
+            RandomAssetIds, RandomDocumentIds, UuidBackupRunIdGenerator, random_human_id,
+            sqlite_positive_id,
+        },
     },
-    runtime::{HostAssetReviews, HostMarkdownReviews},
-    source::LocalSource,
-    source::r2::{R2Source, R2SourcePrefix},
-    storage::{
-        LocalContentStore, SqliteAssetObservationStore, SqliteAssetReviewRunStore,
-        SqliteBackupRunStore, SqliteDeliveryProjectionStore, SqliteHumanReviewStore,
-        SqlitePublishRunStore, SqliteRemoteObservationStore, SqliteReviewRunStore,
-        SqliteSourceMaterializationStore,
-    },
+    storage::{SqliteAssetReviewRunStore, SqliteHumanReviewStore, SqliteReviewRunStore},
     workflow::{
-        AssetReviewCandidate, AssetReviewRunId, AssetReviewRunIdGenerator, AssetReviewRunStore,
-        AssetReviewer, AssetReviewerError, AssetReviewerReport, ExplicitHumanReviewSelection,
-        HumanReviewAttempt, HumanReviewDecision, HumanReviewId, HumanReviewRecordError,
-        HumanReviewResolution, PublicExclusionRules, PublicationApplication,
-        PublicationApplicationOutcome, PublicationApplicationRequest, ReviewRunIdGenerator,
+        AssetReviewRunId, AssetReviewRunStore, ExplicitHumanReviewSelection, HumanReviewAttempt,
+        HumanReviewDecision, HumanReviewResolution, PublicExclusionRules, PublicationApplication,
+        PublicationApplicationOutcome, PublicationApplicationRequest,
     },
 };
 use sha2::{Digest, Sha256 as Sha256Hasher};
 
-use mineral_publisher::config::model::ReviewConfig;
-use mineral_publisher::config::{
-    ConfigFormat, DEFAULT_BACKUP_AUTHOR_EMAIL, DEFAULT_BACKUP_AUTHOR_NAME,
-    DEFAULT_BACKUP_LFS_TIMEOUT_SECONDS, DEFAULT_BACKUP_MESSAGE, SourceType, ValidatedConfig,
-    load as load_config,
-};
+use mineral_publisher::config::{ConfigFormat, SourceType};
 
 /// The YAML template, which the tests exercise as the shape of a workspace.
 #[cfg(test)]
@@ -78,215 +48,11 @@ use mineral_publisher::config::DEFAULT_CONFIG;
 /// always used for it. It is only ever held inside a validated configuration.
 #[cfg(test)]
 use mineral_publisher::config::RawConfig as Config;
-
-/// One workspace this binary can act on: a validated configuration plus the
-/// adapters built from it.
-#[derive(Debug)]
-struct Workspace {
-    config: ValidatedConfig,
-    config_path: PathBuf,
-}
-
-/// Reading a setting goes through the validated configuration, so a caller that
-/// holds a `Workspace` never has to ask whether the configuration is usable.
-impl std::ops::Deref for Workspace {
-    type Target = ValidatedConfig;
-
-    fn deref(&self) -> &Self::Target {
-        &self.config
-    }
-}
-
-impl Workspace {
-    /// Loads, validates and normalizes one configuration file.
-    ///
-    /// The work itself belongs to the configuration layer; this is the seam that
-    /// hands a file to it and keeps the path for the messages that name it.
-    fn load(path: PathBuf) -> Result<Self, Box<dyn Error>> {
-        let config = load_config(&path)?;
-        Ok(Self {
-            config,
-            config_path: path,
-        })
-    }
-
-    /// Builds the configured R2 source reader, reading its secret from the
-    /// environment. The secret never reaches the engine or a durable record.
-    fn r2_source(&self, store: LocalContentStore) -> Result<R2Source, Box<dyn Error>> {
-        let r2 = self
-            .config
-            .source
-            .r2
-            .as_ref()
-            .ok_or("source.type is r2 but source.r2 is not configured")?;
-        let prefix = R2SourcePrefix::new(&r2.prefix)
-            .map_err(|error| format!("source.r2.prefix is unusable: {error}"))?;
-        let mut config = R2ObjectStoreConfig::new(
-            r2.endpoint.clone(),
-            r2.bucket.clone(),
-            r2.access_key_id.clone(),
-            R2SecretKey::new(env::var(&r2.secret_access_key_env).map_err(|_| {
-                format!(
-                    "source.r2.secret_access_key_env names {}, which is not set",
-                    r2.secret_access_key_env
-                )
-            })?)?,
-        )?;
-        if let Some(region) = &r2.region {
-            config = config.with_region(region.clone())?;
-        }
-        if let Some(seconds) = r2.timeout_seconds {
-            config = config.with_timeout(Duration::from_secs(seconds));
-        }
-        let materializations =
-            SqliteSourceMaterializationStore::open(self.source_materializations_db())?;
-        Ok(R2Source::new(config, prefix, store, materializations)?)
-    }
-
-    fn source_materializations_db(&self) -> PathBuf {
-        self.config
-            .state
-            .path
-            .join("source-materializations.sqlite3")
-    }
-    fn document_db(&self) -> PathBuf {
-        self.config.state.path.join("document-reviews.sqlite3")
-    }
-    fn asset_db(&self) -> PathBuf {
-        self.config.state.path.join("asset-reviews.sqlite3")
-    }
-    fn human_db(&self) -> PathBuf {
-        self.config.state.path.join("human-reviews.sqlite3")
-    }
-    fn publish_db(&self) -> PathBuf {
-        self.config.state.path.join("publish-runs.sqlite3")
-    }
-    fn observation_db(&self) -> PathBuf {
-        self.config.state.path.join("remote-observations.sqlite3")
-    }
-    fn delivery_db(&self) -> PathBuf {
-        self.config.state.path.join("delivery-projections.sqlite3")
-    }
-
-    /// Builds the configured target, reading the secret access key from the
-    /// environment. This is the only place an asset-target credential is read,
-    /// and it never reaches the engine or a durable record.
-    fn asset_target(&self) -> Result<ConfiguredAssetTarget, Box<dyn Error>> {
-        let assets = self.assets()?;
-        if let Some(target_path) = &assets.target_path {
-            return Ok(ConfiguredAssetTarget::filesystem(target_path));
-        }
-        let r2 = assets
-            .r2
-            .as_ref()
-            .ok_or("assets must configure either target_path or r2 before publishing")?;
-        let mut config = R2ObjectStoreConfig::new(
-            r2.endpoint.clone(),
-            r2.bucket.clone(),
-            r2.access_key_id.clone(),
-            R2SecretKey::new(env::var(&r2.secret_access_key_env).map_err(|_| {
-                format!(
-                    "assets.r2.secret_access_key_env names {}, which is not set",
-                    r2.secret_access_key_env
-                )
-            })?)?,
-        )?;
-        if let Some(region) = &r2.region {
-            config = config.with_region(region.clone())?;
-        }
-        if let Some(seconds) = r2.timeout_seconds {
-            config = config.with_timeout(std::time::Duration::from_secs(seconds));
-        }
-        Ok(ConfiguredAssetTarget::r2(R2ObjectStore::new(
-            config,
-            self.config.state.path.join("asset-spool"),
-        )?))
-    }
-    fn asset_observations_db(&self) -> PathBuf {
-        self.config.state.path.join("asset-observations.sqlite3")
-    }
-
-    /// Where durable backup intents live, beside the publication runs.
-    fn backup_db(&self) -> PathBuf {
-        self.config.state.path.join("backup-runs.sqlite3")
-    }
-
-    /// Builds the configured LFS endpoint, reading the credentials from the
-    /// environment. This is the only place a backup credential is read, and it never
-    /// reaches the engine, a durable record or a report: a missing variable is
-    /// reported by name, and the value is never printed.
-    fn backup_lfs_remote(&self) -> Result<LfsHttpRemote, Box<dyn Error>> {
-        let lfs = self.backup_lfs()?;
-        let username_env = lfs
-            .username_env
-            .as_deref()
-            .ok_or("backup.lfs.username_env must be non-empty when backup.lfs is enabled")?;
-        let token_env = lfs
-            .token_env
-            .as_deref()
-            .ok_or("backup.lfs.token_env must be non-empty when backup.lfs is enabled")?;
-        let username = env::var(username_env).map_err(|_| {
-            format!("backup.lfs.username_env names {username_env}, which is not set")
-        })?;
-        let token = env::var(token_env)
-            .map_err(|_| format!("backup.lfs.token_env names {token_env}, which is not set"))?;
-        let batch_url = match &lfs.batch_url {
-            Some(url) => url.clone(),
-            None => self.derive_backup_batch_url()?,
-        };
-        let timeout = Duration::from_secs(
-            lfs.timeout_seconds
-                .unwrap_or(DEFAULT_BACKUP_LFS_TIMEOUT_SECONDS),
-        );
-        let config = LfsHttpConfig::new(batch_url, username, LfsToken::new(token)?, timeout)?;
-        Ok(LfsHttpRemote::new(config)?)
-    }
-
-    /// Derives the LFS batch endpoint from the backup remote URL.
-    ///
-    /// A remote URL already names where the repository lives, and a Git LFS server
-    /// serves the batch API from `<remote>/info/lfs`. A remote that is not an
-    /// absolute http(s) URL cannot be derived and is refused rather than guessed.
-    fn derive_backup_batch_url(&self) -> Result<String, Box<dyn Error>> {
-        let git = self.backup_git()?;
-        let remote = git
-            .remote
-            .as_deref()
-            .ok_or("backup.git.remote must be non-empty when backup is enabled")?;
-        let output = Command::new("git")
-            .current_dir(self.backup_git_repository()?)
-            .args(["remote", "get-url", remote])
-            .output()
-            .map_err(|error| format!("git is unavailable: {error}"))?;
-        if !output.status.success() {
-            return Err(format!(
-                "could not read the URL of backup remote {remote}: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            )
-            .into());
-        }
-        let url = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-        if url.is_empty() {
-            return Err(format!("backup remote {remote} has no URL").into());
-        }
-        Ok(format!("{}/info/lfs", url.trim_end_matches('/')))
-    }
-
-    /// The commit identity one backup freezes, using the configured values and the
-    /// documented defaults for whichever were omitted.
-    fn backup_commit_metadata(&self) -> Result<GitCommitMetadata, Box<dyn Error>> {
-        let git = self.backup_git()?;
-        Ok(backup_commit_metadata(
-            git.author_name
-                .as_deref()
-                .unwrap_or(DEFAULT_BACKUP_AUTHOR_NAME),
-            git.author_email
-                .as_deref()
-                .unwrap_or(DEFAULT_BACKUP_AUTHOR_EMAIL),
-            git.message.as_deref().unwrap_or(DEFAULT_BACKUP_MESSAGE),
-        )?)
-    }
-}
+/// The runtime this binary drives.
+///
+/// Every adapter is built inside it, so this module decides *what* to run and
+/// never *how* it is connected.
+type Workspace = WorkspaceRuntime;
 
 pub fn run() -> Result<(), Box<dyn Error>> {
     let mut args = env::args().skip(1).collect::<Vec<_>>();
@@ -382,7 +148,7 @@ fn init(path: &Path, format: ConfigFormat) -> Result<(), Box<dyn Error>> {
     }
     fs::create_dir_all(&workspace.config.state.path)?;
     fs::create_dir_all(workspace.cas())?;
-    open_stores(&workspace)?;
+    workspace.open_stores()?;
     println!(
         "Initialized Mineral workspace\n  config: {}\n  state: {}\n  source: {}",
         workspace.config_path.display(),
@@ -392,32 +158,15 @@ fn init(path: &Path, format: ConfigFormat) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn open_stores(workspace: &Workspace) -> Result<(), Box<dyn Error>> {
-    SqliteReviewRunStore::open(workspace.document_db())?;
-    SqliteAssetReviewRunStore::open(workspace.asset_db())?;
-    SqliteHumanReviewStore::open(workspace.human_db())?;
-    SqlitePublishRunStore::open(workspace.publish_db())?;
-    SqliteRemoteObservationStore::open(workspace.observation_db())?;
-    SqliteDeliveryProjectionStore::open(workspace.delivery_db())?;
-    SqliteAssetObservationStore::open(workspace.asset_observations_db())?;
-    SqliteSourceMaterializationStore::open(workspace.source_materializations_db())?;
-    // The backup store only exists for a workspace that backs up, so a workspace
-    // without a `backup:` section is never given an empty database it never uses.
-    if workspace.backup_enabled() {
-        SqliteBackupRunStore::open(workspace.backup_db())?;
-    }
-    Ok(())
-}
-
-fn snapshot(workspace: &Workspace, store: &LocalContentStore) -> Result<Snapshot, Box<dyn Error>> {
+/// Reads one complete source state as an immutable Snapshot.
+///
+/// The source itself is built by the runtime; what stays here is the progress a
+/// human watches, because that is presentation.
+fn snapshot(workspace: &Workspace) -> Result<Snapshot, Box<dyn Error>> {
     let source_id = SourceId::new(workspace.config.source.id.clone())?;
     match workspace.source_kind() {
         SourceType::Local => {
-            let source = LocalSource::new(
-                workspace.local_source_path()?,
-                source_id.clone(),
-                store.clone(),
-            );
+            let source = workspace.local_source(source_id.clone())?;
             let provisional = source.snapshot(SnapshotId::new(1)?, SystemTime::now())?;
             let id = snapshot_id(&source_id, provisional.files());
             source
@@ -428,7 +177,7 @@ fn snapshot(workspace: &Workspace, store: &LocalContentStore) -> Result<Snapshot
             // One stabilized scan, one assembled state. The identity is computed from
             // the materialized bytes only, so the same bytes from a local directory
             // and from R2 describe the same source state.
-            let source = workspace.r2_source(store.clone())?;
+            let source = workspace.r2_source()?;
             let stabilized = stabilize_scan(&source, DEFAULT_MAX_SCAN_ATTEMPTS)
                 .map_err(|error| format!("could not read the R2 source: {error}"))?;
             eprintln!(
@@ -471,64 +220,50 @@ fn snapshot_id(source_id: &SourceId, files: &[SnapshotFile]) -> u64 {
 
 fn publish(workspace: Workspace) -> Result<(), Box<dyn Error>> {
     fs::create_dir_all(&workspace.config.state.path)?;
-    let content_store = LocalContentStore::new(workspace.cas());
+    let content_store = workspace.content_store();
     eprintln!("[1/4] Creating immutable Snapshot...");
-    let snapshot = snapshot(&workspace, &content_store)?;
+    let snapshot = snapshot(&workspace)?;
     eprintln!(
         "[1/4] Snapshot {} contains {} files.",
         snapshot.id().get(),
         snapshot.files().len()
     );
-    let document_runs = SqliteReviewRunStore::open(workspace.document_db())?;
-    let asset_runs = SqliteAssetReviewRunStore::open(workspace.asset_db())?;
-    let human = SqliteHumanReviewStore::open(workspace.human_db())?;
-    let publish_runs = SqlitePublishRunStore::open(workspace.publish_db())?;
-    let delivery_projections = SqliteDeliveryProjectionStore::open(workspace.delivery_db())?;
+    let document_runs = workspace.document_reviews()?;
+    let asset_runs = workspace.asset_reviews()?;
+    let human = workspace.human_reviews()?;
+    let publish_runs = workspace.publish_runs()?;
+    let delivery_projections = workspace.delivery_projections()?;
     let asset_target = workspace.asset_target()?;
     let public_scope = workspace.public_scope()?;
     let asset_location = asset_target.description();
-    let asset_observations = SqliteAssetObservationStore::open(workspace.asset_observations_db())?;
-    let observations = SqliteRemoteObservationStore::open(workspace.observation_db())?;
-    let markdown_reviewer = LazyMarkdownReviewer {
-        config: workspace.config.review.clone(),
-        store: content_store.clone(),
-        completed: AtomicUsize::new(0),
-        reviewer: OnceLock::new(),
-    };
-    let asset_reviewer = LazyAssetReviewer {
-        config: workspace.config.review.clone(),
-        store: content_store.clone(),
-        completed: AtomicUsize::new(0),
-        reviewer: OnceLock::new(),
-    };
+    let asset_observations = workspace.asset_observations()?;
+    let observations = workspace.remote_observations()?;
+    let markdown_reviewer = workspace.markdown_reviewer()?;
+    let asset_reviewer = workspace.asset_reviewer()?;
     let markdown_policy = PolicyIdentity::new(
         format!("deepseek:{}", workspace.config.review.markdown_model),
         MARKDOWN_REVIEWER_PROMPT_VERSION,
-        markdown_contract_hash(&workspace.config.review)?,
+        workspace.markdown_contract_hash()?,
     )?;
     let asset_policy = PolicyIdentity::new(
         format!("deepseek:{}", workspace.config.review.asset_model),
         ASSET_REVIEWER_PROMPT_VERSION,
-        asset_contract_hash(&workspace.config.review)?,
+        workspace.asset_contract_hash()?,
     )?;
+    let target = workspace.publish_target()?;
+    let commit_metadata = workspace.publish_commit_metadata()?;
+    let asset_delivery = workspace.asset_delivery()?;
     let request = PublicationApplicationRequest {
         snapshot: &snapshot,
         markdown_policy: &markdown_policy,
         asset_policy: &asset_policy,
         repository: &workspace.config.git.repository,
-        target_id: workspace.config.git.publish_target_id()?,
-        target: GitRefTarget::new(
-            &workspace.config.git.remote,
-            &workspace.config.git.reference,
-        )?,
-        commit_metadata: &GitCommitMetadata::new(
-            &workspace.config.git.author_name,
-            &workspace.config.git.author_email,
-            &workspace.config.git.message,
-        )?,
+        target_id: workspace.publish_target_id()?,
+        target,
+        commit_metadata: &commit_metadata,
         human_reviews: ExplicitHumanReviewSelection::default(),
         public_scope: &public_scope,
-        asset_delivery: &workspace.asset_delivery()?,
+        asset_delivery: &asset_delivery,
     };
     // Runtime concerns stay in the composition root: wall-clock time and the
     // review execution strategy are supplied to the application, never read by it.
@@ -671,11 +406,11 @@ fn render_warnings(result: &mineral_publisher::workflow::PublicPolicyRunResult) 
 }
 
 fn status(workspace: Workspace) -> Result<(), Box<dyn Error>> {
-    let documents = SqliteReviewRunStore::open(workspace.document_db())?;
-    let assets = SqliteAssetReviewRunStore::open(workspace.asset_db())?;
-    let human = SqliteHumanReviewStore::open(workspace.human_db())?;
-    let runs = SqlitePublishRunStore::open(workspace.publish_db())?;
-    SqliteSourceMaterializationStore::open(workspace.source_materializations_db())?;
+    let documents = workspace.document_reviews()?;
+    let assets = workspace.asset_reviews()?;
+    let human = workspace.human_reviews()?;
+    let runs = workspace.publish_runs()?;
+    workspace.source_materializations()?;
     let pending_documents =
         HumanReviewResolution::list_pending_documents(&documents, &human)?.len();
     let pending_assets = HumanReviewResolution::list_pending_assets(&assets, &human)?.len();
@@ -697,9 +432,9 @@ fn status(workspace: Workspace) -> Result<(), Box<dyn Error>> {
 }
 
 fn review(workspace: Workspace, args: &[String]) -> Result<(), Box<dyn Error>> {
-    let documents = SqliteReviewRunStore::open(workspace.document_db())?;
-    let assets = SqliteAssetReviewRunStore::open(workspace.asset_db())?;
-    let human = SqliteHumanReviewStore::open(workspace.human_db())?;
+    let documents = workspace.document_reviews()?;
+    let assets = workspace.asset_reviews()?;
+    let human = workspace.human_reviews()?;
     match args.first().map(String::as_str) {
         Some("list") => {
             println!("Markdown");
@@ -904,12 +639,11 @@ fn backup_run(workspace: Workspace) -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
     fs::create_dir_all(&workspace.config.state.path)?;
-    let content_store = LocalContentStore::new(workspace.cas());
-    let snapshot = snapshot(&workspace, &content_store)?;
-    let store = SqliteBackupRunStore::open(workspace.backup_db())?;
-    let repository_path = workspace.backup_git_repository()?;
-    let repository = GitBackupRepository::new(repository_path, content_store.clone())?;
-    let remote = GitRemoteAdapter::new(repository_path)?;
+    let content_store = workspace.content_store();
+    let snapshot = snapshot(&workspace)?;
+    let store = workspace.backup_runs()?;
+    let repository = workspace.backup_repository()?;
+    let remote = workspace.backup_git_remote()?;
     let lfs = workspace.backup_lfs_remote()?;
     let target = workspace.backup_target()?;
     let metadata = workspace.backup_commit_metadata()?;
@@ -995,8 +729,7 @@ fn backup_status(workspace: Workspace) -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
     let target = workspace.backup_target()?;
-    let repository = workspace.backup_git_repository()?;
-    match observe_backup_ref(repository, &target) {
+    match workspace.observe_backup_ref(&target) {
         Ok(RemoteRefState::Present { commit_oid }) => println!(
             "  ref: {} {} ({})",
             target.remote_name(),
@@ -1014,7 +747,7 @@ fn backup_status(workspace: Workspace) -> Result<(), Box<dyn Error>> {
             target.destination_ref()
         ),
     }
-    let store = SqliteBackupRunStore::open(workspace.backup_db())?;
+    let store = workspace.backup_runs()?;
     match store.list()?.last() {
         Some(run) => println!(
             "  newest run: {}\n  snapshot: {}\n  delivery: {}",
@@ -1033,10 +766,8 @@ fn backup_verify(workspace: Workspace) -> Result<(), Box<dyn Error>> {
         println!("Backup is not configured for this workspace; nothing to verify.");
         return Ok(());
     }
-    let repository_path = workspace.backup_git_repository()?;
-    let repository =
-        GitBackupRepository::new(repository_path, LocalContentStore::new(workspace.cas()))?;
-    let remote = GitRemoteAdapter::new(repository_path)?;
+    let repository = workspace.backup_repository()?;
+    let remote = workspace.backup_git_remote()?;
     let lfs = workspace.backup_lfs_remote()?;
     let target = workspace.backup_target()?;
     let report = verify_backup(&repository, &remote, &lfs, &target, None)
@@ -1062,8 +793,7 @@ fn backup_init(workspace: Workspace) -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
     let target = workspace.backup_target()?;
-    let repository = workspace.backup_git_repository()?;
-    match observe_backup_ref(repository, &target)? {
+    match workspace.observe_backup_ref(&target)? {
         RemoteRefState::Present { commit_oid } => {
             println!(
                 "Backup ref {} {} already exists at {}; nothing changed.",
@@ -1075,11 +805,8 @@ fn backup_init(workspace: Workspace) -> Result<(), Box<dyn Error>> {
         }
         RemoteRefState::Missing => {
             let metadata = workspace.backup_commit_metadata()?;
-            // `Command::output` closes stdin, so `git mktree` reads an empty list and
-            // prints the empty tree the root commit points at.
-            let tree = backup_git_stdout(repository, &["mktree"])?;
-            let commit = backup_root_commit(repository, &tree, &metadata)?;
-            push_backup_root_commit(repository, &target, &commit)?;
+            let commit = workspace.backup_root_commit(&metadata)?;
+            workspace.push_backup_root_commit(&target, &commit)?;
             println!(
                 "Initialized backup ref {} {} at {}.",
                 target.remote_name(),
@@ -1088,89 +815,6 @@ fn backup_init(workspace: Workspace) -> Result<(), Box<dyn Error>> {
             );
             Ok(())
         }
-    }
-}
-
-/// Runs a `git` command whose stdout is one value, failing closed on a non-zero exit.
-fn backup_git_stdout(repository: &Path, arguments: &[&str]) -> Result<String, Box<dyn Error>> {
-    let output = Command::new("git")
-        .current_dir(repository)
-        .args(arguments)
-        .output()
-        .map_err(|error| format!("git is unavailable: {error}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "git {} failed: {}",
-            arguments.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
-        )
-        .into());
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
-}
-
-/// Creates the empty root commit with the frozen backup identity.
-fn backup_root_commit(
-    repository: &Path,
-    tree: &str,
-    metadata: &GitCommitMetadata,
-) -> Result<GitCommitOid, Box<dyn Error>> {
-    let output = Command::new("git")
-        .current_dir(repository)
-        .env("GIT_AUTHOR_NAME", metadata.author_name())
-        .env("GIT_AUTHOR_EMAIL", metadata.author_email())
-        .env("GIT_COMMITTER_NAME", metadata.author_name())
-        .env("GIT_COMMITTER_EMAIL", metadata.author_email())
-        .args(["commit-tree", tree, "-m", metadata.message()])
-        .output()
-        .map_err(|error| format!("git is unavailable: {error}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "git commit-tree failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )
-        .into());
-    }
-    let commit = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    Ok(GitCommitOid::new(commit)?)
-}
-
-/// Pushes the bootstrap commit onto the backup branch.
-fn push_backup_root_commit(
-    repository: &Path,
-    target: &GitRefTarget,
-    commit: &GitCommitOid,
-) -> Result<(), Box<dyn Error>> {
-    let refspec = format!("{}:{}", commit.as_str(), target.destination_ref());
-    let output = Command::new("git")
-        .current_dir(repository)
-        .args(["push", target.remote_name(), &refspec])
-        .output()
-        .map_err(|error| format!("git is unavailable: {error}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "git push failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )
-        .into());
-    }
-    Ok(())
-}
-
-/// Allocates backup-attempt identities from UUID v4 entropy.
-///
-/// A backup id is frozen into the durable intent before any remote effect, so it
-/// must be globally unique rather than sequential: a restart resuming an intent and
-/// a fresh run must never collide on one identity.
-struct UuidBackupRunIdGenerator;
-
-impl BackupRunIdGenerator for UuidBackupRunIdGenerator {
-    fn next_id(&self) -> BackupRunId {
-        let bytes = *uuid::Uuid::new_v4().as_bytes();
-        let mut prefix = [0_u8; 8];
-        prefix.copy_from_slice(&bytes[..8]);
-        BackupRunId::new(sqlite_positive_id(u64::from_be_bytes(prefix)))
-            .expect("UUID-derived id is nonzero")
     }
 }
 
@@ -1275,18 +919,9 @@ fn doctor(workspace: Workspace) -> Result<(), Box<dyn Error>> {
             _ => "not configured".to_owned(),
         },
     );
-    let remote = Command::new("git")
-        .current_dir(&workspace.config.git.repository)
-        .args([
-            "ls-remote",
-            "--exit-code",
-            &workspace.config.git.remote,
-            &workspace.config.git.reference,
-        ])
-        .output();
     check(
         "remote/ref",
-        remote.is_ok_and(|output| output.status.success()),
+        workspace.publication_ref_present(),
         format!(
             "{} {}",
             workspace.config.git.remote, workspace.config.git.reference
@@ -1312,140 +947,6 @@ fn doctor(workspace: Workspace) -> Result<(), Box<dyn Error>> {
     }
 }
 
-fn markdown_config(
-    config: &ReviewConfig,
-    key: DeepSeekApiKey,
-) -> Result<DeepSeekMarkdownReviewerConfig, Box<dyn Error>> {
-    Ok(DeepSeekMarkdownReviewerConfig::new(
-        &config.api_base_url,
-        &config.markdown_model,
-        key,
-        Duration::from_secs(config.timeout_seconds),
-        2 * 1024 * 1024,
-        64 * 1024,
-    )?)
-}
-fn asset_config(
-    config: &ReviewConfig,
-    key: DeepSeekApiKey,
-) -> Result<DeepSeekAssetReviewerConfig, Box<dyn Error>> {
-    Ok(DeepSeekAssetReviewerConfig::new(
-        &config.api_base_url,
-        key,
-        Duration::from_secs(config.timeout_seconds),
-        8 * 1024 * 1024,
-        64 * 1024,
-    )?
-    .with_model(&config.asset_model)?)
-}
-fn markdown_contract_hash(config: &ReviewConfig) -> Result<Sha256, Box<dyn Error>> {
-    let reviewer = DeepSeekMarkdownReviewer::new(
-        markdown_config(config, DeepSeekApiKey::new("contract-only")?)?,
-        LocalContentStore::new(env::temp_dir().join("mineral-contract-cas")),
-    )?;
-    Ok(reviewer.prompt_sha256())
-}
-fn asset_contract_hash(config: &ReviewConfig) -> Result<Sha256, Box<dyn Error>> {
-    let reviewer = DeepSeekAssetReviewer::new(
-        asset_config(config, DeepSeekApiKey::new("contract-only")?)?,
-        LocalContentStore::new(env::temp_dir().join("mineral-contract-cas")),
-    )?;
-    Ok(reviewer.prompt_sha256())
-}
-
-struct LazyMarkdownReviewer {
-    config: ReviewConfig,
-    store: LocalContentStore,
-    completed: AtomicUsize,
-    reviewer: OnceLock<Result<DeepSeekMarkdownReviewer, String>>,
-}
-impl Reviewer for LazyMarkdownReviewer {
-    fn review(&self, candidate: &ReviewCandidate) -> Result<ReviewerReport, ReviewerError> {
-        eprintln!("      Markdown review: {}", candidate.path());
-        let reviewer = self.reviewer.get_or_init(|| {
-            (|| -> Result<_, Box<dyn Error>> {
-                let key = DeepSeekApiKey::from_env(&self.config.api_key_env)?;
-                Ok(DeepSeekMarkdownReviewer::new(
-                    markdown_config(&self.config, key)?,
-                    self.store.clone(),
-                )?)
-            })()
-            .map_err(|error| error.to_string())
-        });
-        let result = reviewer
-            .as_ref()
-            .map_err(|error| ReviewerError::new(format!("review provider unavailable: {error}")))
-            .and_then(|reviewer| reviewer.review(candidate));
-        let completed = self.completed.fetch_add(1, Ordering::Relaxed) + 1;
-        eprintln!("      Markdown reviews completed: {completed}");
-        result
-    }
-}
-struct LazyAssetReviewer {
-    config: ReviewConfig,
-    store: LocalContentStore,
-    completed: AtomicUsize,
-    reviewer: OnceLock<Result<DeepSeekAssetReviewer, String>>,
-}
-impl AssetReviewer for LazyAssetReviewer {
-    fn review(
-        &self,
-        candidate: &AssetReviewCandidate,
-    ) -> Result<AssetReviewerReport, AssetReviewerError> {
-        eprintln!("[3/4] Asset review: {}", candidate.path());
-        let reviewer = self.reviewer.get_or_init(|| {
-            (|| -> Result<_, Box<dyn Error>> {
-                let key = DeepSeekApiKey::from_env(&self.config.api_key_env)?;
-                Ok(DeepSeekAssetReviewer::new(
-                    asset_config(&self.config, key)?,
-                    self.store.clone(),
-                )?)
-            })()
-            .map_err(|error| error.to_string())
-        });
-        let result = reviewer
-            .as_ref()
-            .map_err(|error| {
-                AssetReviewerError::new(format!("review provider unavailable: {error}"))
-            })
-            .and_then(|reviewer| reviewer.review(candidate));
-        let completed = self.completed.fetch_add(1, Ordering::Relaxed) + 1;
-        eprintln!("      Asset reviews completed: {completed}");
-        result
-    }
-}
-
-struct RandomDocumentIds;
-impl ReviewRunIdGenerator for RandomDocumentIds {
-    type Error = Infallible;
-    fn next_id(&mut self) -> Result<ReviewRunId, Self::Error> {
-        Ok(ReviewRunId::new(random_u64()).expect("UUID-derived id is nonzero"))
-    }
-}
-struct RandomAssetIds;
-impl AssetReviewRunIdGenerator for RandomAssetIds {
-    type Error = Infallible;
-    fn next_id(&mut self) -> Result<AssetReviewRunId, Self::Error> {
-        Ok(AssetReviewRunId::new(random_u64()).expect("UUID-derived id is nonzero"))
-    }
-}
-fn random_human_id() -> Result<HumanReviewId, HumanReviewRecordError> {
-    HumanReviewId::new(random_u64())
-}
-fn random_u64() -> u64 {
-    let bytes = *uuid::Uuid::new_v4().as_bytes();
-    sqlite_positive_id(u64::from_be_bytes(
-        bytes[..8].try_into().expect("fixed UUID width"),
-    ))
-}
-
-/// SQLite INTEGER is signed even though the domain IDs are represented as
-/// `u64`. Keep every production-generated identity in the common positive
-/// range so persistence can never reject a valid generated ID.
-fn sqlite_positive_id(value: u64) -> u64 {
-    (value & i64::MAX as u64).max(1)
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -1455,9 +956,11 @@ mod tests {
         time::Duration,
     };
 
+    use mineral_publisher::backup::lfs_http::{LfsHttpConfig, LfsToken};
+
     use super::{
-        Config, ConfigFormat, DEFAULT_CONFIG, LfsHttpConfig, LfsHttpRemote, LfsToken,
-        LocalContentStore, SourceType, Workspace, backup, init, sqlite_positive_id,
+        Config, ConfigFormat, DEFAULT_CONFIG, LfsHttpRemote, SourceType, Workspace, backup, init,
+        sqlite_positive_id,
     };
 
     /// The three asset-target shapes a configuration can have: the native store,
@@ -1606,7 +1109,7 @@ mod tests {
         fs::create_dir_all(&directory).unwrap();
         let path = directory.join("mineral.yaml");
         fs::write(&path, text).unwrap();
-        Workspace::load(path)
+        Workspace::load(path).map_err(Into::into)
     }
 
     fn r2_source_block(prefix: &str) -> String {
@@ -1628,11 +1131,7 @@ mod tests {
         assert_eq!(workspace.source_kind(), SourceType::Local);
         assert!(workspace.local_source_path().unwrap().is_absolute());
         assert!(workspace.source_description().ends_with("vault"));
-        assert!(
-            workspace
-                .r2_source(LocalContentStore::new(workspace.cas()))
-                .is_err()
-        );
+        assert!(workspace.r2_source().is_err());
     }
 
     #[test]
@@ -1652,7 +1151,7 @@ mod tests {
         );
         assert!(workspace.local_source_path().is_err());
 
-        let error = match workspace.r2_source(LocalContentStore::new(workspace.cas())) {
+        let error = match workspace.r2_source() {
             Ok(_) => panic!("an unset secret must be refused"),
             Err(error) => error.to_string(),
         };
@@ -1802,7 +1301,7 @@ mod tests {
         fs::create_dir_all(&directory).unwrap();
         let path = directory.join("mineral.yaml");
         fs::write(&path, text).unwrap();
-        Workspace::load(path)
+        Workspace::load(path).map_err(Into::into)
     }
 
     /// A valid backup block, so each refusal test can change exactly one field.

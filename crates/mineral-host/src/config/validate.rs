@@ -456,6 +456,51 @@ impl ValidatedConfig {
     pub fn state_file(&self, name: &str) -> PathBuf {
         self.state_path().join(name)
     }
+
+    /// The durable Markdown review runs.
+    pub fn document_db(&self) -> PathBuf {
+        self.state_file("document-reviews.sqlite3")
+    }
+
+    /// The durable asset review runs.
+    pub fn asset_db(&self) -> PathBuf {
+        self.state_file("asset-reviews.sqlite3")
+    }
+
+    /// The durable human decisions.
+    pub fn human_db(&self) -> PathBuf {
+        self.state_file("human-reviews.sqlite3")
+    }
+
+    /// The durable publication runs.
+    pub fn publish_db(&self) -> PathBuf {
+        self.state_file("publish-runs.sqlite3")
+    }
+
+    /// The durable observations of the publication ref.
+    pub fn observation_db(&self) -> PathBuf {
+        self.state_file("remote-observations.sqlite3")
+    }
+
+    /// The durable delivery projections.
+    pub fn delivery_db(&self) -> PathBuf {
+        self.state_file("delivery-projections.sqlite3")
+    }
+
+    /// The durable observations of delivered assets.
+    pub fn asset_observations_db(&self) -> PathBuf {
+        self.state_file("asset-observations.sqlite3")
+    }
+
+    /// The durable record of materialized source objects.
+    pub fn source_materializations_db(&self) -> PathBuf {
+        self.state_file("source-materializations.sqlite3")
+    }
+
+    /// The durable backup intents.
+    pub fn backup_db(&self) -> PathBuf {
+        self.state_file("backup-runs.sqlite3")
+    }
 }
 
 /// Parses one configured credential name, naming the key that carried it.

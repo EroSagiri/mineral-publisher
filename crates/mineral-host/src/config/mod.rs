@@ -27,8 +27,10 @@ pub mod validate;
 
 pub use load::{ConfigFormat, load, parse};
 pub use model::{
-    DEFAULT_BACKUP_AUTHOR_EMAIL, DEFAULT_BACKUP_AUTHOR_NAME, DEFAULT_BACKUP_LFS_TIMEOUT_SECONDS,
-    DEFAULT_BACKUP_MESSAGE, DEFAULT_CONFIG, DEFAULT_CONFIG_TOML, RawConfig, SourceType,
+    AssetsConfig, BackupConfig, BackupGitConfig, BackupLfsConfig, DEFAULT_BACKUP_AUTHOR_EMAIL,
+    DEFAULT_BACKUP_AUTHOR_NAME, DEFAULT_BACKUP_LFS_TIMEOUT_SECONDS, DEFAULT_BACKUP_MESSAGE,
+    DEFAULT_CONFIG, DEFAULT_CONFIG_TOML, GitConfig, PublicConfig, R2Config, RawConfig,
+    ReviewConfig, SourceConfig, SourceR2Config, SourceType, StateConfig,
 };
 pub use secrets::{
     EnvSecretProvider, SecretError, SecretName, SecretProvider, SecretValue, StaticSecretProvider,
