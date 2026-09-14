@@ -9,4 +9,6 @@ pub mod application;
 pub mod git_backup;
 pub mod lfs_http;
 #[cfg(test)]
+mod live_tests;
+#[cfg(test)]
 mod tests;

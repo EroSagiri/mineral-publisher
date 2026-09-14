@@ -12,20 +12,33 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use mineral_core::backup::{
+    BackupExecutionOutcome, BackupRunId, BackupRunStore, TypeFirstBackupRepresentationPolicy,
+    verify_backup,
+};
 use mineral_core::source::{DEFAULT_MAX_SCAN_ATTEMPTS, stabilize_scan};
 use mineral_publisher::{
     asset::{
         AssetPublicationOutcome, ConfiguredAssetTarget, R2ObjectStore, R2ObjectStoreConfig,
         R2SecretKey, UuidAssetObservationIdGenerator,
     },
-    domain::{Sha256, Snapshot, SnapshotFile, SnapshotId, SourceId},
+    backup::{
+        application::{
+            BackupApplicationError, BackupApplicationOutcome, BackupApplicationRequest,
+            BackupRunIdGenerator, run_backup,
+        },
+        git_backup::{GitBackupRepository, backup_commit_metadata, observe_backup_ref},
+        lfs_http::{LfsHttpConfig, LfsHttpRemote, LfsToken},
+    },
+    domain::{Sha256, Snapshot, SnapshotFile, SnapshotId, SourceId, TimestampMillis},
     policy::{
         PolicyIdentity, ReviewCandidate, ReviewRunId, ReviewRunStore, Reviewer, ReviewerError,
         ReviewerReport,
     },
     publisher::{
-        GitCommitMetadata, GitPublicationExecution, GitRefTarget, PublishRunStore, PublishTargetId,
-        UuidPublishRunIdGenerator, UuidRemoteObservationIdGenerator,
+        GitCommitMetadata, GitCommitOid, GitPublicationExecution, GitRefTarget, GitRemoteAdapter,
+        PublishRunStore, PublishTargetId, RemoteRefState, UuidPublishRunIdGenerator,
+        UuidRemoteObservationIdGenerator,
     },
     reviewer::{
         ASSET_REVIEWER_PROMPT_VERSION, DeepSeekApiKey, DeepSeekAssetReviewer,
@@ -37,8 +50,9 @@ use mineral_publisher::{
     source::r2::{R2Source, R2SourcePrefix},
     storage::{
         LocalContentStore, SqliteAssetObservationStore, SqliteAssetReviewRunStore,
-        SqliteDeliveryProjectionStore, SqliteHumanReviewStore, SqlitePublishRunStore,
-        SqliteRemoteObservationStore, SqliteReviewRunStore, SqliteSourceMaterializationStore,
+        SqliteBackupRunStore, SqliteDeliveryProjectionStore, SqliteHumanReviewStore,
+        SqlitePublishRunStore, SqliteRemoteObservationStore, SqliteReviewRunStore,
+        SqliteSourceMaterializationStore,
     },
     workflow::{
         ASSET_OBJECT_KEY_PREFIX, AssetDeliveryConfig, AssetReviewCandidate, AssetReviewRunId,
@@ -109,6 +123,25 @@ review:
   timeout_seconds: 45
   markdown_concurrency: 4
   asset_concurrency: 2
+# An optional private backup of every Snapshot, byte-faithful and restorable.
+# It is absent here because every workspace worked before backups existed and
+# must keep working unchanged. Credentials are named here, never written here.
+# backup:
+#   enabled: true
+#   git:
+#     repository: ./backup-repo
+#     remote: origin
+#     branch: refs/heads/mineral-backup
+#     author_name: Mineral Backup
+#     author_email: backup@example.invalid
+#     message: Backup knowledge snapshot
+#   lfs:
+#     enabled: true
+#     # Omit batch_url to derive it from the Git remote URL, or name the endpoint.
+#     batch_url: https://github.com/<owner>/<repo>.git/info/lfs
+#     username_env: MINERAL_BACKUP_LFS_USER
+#     token_env: MINERAL_BACKUP_LFS_TOKEN
+#     timeout_seconds: 300
 "#;
 
 #[derive(Clone, Debug, Deserialize)]
@@ -127,6 +160,10 @@ struct Config {
     /// scope excludes nothing, which is exactly how every earlier workspace behaved.
     #[serde(default)]
     public: Option<PublicConfig>,
+    /// The optional private backup target. Absent means this workspace never backs
+    /// up, which is exactly how every workspace behaved before backups existed.
+    #[serde(default)]
+    backup: Option<BackupConfig>,
 }
 
 /// Which kind of namespace one workspace reads its source from.
@@ -252,6 +289,81 @@ struct PublicConfig {
     exclude: Vec<String>,
 }
 
+/// Defaults for a backup commit identity the configuration does not spell out.
+const DEFAULT_BACKUP_AUTHOR_NAME: &str = "Mineral Backup";
+const DEFAULT_BACKUP_AUTHOR_EMAIL: &str = "backup@example.invalid";
+const DEFAULT_BACKUP_MESSAGE: &str = "Backup knowledge snapshot";
+/// How long one backup LFS request may take when the configuration stays silent.
+const DEFAULT_BACKUP_LFS_TIMEOUT_SECONDS: u64 = 300;
+
+/// The optional private backup target.
+///
+/// A backup stores a byte-faithful restorable copy of every Snapshot in a Git
+/// repository, with binary objects in Git LFS. The section is optional and defaults
+/// to disabled, so a workspace that never mentions it behaves exactly as it did
+/// before backups existed, and a section present only to document a future target
+/// cannot start one by accident.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BackupConfig {
+    /// Whether this workspace backs up at all. Validation and execution only ever
+    /// happen for an enabled section; a disabled one is inert.
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    git: Option<BackupGitConfig>,
+    #[serde(default)]
+    lfs: Option<BackupLfsConfig>,
+}
+
+/// The Git repository one backup writes to.
+///
+/// Every field is optional at the type level because a disabled section may omit
+/// them; an enabled section requires the repository, and the remote, branch and
+/// commit identity are validated or defaulted while the workspace loads.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BackupGitConfig {
+    /// The local Git repository holding the backup ref. Required and absolutized
+    /// when the backup is enabled, exactly like `git.repository`.
+    #[serde(default)]
+    repository: Option<PathBuf>,
+    #[serde(default)]
+    remote: Option<String>,
+    /// The fully qualified destination ref, for example `refs/heads/mineral-backup`.
+    #[serde(default)]
+    branch: Option<String>,
+    #[serde(default)]
+    author_name: Option<String>,
+    #[serde(default)]
+    author_email: Option<String>,
+    #[serde(default)]
+    message: Option<String>,
+}
+
+/// The Git LFS endpoint binary backup objects are stored through.
+///
+/// Only the *names* of the credential variables live here: the username and token
+/// values are read from the environment when a backup runs and never reach a
+/// configuration field, a durable record or a report.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BackupLfsConfig {
+    #[serde(default)]
+    enabled: bool,
+    /// The endpoint root. Absent means it is derived from the Git remote URL.
+    #[serde(default)]
+    batch_url: Option<String>,
+    /// The name of the environment variable holding the LFS username.
+    #[serde(default)]
+    username_env: Option<String>,
+    /// The name of the environment variable holding the LFS token.
+    #[serde(default)]
+    token_env: Option<String>,
+    #[serde(default)]
+    timeout_seconds: Option<u64>,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReviewConfig {
@@ -350,6 +462,71 @@ impl Workspace {
             }
             if let Some(target_path) = &assets.target_path {
                 assets.target_path = Some(absolute(base, target_path)?);
+            }
+        }
+        // The private backup target is validated once, while the workspace is
+        // loaded, so an unusable destination stops the run before a Snapshot is even
+        // taken. A disabled section is inert: it may omit everything, which is what
+        // makes `enabled: false` a safe way to keep a target documented.
+        if let Some(backup) = &mut config.backup
+            && backup.enabled
+        {
+            let git = backup
+                .git
+                .as_mut()
+                .ok_or("backup.git must be configured when backup is enabled")?;
+            let repository = git
+                .repository
+                .clone()
+                .filter(|path| !path.as_os_str().is_empty())
+                .ok_or("backup.git.repository is required when backup is enabled")?;
+            git.repository = Some(absolute(base, &repository)?);
+            let remote = git.remote.as_deref().unwrap_or_default();
+            if remote.trim().is_empty() || remote.contains(['\0', '\n', '\r']) {
+                return Err("backup.git.remote must be a non-empty name".into());
+            }
+            let branch = git.branch.as_deref().unwrap_or_default();
+            if branch.trim().is_empty() {
+                return Err("backup.git.branch must be non-empty".into());
+            }
+            // The branch is the one ref a backup compare-and-swaps, so it is
+            // validated with the same rule the publisher applies to its own ref.
+            GitRefTarget::new(remote, branch).map_err(|error| {
+                format!("backup.git.branch must be a fully qualified safe ref: {error}")
+            })?;
+            if let Some(lfs) = &backup.lfs
+                && lfs.enabled
+            {
+                // Only the variable *names* are validated here. The credential
+                // values are read from the environment at run time and never
+                // stored, recorded or printed.
+                if lfs
+                    .username_env
+                    .as_deref()
+                    .is_none_or(|name| name.trim().is_empty())
+                {
+                    return Err(
+                        "backup.lfs.username_env must be non-empty when backup.lfs is enabled"
+                            .into(),
+                    );
+                }
+                if lfs
+                    .token_env
+                    .as_deref()
+                    .is_none_or(|name| name.trim().is_empty())
+                {
+                    return Err(
+                        "backup.lfs.token_env must be non-empty when backup.lfs is enabled".into(),
+                    );
+                }
+                if let Some(url) = &lfs.batch_url
+                    && !is_absolute_http_url(url)
+                {
+                    return Err(format!(
+                        "backup.lfs.batch_url must be an absolute http(s) URL: {url}"
+                    )
+                    .into());
+                }
             }
         }
         // A source and a publication target that share one namespace on one bucket
@@ -511,6 +688,144 @@ impl Workspace {
     fn asset_observations_db(&self) -> PathBuf {
         self.config.state.path.join("asset-observations.sqlite3")
     }
+
+    /// Where durable backup intents live, beside the publication runs.
+    fn backup_db(&self) -> PathBuf {
+        self.config.state.path.join("backup-runs.sqlite3")
+    }
+
+    /// Whether this workspace has an enabled backup target.
+    ///
+    /// Every backup command checks this first, so a workspace without a `backup:`
+    /// section keeps behaving exactly as it did before backups existed.
+    fn backup_enabled(&self) -> bool {
+        self.config
+            .backup
+            .as_ref()
+            .is_some_and(|backup| backup.enabled)
+    }
+
+    /// The enabled backup Git target, if this workspace has one.
+    fn backup_git(&self) -> Result<&BackupGitConfig, Box<dyn Error>> {
+        self.config
+            .backup
+            .as_ref()
+            .filter(|backup| backup.enabled)
+            .and_then(|backup| backup.git.as_ref())
+            .ok_or_else(|| "backup.git must be configured when backup is enabled".into())
+    }
+
+    /// The local backup repository, already absolutized while the workspace loaded.
+    fn backup_git_repository(&self) -> Result<&Path, Box<dyn Error>> {
+        self.backup_git()?
+            .repository
+            .as_deref()
+            .ok_or_else(|| "backup.git.repository is required when backup is enabled".into())
+    }
+
+    /// The remote and fully qualified ref one backup compare-and-swaps.
+    fn backup_target(&self) -> Result<GitRefTarget, Box<dyn Error>> {
+        let git = self.backup_git()?;
+        let remote = git
+            .remote
+            .as_deref()
+            .ok_or("backup.git.remote must be non-empty when backup is enabled")?;
+        let branch = git
+            .branch
+            .as_deref()
+            .ok_or("backup.git.branch must be a fully qualified ref when backup is enabled")?;
+        Ok(GitRefTarget::new(remote, branch)?)
+    }
+
+    /// The enabled LFS endpoint description, if this workspace has one.
+    fn backup_lfs(&self) -> Result<&BackupLfsConfig, Box<dyn Error>> {
+        self.config
+            .backup
+            .as_ref()
+            .filter(|backup| backup.enabled)
+            .and_then(|backup| backup.lfs.as_ref())
+            .filter(|lfs| lfs.enabled)
+            .ok_or_else(|| {
+                "backup.lfs must be enabled to run a backup; binary objects are stored in Git LFS"
+                    .into()
+            })
+    }
+
+    /// Builds the configured LFS endpoint, reading the credentials from the
+    /// environment. This is the only place a backup credential is read, and it never
+    /// reaches the engine, a durable record or a report: a missing variable is
+    /// reported by name, and the value is never printed.
+    fn backup_lfs_remote(&self) -> Result<LfsHttpRemote, Box<dyn Error>> {
+        let lfs = self.backup_lfs()?;
+        let username_env = lfs
+            .username_env
+            .as_deref()
+            .ok_or("backup.lfs.username_env must be non-empty when backup.lfs is enabled")?;
+        let token_env = lfs
+            .token_env
+            .as_deref()
+            .ok_or("backup.lfs.token_env must be non-empty when backup.lfs is enabled")?;
+        let username = env::var(username_env).map_err(|_| {
+            format!("backup.lfs.username_env names {username_env}, which is not set")
+        })?;
+        let token = env::var(token_env)
+            .map_err(|_| format!("backup.lfs.token_env names {token_env}, which is not set"))?;
+        let batch_url = match &lfs.batch_url {
+            Some(url) => url.clone(),
+            None => self.derive_backup_batch_url()?,
+        };
+        let timeout = Duration::from_secs(
+            lfs.timeout_seconds
+                .unwrap_or(DEFAULT_BACKUP_LFS_TIMEOUT_SECONDS),
+        );
+        let config = LfsHttpConfig::new(batch_url, username, LfsToken::new(token)?, timeout)?;
+        Ok(LfsHttpRemote::new(config)?)
+    }
+
+    /// Derives the LFS batch endpoint from the backup remote URL.
+    ///
+    /// A remote URL already names where the repository lives, and a Git LFS server
+    /// serves the batch API from `<remote>/info/lfs`. A remote that is not an
+    /// absolute http(s) URL cannot be derived and is refused rather than guessed.
+    fn derive_backup_batch_url(&self) -> Result<String, Box<dyn Error>> {
+        let git = self.backup_git()?;
+        let remote = git
+            .remote
+            .as_deref()
+            .ok_or("backup.git.remote must be non-empty when backup is enabled")?;
+        let output = Command::new("git")
+            .current_dir(self.backup_git_repository()?)
+            .args(["remote", "get-url", remote])
+            .output()
+            .map_err(|error| format!("git is unavailable: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "could not read the URL of backup remote {remote}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )
+            .into());
+        }
+        let url = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        if url.is_empty() {
+            return Err(format!("backup remote {remote} has no URL").into());
+        }
+        Ok(format!("{}/info/lfs", url.trim_end_matches('/')))
+    }
+
+    /// The commit identity one backup freezes, using the configured values and the
+    /// documented defaults for whichever were omitted.
+    fn backup_commit_metadata(&self) -> Result<GitCommitMetadata, Box<dyn Error>> {
+        let git = self.backup_git()?;
+        Ok(backup_commit_metadata(
+            git.author_name
+                .as_deref()
+                .unwrap_or(DEFAULT_BACKUP_AUTHOR_NAME),
+            git.author_email
+                .as_deref()
+                .unwrap_or(DEFAULT_BACKUP_AUTHOR_EMAIL),
+            git.message.as_deref().unwrap_or(DEFAULT_BACKUP_MESSAGE),
+        )?)
+    }
 }
 
 impl Config {
@@ -558,6 +873,16 @@ fn namespaces_overlap(left: &str, right: &str) -> bool {
     left.starts_with(right) || right.starts_with(left)
 }
 
+/// Whether one configured URL is an absolute http(s) URL with a host.
+///
+/// The LFS adapter enforces the same rule when it builds an endpoint; applying it
+/// while the workspace loads means an unusable `batch_url` is reported before a
+/// backup starts rather than in the middle of one.
+fn is_absolute_http_url(value: &str) -> bool {
+    reqwest::Url::parse(value)
+        .is_ok_and(|url| matches!(url.scheme(), "http" | "https") && url.host_str().is_some())
+}
+
 fn absolute(base: &Path, value: &Path) -> Result<PathBuf, Box<dyn Error>> {
     Ok(if value.is_absolute() {
         value.to_path_buf()
@@ -588,6 +913,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         "status" => status(Workspace::load(config_path)?),
         "doctor" => doctor(Workspace::load(config_path)?),
         "review" => review(Workspace::load(config_path)?, &args[1..]),
+        "backup" => backup(Workspace::load(config_path)?, &args[1..]),
         "help" | "--help" | "-h" => {
             print_help();
             Ok(())
@@ -598,7 +924,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 
 fn print_help() {
     println!(
-        "Mineral Publisher\n\nUsage:\n  mineral [--config PATH] init\n  mineral [--config PATH] publish\n  mineral [--config PATH] status\n  mineral [--config PATH] review list\n  mineral [--config PATH] review show <document:ID|asset:ID>\n  mineral [--config PATH] review approve <document:ID|asset:ID>\n  mineral [--config PATH] review reject <document:ID|asset:ID>\n  mineral [--config PATH] doctor"
+        "Mineral Publisher\n\nUsage:\n  mineral [--config PATH] init\n  mineral [--config PATH] publish\n  mineral [--config PATH] status\n  mineral [--config PATH] review list\n  mineral [--config PATH] review show <document:ID|asset:ID>\n  mineral [--config PATH] review approve <document:ID|asset:ID>\n  mineral [--config PATH] review reject <document:ID|asset:ID>\n  mineral [--config PATH] backup\n  mineral [--config PATH] backup status\n  mineral [--config PATH] backup verify\n  mineral [--config PATH] backup init\n  mineral [--config PATH] doctor"
     );
 }
 
@@ -635,6 +961,11 @@ fn open_stores(workspace: &Workspace) -> Result<(), Box<dyn Error>> {
     SqliteDeliveryProjectionStore::open(workspace.delivery_db())?;
     SqliteAssetObservationStore::open(workspace.asset_observations_db())?;
     SqliteSourceMaterializationStore::open(workspace.source_materializations_db())?;
+    // The backup store only exists for a workspace that backs up, so a workspace
+    // without a `backup:` section is never given an empty database it never uses.
+    if workspace.backup_enabled() {
+        SqliteBackupRunStore::open(workspace.backup_db())?;
+    }
     Ok(())
 }
 
@@ -1111,6 +1442,295 @@ fn resolve_review(
     Ok(())
 }
 
+/// Dispatches the backup subcommands, defaulting to one backup run.
+fn backup(workspace: Workspace, args: &[String]) -> Result<(), Box<dyn Error>> {
+    match args.first().map(String::as_str) {
+        None => backup_run(workspace),
+        Some("status") => backup_status(workspace),
+        Some("verify") => backup_verify(workspace),
+        Some("init") => backup_init(workspace),
+        Some(other) => Err(format!("unknown backup command: {other}").into()),
+    }
+}
+
+/// Runs one backup of a fresh Snapshot.
+///
+/// The Snapshot comes from the same helper `publish` uses, so a local directory and
+/// an R2 prefix both back up. Nothing remote happens until the intent is durable,
+/// and the report names the run, the Snapshot it froze and the ref it moved.
+fn backup_run(workspace: Workspace) -> Result<(), Box<dyn Error>> {
+    if !workspace.backup_enabled() {
+        println!("Backup is not configured for this workspace; nothing to do.");
+        return Ok(());
+    }
+    fs::create_dir_all(&workspace.config.state.path)?;
+    let content_store = LocalContentStore::new(workspace.cas());
+    let snapshot = snapshot(&workspace, &content_store)?;
+    let store = SqliteBackupRunStore::open(workspace.backup_db())?;
+    let repository_path = workspace.backup_git_repository()?;
+    let repository = GitBackupRepository::new(repository_path, content_store.clone())?;
+    let remote = GitRemoteAdapter::new(repository_path)?;
+    let lfs = workspace.backup_lfs_remote()?;
+    let target = workspace.backup_target()?;
+    let metadata = workspace.backup_commit_metadata()?;
+    let policy = TypeFirstBackupRepresentationPolicy;
+    // Wall-clock time is a runtime concern: it is frozen into the intent here and
+    // never read by the engine.
+    let created_at = TimestampMillis::from_system_time(SystemTime::now())
+        .ok_or("system time is before the Unix epoch")?;
+    let request = BackupApplicationRequest {
+        snapshot: &snapshot,
+        target: &target,
+        commit_metadata: &metadata,
+        policy: &policy,
+        created_at,
+    };
+    let run_ids = UuidBackupRunIdGenerator;
+    let outcome = match run_backup(
+        request,
+        &store,
+        &repository,
+        &remote,
+        &lfs,
+        &content_store,
+        &run_ids,
+    ) {
+        Ok(outcome) => outcome,
+        // A missing ref is one operator action away from a backup, so it gets the
+        // same short report as the other statuses before failing closed.
+        Err(BackupApplicationError::NoBaseCommit(target)) => {
+            println!(
+                "Backup\n  status: ref missing\n  ref: {} {}\n  snapshot: {}\n  files: {}",
+                target.remote_name(),
+                target.destination_ref(),
+                snapshot.id().get(),
+                snapshot.files().len()
+            );
+            return Err(format!(
+                "backup ref {} {} does not exist yet; run `mineral backup init` once to create it",
+                target.remote_name(),
+                target.destination_ref()
+            )
+            .into());
+        }
+        Err(error) => return Err(Box::new(error)),
+    };
+    render_backup_outcome(&outcome, &target, &lfs);
+    Ok(())
+}
+
+/// What one backup attempt did, in the operator's words.
+fn render_backup_outcome(
+    outcome: &BackupApplicationOutcome,
+    target: &GitRefTarget,
+    lfs: &LfsHttpRemote,
+) {
+    let status = match outcome.execution() {
+        BackupExecutionOutcome::BackedUp { .. } => "backed up",
+        BackupExecutionOutcome::AlreadyBackedUp { .. } => "already backed up",
+        BackupExecutionOutcome::RemoteChanged { .. } => "remote changed",
+    };
+    println!(
+        "Backup\n  status: {status}\n  run: {}\n  snapshot: {}\n  files: {}\n  lfs objects: {}\n  ref: {} {}\n  endpoint: {}",
+        outcome.run_id().get(),
+        outcome.snapshot_id().get(),
+        outcome.files(),
+        outcome.lfs_objects(),
+        target.remote_name(),
+        target.destination_ref(),
+        lfs.describe()
+    );
+}
+
+/// Reports the observed backup ref and the newest durable intent.
+///
+/// The only network call is the `ls-remote` behind the observation.
+fn backup_status(workspace: Workspace) -> Result<(), Box<dyn Error>> {
+    println!("Mineral backup");
+    if !workspace.backup_enabled() {
+        println!("  backup: not configured");
+        return Ok(());
+    }
+    let target = workspace.backup_target()?;
+    let repository = workspace.backup_git_repository()?;
+    match observe_backup_ref(repository, &target) {
+        Ok(RemoteRefState::Present { commit_oid }) => println!(
+            "  ref: {} {} ({})",
+            target.remote_name(),
+            target.destination_ref(),
+            commit_oid.as_str()
+        ),
+        Ok(RemoteRefState::Missing) => println!(
+            "  ref: {} {} (missing)",
+            target.remote_name(),
+            target.destination_ref()
+        ),
+        Err(error) => println!(
+            "  ref: {} {} (unavailable: {error})",
+            target.remote_name(),
+            target.destination_ref()
+        ),
+    }
+    let store = SqliteBackupRunStore::open(workspace.backup_db())?;
+    match store.list()?.last() {
+        Some(run) => println!(
+            "  newest run: {}\n  snapshot: {}\n  delivery: {}",
+            run.id().get(),
+            run.snapshot_id().get(),
+            run.delivery_sha256()
+        ),
+        None => println!("  newest run: none"),
+    }
+    Ok(())
+}
+
+/// Verifies that the backup ref can be restored byte-for-byte.
+fn backup_verify(workspace: Workspace) -> Result<(), Box<dyn Error>> {
+    if !workspace.backup_enabled() {
+        println!("Backup is not configured for this workspace; nothing to verify.");
+        return Ok(());
+    }
+    let repository_path = workspace.backup_git_repository()?;
+    let repository =
+        GitBackupRepository::new(repository_path, LocalContentStore::new(workspace.cas()))?;
+    let remote = GitRemoteAdapter::new(repository_path)?;
+    let lfs = workspace.backup_lfs_remote()?;
+    let target = workspace.backup_target()?;
+    let report = verify_backup(&repository, &remote, &lfs, &target, None)
+        .map_err(|error| format!("backup verification failed: {error}"))?;
+    println!(
+        "Backup verify\n  status: verified\n  commit: {}\n  files: {}\n  lfs objects: {}",
+        report.commit().as_str(),
+        report.files_verified(),
+        report.lfs_objects_verified()
+    );
+    Ok(())
+}
+
+/// Bootstraps the backup ref with one empty root commit.
+///
+/// The engine builds every backup on the commit the ref already holds, so the very
+/// first backup needs a base that is derived from nothing. This is the one place the
+/// host creates history rather than continuing it, and an existing ref is never
+/// touched.
+fn backup_init(workspace: Workspace) -> Result<(), Box<dyn Error>> {
+    if !workspace.backup_enabled() {
+        println!("Backup is not configured for this workspace; nothing to initialize.");
+        return Ok(());
+    }
+    let target = workspace.backup_target()?;
+    let repository = workspace.backup_git_repository()?;
+    match observe_backup_ref(repository, &target)? {
+        RemoteRefState::Present { commit_oid } => {
+            println!(
+                "Backup ref {} {} already exists at {}; nothing changed.",
+                target.remote_name(),
+                target.destination_ref(),
+                commit_oid.as_str()
+            );
+            Ok(())
+        }
+        RemoteRefState::Missing => {
+            let metadata = workspace.backup_commit_metadata()?;
+            // `Command::output` closes stdin, so `git mktree` reads an empty list and
+            // prints the empty tree the root commit points at.
+            let tree = backup_git_stdout(repository, &["mktree"])?;
+            let commit = backup_root_commit(repository, &tree, &metadata)?;
+            push_backup_root_commit(repository, &target, &commit)?;
+            println!(
+                "Initialized backup ref {} {} at {}.",
+                target.remote_name(),
+                target.destination_ref(),
+                commit.as_str()
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Runs a `git` command whose stdout is one value, failing closed on a non-zero exit.
+fn backup_git_stdout(repository: &Path, arguments: &[&str]) -> Result<String, Box<dyn Error>> {
+    let output = Command::new("git")
+        .current_dir(repository)
+        .args(arguments)
+        .output()
+        .map_err(|error| format!("git is unavailable: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git {} failed: {}",
+            arguments.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+/// Creates the empty root commit with the frozen backup identity.
+fn backup_root_commit(
+    repository: &Path,
+    tree: &str,
+    metadata: &GitCommitMetadata,
+) -> Result<GitCommitOid, Box<dyn Error>> {
+    let output = Command::new("git")
+        .current_dir(repository)
+        .env("GIT_AUTHOR_NAME", metadata.author_name())
+        .env("GIT_AUTHOR_EMAIL", metadata.author_email())
+        .env("GIT_COMMITTER_NAME", metadata.author_name())
+        .env("GIT_COMMITTER_EMAIL", metadata.author_email())
+        .args(["commit-tree", tree, "-m", metadata.message()])
+        .output()
+        .map_err(|error| format!("git is unavailable: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git commit-tree failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    let commit = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    Ok(GitCommitOid::new(commit)?)
+}
+
+/// Pushes the bootstrap commit onto the backup branch.
+fn push_backup_root_commit(
+    repository: &Path,
+    target: &GitRefTarget,
+    commit: &GitCommitOid,
+) -> Result<(), Box<dyn Error>> {
+    let refspec = format!("{}:{}", commit.as_str(), target.destination_ref());
+    let output = Command::new("git")
+        .current_dir(repository)
+        .args(["push", target.remote_name(), &refspec])
+        .output()
+        .map_err(|error| format!("git is unavailable: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git push failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Allocates backup-attempt identities from UUID v4 entropy.
+///
+/// A backup id is frozen into the durable intent before any remote effect, so it
+/// must be globally unique rather than sequential: a restart resuming an intent and
+/// a fresh run must never collide on one identity.
+struct UuidBackupRunIdGenerator;
+
+impl BackupRunIdGenerator for UuidBackupRunIdGenerator {
+    fn next_id(&self) -> BackupRunId {
+        let bytes = *uuid::Uuid::new_v4().as_bytes();
+        let mut prefix = [0_u8; 8];
+        prefix.copy_from_slice(&bytes[..8]);
+        BackupRunId::new(sqlite_positive_id(u64::from_be_bytes(prefix)))
+            .expect("UUID-derived id is nonzero")
+    }
+}
+
 fn doctor(workspace: Workspace) -> Result<(), Box<dyn Error>> {
     let mut failed = false;
     let mut check = |name: &str, ok: bool, detail: String| {
@@ -1186,6 +1806,31 @@ fn doctor(workspace: Workspace) -> Result<(), Box<dyn Error>> {
         "Git target",
         workspace.config.git.repository.is_dir(),
         workspace.config.git.repository.display().to_string(),
+    );
+    // Presence only: the backup check never touches the network, so `doctor` stays
+    // usable while the backup endpoint is unreachable.
+    check(
+        "backup",
+        true,
+        match workspace.config.backup.as_ref() {
+            Some(backup) if backup.enabled => {
+                let repository = backup
+                    .git
+                    .as_ref()
+                    .and_then(|git| git.repository.as_ref())
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "<unconfigured>".to_owned());
+                format!(
+                    "{repository} (lfs {})",
+                    if backup.lfs.as_ref().is_some_and(|lfs| lfs.enabled) {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    }
+                )
+            }
+            _ => "not configured".to_owned(),
+        },
     );
     let remote = Command::new("git")
         .current_dir(&workspace.config.git.repository)
@@ -1364,10 +2009,12 @@ mod tests {
         error::Error,
         fs,
         sync::atomic::{AtomicUsize, Ordering},
+        time::Duration,
     };
 
     use super::{
-        Config, DEFAULT_CONFIG, LocalContentStore, SourceType, Workspace, sqlite_positive_id,
+        Config, DEFAULT_CONFIG, LfsHttpConfig, LfsHttpRemote, LfsToken, LocalContentStore,
+        SourceType, Workspace, backup, sqlite_positive_id,
     };
 
     /// The three asset-target shapes a configuration can have: the native store,
@@ -1692,5 +2339,190 @@ mod tests {
             &r2_assets_block("other-bucket"),
         )
         .unwrap();
+    }
+
+    /// A workspace for the backup tests: one local source plus the caller's blocks.
+    fn configured_workspace(
+        source: &str,
+        assets: &str,
+        backup: &str,
+    ) -> Result<Workspace, Box<dyn Error>> {
+        let text = format!(
+            "source:\n{source}state:\n  path: ./.mineral\ngit:\n  repository: ./publication\n  remote: origin\n  reference: refs/heads/main\n  author_name: Bot\n  author_email: bot@example.invalid\n  message: Publish Mineral content\n{assets}{backup}review:\n  api_base_url: https://api.deepseek.com\n  markdown_model: deepseek-flash\n  asset_model: deepseek-flash\n  api_key_env: MINERAL_DEEPSEEK_API_KEY\n  timeout_seconds: 45\n"
+        );
+        static NEXT: AtomicUsize = AtomicUsize::new(1);
+        let directory = std::env::temp_dir().join(format!(
+            "mineral-cli-backup-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("mineral.yaml");
+        fs::write(&path, text).unwrap();
+        Workspace::load(path)
+    }
+
+    /// A valid backup block, so each refusal test can change exactly one field.
+    fn valid_backup_block() -> String {
+        "backup:\n  enabled: true\n  git:\n    repository: ./backup-repo\n    remote: origin\n    branch: refs/heads/mineral-backup\n    author_name: Mineral Backup\n    author_email: backup@example.invalid\n    message: Backup knowledge snapshot\n  lfs:\n    enabled: true\n    batch_url: https://github.com/owner/repo.git/info/lfs\n    username_env: MINERAL_BACKUP_TEST_LFS_USER\n    token_env: MINERAL_BACKUP_TEST_LFS_TOKEN\n    timeout_seconds: 300\n"
+            .to_owned()
+    }
+
+    /// A configured backup parses, its repository is absolutized like `git.repository`,
+    /// and its target and commit identity are usable without any network call.
+    #[test]
+    fn a_backup_section_parses_and_absolutizes_its_repository() {
+        let workspace = configured_workspace(
+            "  id: local-vault\n  path: ./vault\n",
+            "",
+            &valid_backup_block(),
+        )
+        .unwrap();
+
+        assert!(workspace.backup_enabled());
+        let backup = workspace.config.backup.as_ref().unwrap();
+        assert!(backup.enabled);
+        let git = backup.git.as_ref().unwrap();
+        let repository = git.repository.as_ref().unwrap();
+        assert!(repository.is_absolute(), "{}", repository.display());
+        assert!(
+            repository.ends_with("backup-repo"),
+            "{}",
+            repository.display()
+        );
+        assert_eq!(
+            git.branch.as_deref(),
+            Some("refs/heads/mineral-backup"),
+            "the fully qualified branch is stored verbatim"
+        );
+        assert_eq!(
+            workspace.backup_target().unwrap().destination_ref(),
+            "refs/heads/mineral-backup"
+        );
+        let metadata = workspace.backup_commit_metadata().unwrap();
+        assert_eq!(metadata.author_name(), "Mineral Backup");
+        assert_eq!(metadata.message(), "Backup knowledge snapshot");
+    }
+
+    /// An unusable enabled backup section is refused while the workspace loads, so no
+    /// Snapshot, ref or LFS object is ever touched. A disabled section stays inert.
+    #[test]
+    fn an_unusable_backup_section_is_refused_while_the_workspace_loads() {
+        let git = "  git:\n    repository: ./backup-repo\n    remote: origin\n    branch: refs/heads/mineral-backup\n";
+        let lfs = "  lfs:\n    enabled: true\n    batch_url: https://github.com/owner/repo.git/info/lfs\n    username_env: MINERAL_BACKUP_TEST_LFS_USER\n    token_env: MINERAL_BACKUP_TEST_LFS_TOKEN\n";
+        let source = "  id: local-vault\n  path: ./vault\n";
+        let cases = [
+            (
+                "missing branch",
+                "backup:\n  enabled: true\n  git:\n    repository: ./backup-repo\n    remote: origin\n",
+                "backup.git.branch",
+            ),
+            (
+                "empty branch",
+                "backup:\n  enabled: true\n  git:\n    repository: ./backup-repo\n    remote: origin\n    branch: \"\"\n",
+                "backup.git.branch",
+            ),
+            (
+                "unqualified branch",
+                "backup:\n  enabled: true\n  git:\n    repository: ./backup-repo\n    remote: origin\n    branch: main\n",
+                "backup.git.branch",
+            ),
+            (
+                "missing remote",
+                "backup:\n  enabled: true\n  git:\n    repository: ./backup-repo\n    branch: refs/heads/mineral-backup\n",
+                "backup.git.remote",
+            ),
+            (
+                "missing repository",
+                "backup:\n  enabled: true\n  git:\n    remote: origin\n    branch: refs/heads/mineral-backup\n",
+                "backup.git.repository",
+            ),
+            ("missing git", "backup:\n  enabled: true\n", "backup.git"),
+            (
+                "non-http batch url",
+                "backup:\n  enabled: true\n  git:\n    repository: ./backup-repo\n    remote: origin\n    branch: refs/heads/mineral-backup\n  lfs:\n    enabled: true\n    batch_url: file:///tmp/lfs\n    username_env: U\n    token_env: T\n",
+                "backup.lfs.batch_url",
+            ),
+            (
+                "empty username variable name",
+                "backup:\n  enabled: true\n  git:\n    repository: ./backup-repo\n    remote: origin\n    branch: refs/heads/mineral-backup\n  lfs:\n    enabled: true\n    batch_url: https://github.com/owner/repo.git/info/lfs\n    username_env: \"\"\n    token_env: T\n",
+                "backup.lfs.username_env",
+            ),
+            (
+                "empty token variable name",
+                "backup:\n  enabled: true\n  git:\n    repository: ./backup-repo\n    remote: origin\n    branch: refs/heads/mineral-backup\n  lfs:\n    enabled: true\n    batch_url: https://github.com/owner/repo.git/info/lfs\n    username_env: U\n    token_env: \"\"\n",
+                "backup.lfs.token_env",
+            ),
+        ];
+        for (name, backup, fragment) in cases {
+            let error = configured_workspace(source, "", backup)
+                .err()
+                .map(|error| error.to_string())
+                .unwrap_or_default();
+            assert!(error.contains(fragment), "{name}: {error}");
+        }
+        // The unchanged fields are exactly what the refusals above prove: the same
+        // block without the one changed field loads.
+        configured_workspace(source, "", &format!("backup:\n  enabled: true\n{git}{lfs}")).unwrap();
+        // A disabled section is inert: it may omit everything an enabled one needs.
+        configured_workspace(source, "", "backup:\n  enabled: false\n").unwrap();
+    }
+
+    /// A workspace without a `backup:` section still parses, and the command is a
+    /// successful no-op rather than an error.
+    #[test]
+    fn a_workspace_without_a_backup_section_keeps_working() {
+        let workspace = source_workspace("  id: local-vault\n  path: ./vault\n", "").unwrap();
+        assert!(workspace.config.backup.is_none());
+        assert!(!workspace.backup_enabled());
+
+        backup(workspace, &[]).unwrap();
+    }
+
+    /// Credentials never reach a configuration dump or an endpoint report.
+    ///
+    /// Edition 2024 makes writing to the process environment `unsafe`, and this
+    /// project forbids `unsafe`, so the environment value is supplied directly to the
+    /// same adapter a backup builds. The redaction is identical: only the variable
+    /// *name* may appear, and only the username may appear in `describe()`.
+    #[test]
+    fn lfs_credentials_never_appear_in_a_config_dump_or_an_endpoint_report() {
+        let workspace = configured_workspace(
+            "  id: local-vault\n  path: ./vault\n",
+            "",
+            &valid_backup_block(),
+        )
+        .unwrap();
+        let dump = format!("{:?}", workspace.config);
+        assert!(dump.contains("MINERAL_BACKUP_TEST_LFS_TOKEN"), "{dump}");
+        assert!(!dump.contains("super-secret-token"), "{dump}");
+
+        // A named-but-unset variable fails closed by name, never by value.
+        let unset = configured_workspace(
+            "  id: local-vault\n  path: ./vault\n",
+            "",
+            "backup:\n  enabled: true\n  git:\n    repository: ./backup-repo\n    remote: origin\n    branch: refs/heads/mineral-backup\n  lfs:\n    enabled: true\n    batch_url: https://github.com/owner/repo.git/info/lfs\n    username_env: MINERAL_BACKUP_TEST_UNSET_USER\n    token_env: MINERAL_BACKUP_TEST_UNSET_TOKEN\n",
+        )
+        .unwrap();
+        let error = unset
+            .backup_lfs_remote()
+            .err()
+            .expect("an unset credential variable must be refused")
+            .to_string();
+        assert!(error.contains("MINERAL_BACKUP_TEST_UNSET_USER"), "{error}");
+
+        let secret = "super-secret-token";
+        let config = LfsHttpConfig::new(
+            "https://github.com/owner/repo.git/info/lfs",
+            "mineral-backup",
+            LfsToken::new(secret).unwrap(),
+            Duration::from_secs(300),
+        )
+        .unwrap();
+        assert!(!config.describe().contains(secret), "{}", config.describe());
+        assert!(!format!("{config:?}").contains(secret));
+        let remote = LfsHttpRemote::new(config).unwrap();
+        assert!(remote.describe().contains("mineral-backup"));
+        assert!(!remote.describe().contains(secret), "{}", remote.describe());
     }
 }

@@ -1213,6 +1213,32 @@ mod tests {
     }
 
     #[test]
+    fn a_source_that_is_not_the_declared_size_is_refused_before_any_put() {
+        let server = FakeServer::start();
+        let object = object_for(BODY);
+        let remote = server.remote();
+        let plan = remote
+            .prepare_upload(std::slice::from_ref(&object))
+            .unwrap();
+        // A truncated CAS blob: the count is checked before the request, so a body
+        // that would lie about its length is never sent.
+        let mut source = buffered(&object, &BODY[..BODY.len() - 1]);
+
+        let error = remote
+            .upload(&object, &mut source, plan.uploads()[0].action())
+            .unwrap_err();
+
+        assert!(
+            matches!(error, LfsHttpError::SizeMismatch { .. }),
+            "{error}"
+        );
+        assert!(
+            server.lfs.requests_for("PUT", "/upload/").is_empty(),
+            "a size mismatch must not reach the endpoint"
+        );
+    }
+
+    #[test]
     fn a_verify_action_is_called_once_with_an_empty_json_body() {
         let server = FakeServer::start();
         server.lfs.offer_verify.store(true, Ordering::Relaxed);

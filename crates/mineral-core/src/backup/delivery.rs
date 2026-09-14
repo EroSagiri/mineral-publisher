@@ -751,6 +751,18 @@ mod tests {
         assert_eq!(delivery.files().len(), 2);
     }
 
+    /// Renaming a binary changes the tree and the delivery identity, but not the
+    /// object the endpoint must hold.
+    #[test]
+    fn a_rename_never_requires_a_new_lfs_object() {
+        let (before, _) = delivery(&[("img/a.jpg", b"payload")]);
+        let (after, _) = delivery(&[("img/renamed.jpg", b"payload")]);
+
+        assert_ne!(before.delivery_sha256(), after.delivery_sha256());
+        assert_eq!(before.required_lfs_objects(), after.required_lfs_objects());
+        assert_eq!(after.required_lfs_objects().len(), 1);
+    }
+
     #[test]
     fn a_manifest_pointer_round_trip_is_verified() {
         let (delivery, store) = delivery(&[("img/a.jpg", b"payload")]);

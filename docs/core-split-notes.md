@@ -204,6 +204,48 @@ S7.1 增加 **R2 Source**：除本地目录树之外，source 现在可以是一
 * `public.exclude`、privacy、review、DeliveryProjection、R2 publication 完全在 source 之后，
   R2 source adapter 里没有任何 public scope / privacy / review / publication 判断。
 
+S7.2 增加 **Private Backup Pipeline**：与 Public Pipeline 共用 Source / Snapshot / CAS /
+Git 基础设施，从 Projection 起分叉，目标是"完整、可恢复、字节级忠实"。不做 URL rewrite、
+不过 `public.exclude`、不做 privacy / AI review / asset review / sanitization、不删 EXIF、
+不改原始 bytes：私有文件、未公开文件、原始图片都必须在备份里。
+
+* `BackupProjection` 直接由 stabilized Snapshot 构建：每个 SnapshotFile 恰好一次、
+  canonical 顺序、identity 覆盖 snapshot id 与每条的 path/sha256/size；
+  `BackupProjectionFile.source_sha256 == SnapshotFile.sha256`、`size == SnapshotFile.size`
+  是模型层不变量，不经过任何 policy / review / sanitization。
+* `BackupDeliveryProjection` 决定 representation（Git blob vs Git LFS），冻结
+  `required_lfs_objects`、pointer blob、受管 `.gitattributes` blob、manifest blob 与
+  delivery identity；`BackupRepresentationPolicy` 按**类型**（扩展名表）而不是 size 选择，
+  避免同一路径在历史上反复切换 Git/LFS。
+* 目录结构：Snapshot 的 `foo/bar.md` 统一平移到 `vault/foo/bar.md`，仓库根放 Mineral 受管的
+  `.gitattributes`（`* -text` + 各 LFS 扩展名 filter）与 `.mineral-backup/manifest`
+  （确定性文本：format 版本、snapshot、source、projection identity、每 path 的
+  storage/sha256/size；没有任何 credential / 签名 URL / token）。用户自己的
+  `vault/.gitattributes` 只是普通备份内容。
+* LFS pointer 是纯函数：`version https://git-lfs.github.com/spec/v1` +
+  `oid sha256:<SnapshotFile.sha256>` + `size <SnapshotFile.size>` + 恰好一个换行；
+  pointer 自身作为 derived blob 存进 CAS，Git 树里 binary path 写的是 pointer blob，
+  所以仓库永远只存很小的指针。**Invariant 1：LFS OID == Snapshot/CAS SHA-256**；
+  **Invariant 2：LFS size == Snapshot file size**（两者都冻结在 delivery 与 BackupRun 里，
+  不使用第二套 binary identity，也不引入 LFS 专属 SHA 类型）。
+* `LfsRemote` port 在 core，HTTP / Batch API 只在 host：`prepare_upload`（batch
+  `operation=upload`，端点已有的对象一个都不重传）、`upload`（从 CAS 以 64 KiB 为界流式读取，
+  边读边算 SHA-256 与字节数，**端点接受之后**再与 `RequiredLfsObject` 比对，损坏的 CAS 字节
+  不会变成"自称是它"的远端对象）、`verify`（端点给了才做）。
+* **Invariant 3（顺序）**：projection → delivery → tree → commit object → **持久化
+  BackupRun** → `prepare_upload` → 只上传缺失对象 → verify → **再次确认 required 全部存在**
+  → 最后才 `observe_ref` + 精确 `--force-with-lease` CAS。Git backup ref 绝不允许指向一个
+  required LFS object 不完整的 commit；上传/verify/缺 blob/尺寸不符/gate 不通过一律
+  fail closed 且 ref 不动。远端已等于 desired commit → `AlreadyBackedUp`（不会重建 commit、
+  不会重传 LFS）；CAS 答案丢失 → 重新 observe 恢复。
+* durable：独立 `backup-runs.sqlite3`（schema v1），一列一行地保存 snapshot id、
+  projection/delivery identity、base/desired commit、target、`CommitSpecWire` 编码的 commit
+  spec，以及 `BackupDeliveryWire` 编码的完整 delivery；重启后从冻结事实 resume，
+  而不是按"今天的配置"重新推导。
+* 恢复路径就是标准路径：`git clone` + `git lfs pull`，真正的 vault 在 `vault/`；
+  `mineral backup verify` 会重新读 manifest 与 tree（path 集一致）、对每个 Git blob 重新
+  哈希、对每个 pointer 校验 oid/size、并向端点确认所有 required LFS object 仍存在。
+
 同一轮还修掉一个 durable identity 的漏洞：`delivery_sha256` 当初只哈希
 "交付的文本树 + 已发布资产"，却没有覆盖它自己存储的 snapshot provenance
 （`snapshot_id`、`managed_root`、每篇文档的 `source_path`/`source_sha256`）。于是
