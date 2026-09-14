@@ -136,6 +136,7 @@ review:
 #     author_email: backup@example.invalid
 #     message: Backup knowledge snapshot
 #   lfs:
+#     # Required whenever the backup is enabled: binary objects live in Git LFS.
 #     enabled: true
 #     # Omit batch_url to derive it from the Git remote URL, or name the endpoint.
 #     batch_url: https://github.com/<owner>/<repo>.git/info/lfs
@@ -494,39 +495,41 @@ impl Workspace {
             GitRefTarget::new(remote, branch).map_err(|error| {
                 format!("backup.git.branch must be a fully qualified safe ref: {error}")
             })?;
-            if let Some(lfs) = &backup.lfs
-                && lfs.enabled
+            // A backup always stores binary objects through Git LFS, so the engine
+            // cannot run one without an endpoint. That is a configuration fact, not a
+            // run-time discovery: a workspace that could never complete a backup is
+            // refused while it is loaded, exactly like an unusable publication target.
+            let lfs = backup.lfs.as_ref().filter(|lfs| lfs.enabled).ok_or(
+                "backup.lfs must be configured and enabled when backup is enabled; \
+                 binary objects are stored in Git LFS",
+            )?;
+            // Only the variable *names* are validated here. The credential values are
+            // read from the environment at run time and never stored, recorded or
+            // printed.
+            if lfs
+                .username_env
+                .as_deref()
+                .is_none_or(|name| name.trim().is_empty())
             {
-                // Only the variable *names* are validated here. The credential
-                // values are read from the environment at run time and never
-                // stored, recorded or printed.
-                if lfs
-                    .username_env
-                    .as_deref()
-                    .is_none_or(|name| name.trim().is_empty())
-                {
-                    return Err(
-                        "backup.lfs.username_env must be non-empty when backup.lfs is enabled"
-                            .into(),
-                    );
-                }
-                if lfs
-                    .token_env
-                    .as_deref()
-                    .is_none_or(|name| name.trim().is_empty())
-                {
-                    return Err(
-                        "backup.lfs.token_env must be non-empty when backup.lfs is enabled".into(),
-                    );
-                }
-                if let Some(url) = &lfs.batch_url
-                    && !is_absolute_http_url(url)
-                {
-                    return Err(format!(
-                        "backup.lfs.batch_url must be an absolute http(s) URL: {url}"
-                    )
-                    .into());
-                }
+                return Err(
+                    "backup.lfs.username_env must be non-empty when backup.lfs is enabled".into(),
+                );
+            }
+            if lfs
+                .token_env
+                .as_deref()
+                .is_none_or(|name| name.trim().is_empty())
+            {
+                return Err(
+                    "backup.lfs.token_env must be non-empty when backup.lfs is enabled".into(),
+                );
+            }
+            if let Some(url) = &lfs.batch_url
+                && !is_absolute_http_url(url)
+            {
+                return Err(
+                    format!("backup.lfs.batch_url must be an absolute http(s) URL: {url}").into(),
+                );
             }
         }
         // A source and a publication target that share one namespace on one bucket
@@ -738,6 +741,10 @@ impl Workspace {
     }
 
     /// The enabled LFS endpoint description, if this workspace has one.
+    /// The enabled LFS block.
+    ///
+    /// `Workspace::load` already refuses an enabled backup without one, so this is a
+    /// defensive guard rather than the place the requirement is discovered.
     fn backup_lfs(&self) -> Result<&BackupLfsConfig, Box<dyn Error>> {
         self.config
             .backup
@@ -2438,6 +2445,16 @@ mod tests {
                 "backup.git.repository",
             ),
             ("missing git", "backup:\n  enabled: true\n", "backup.git"),
+            (
+                "missing lfs block",
+                "backup:\n  enabled: true\n  git:\n    repository: ./backup-repo\n    remote: origin\n    branch: refs/heads/mineral-backup\n",
+                "backup.lfs",
+            ),
+            (
+                "disabled lfs block",
+                "backup:\n  enabled: true\n  git:\n    repository: ./backup-repo\n    remote: origin\n    branch: refs/heads/mineral-backup\n  lfs:\n    enabled: false\n    username_env: U\n    token_env: T\n",
+                "backup.lfs",
+            ),
             (
                 "non-http batch url",
                 "backup:\n  enabled: true\n  git:\n    repository: ./backup-repo\n    remote: origin\n    branch: refs/heads/mineral-backup\n  lfs:\n    enabled: true\n    batch_url: file:///tmp/lfs\n    username_env: U\n    token_env: T\n",
