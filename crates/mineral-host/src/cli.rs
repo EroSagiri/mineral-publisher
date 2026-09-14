@@ -37,7 +37,7 @@ use mineral_publisher::{
     },
     publisher::{
         GitCommitMetadata, GitCommitOid, GitPublicationExecution, GitRefTarget, GitRemoteAdapter,
-        PublishRunStore, PublishTargetId, RemoteRefState, UuidPublishRunIdGenerator,
+        PublishRunStore, RemoteRefState, UuidPublishRunIdGenerator,
         UuidRemoteObservationIdGenerator,
     },
     reviewer::{
@@ -55,521 +55,59 @@ use mineral_publisher::{
         SqliteSourceMaterializationStore,
     },
     workflow::{
-        ASSET_OBJECT_KEY_PREFIX, AssetDeliveryConfig, AssetReviewCandidate, AssetReviewRunId,
-        AssetReviewRunIdGenerator, AssetReviewRunStore, AssetReviewer, AssetReviewerError,
-        AssetReviewerReport, ExplicitHumanReviewSelection, HumanReviewAttempt, HumanReviewDecision,
-        HumanReviewId, HumanReviewRecordError, HumanReviewResolution, PublicExclusionRules,
-        PublicationApplication, PublicationApplicationOutcome, PublicationApplicationRequest,
-        ReviewRunIdGenerator,
+        AssetReviewCandidate, AssetReviewRunId, AssetReviewRunIdGenerator, AssetReviewRunStore,
+        AssetReviewer, AssetReviewerError, AssetReviewerReport, ExplicitHumanReviewSelection,
+        HumanReviewAttempt, HumanReviewDecision, HumanReviewId, HumanReviewRecordError,
+        HumanReviewResolution, PublicExclusionRules, PublicationApplication,
+        PublicationApplicationOutcome, PublicationApplicationRequest, ReviewRunIdGenerator,
     },
 };
-use serde::Deserialize;
 use sha2::{Digest, Sha256 as Sha256Hasher};
 
-const DEFAULT_CONFIG: &str = r#"source:
-  # One active source. `type` is optional and defaults to a local directory tree, so
-  # every configuration written before R2 sources existed keeps working unchanged.
-  type: local
-  id: local-vault
-  path: ./vault
-  # An R2 source instead reads one managed prefix of a bucket. It needs a non-empty
-  # prefix (never the whole bucket) and the same credential mechanism as the asset
-  # target: the secret is named here, never written here.
-  # type: r2
-  # r2:
-  #   endpoint: https://<account>.r2.cloudflarestorage.com
-  #   bucket: mineral-vault
-  #   prefix: vault/
-  #   access_key_id: <access key id>
-  #   secret_access_key_env: MINERAL_R2_SECRET_ACCESS_KEY
-  #   region: auto
-  #   timeout_seconds: 300
-state:
-  path: ./.mineral
-git:
-  repository: ./publication
-  remote: origin
-  reference: refs/heads/main
-  author_name: Mineral Publisher
-  author_email: publisher@example.invalid
-  message: Publish Mineral content
-assets:
-  public_base_url: https://assets.example.com
-  # Exactly one target: the native store on this machine, or an S3-compatible
-  # bucket. The secret key is never written here, only the variable that holds it.
-  target_path: ./asset-target
-  # r2:
-  #   endpoint: https://<account>.r2.cloudflarestorage.com
-  #   bucket: mineral-assets
-  #   access_key_id: <access key id>
-  #   secret_access_key_env: MINERAL_R2_SECRET_ACCESS_KEY
-  #   region: auto
-  #   timeout_seconds: 300
-public:
-  # Source paths that stay in the Snapshot and in the content store but never enter
-  # the public candidate set: no privacy scan, no review, no publication.
-  exclude: []
-  # exclude:
-  #   - "private/**"
-  #   - "drafts/**"
-  #   - "secret.md"
-  #   - "notes/internal.md"
-  #   - "**/*.tmp"
-review:
-  api_base_url: https://api.deepseek.com
-  markdown_model: deepseek-flash
-  asset_model: deepseek-flash
-  api_key_env: MINERAL_DEEPSEEK_API_KEY
-  timeout_seconds: 45
-  markdown_concurrency: 4
-  asset_concurrency: 2
-# An optional private backup of every Snapshot, byte-faithful and restorable.
-# It is absent here because every workspace worked before backups existed and
-# must keep working unchanged. Credentials are named here, never written here.
-# backup:
-#   enabled: true
-#   git:
-#     repository: ./backup-repo
-#     remote: origin
-#     branch: refs/heads/mineral-backup
-#     author_name: Mineral Backup
-#     author_email: backup@example.invalid
-#     message: Backup knowledge snapshot
-#   lfs:
-#     # Required whenever the backup is enabled: binary objects live in Git LFS.
-#     enabled: true
-#     # Omit batch_url to derive it from the Git remote URL, or name the endpoint.
-#     batch_url: https://github.com/<owner>/<repo>.git/info/lfs
-#     username_env: MINERAL_BACKUP_LFS_USER
-#     token_env: MINERAL_BACKUP_LFS_TOKEN
-#     timeout_seconds: 300
-"#;
+use mineral_publisher::config::model::ReviewConfig;
+use mineral_publisher::config::{
+    ConfigFormat, DEFAULT_BACKUP_AUTHOR_EMAIL, DEFAULT_BACKUP_AUTHOR_NAME,
+    DEFAULT_BACKUP_LFS_TIMEOUT_SECONDS, DEFAULT_BACKUP_MESSAGE, SourceType, ValidatedConfig,
+    load as load_config,
+};
 
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Config {
-    source: SourceConfig,
-    state: StateConfig,
-    git: GitConfig,
-    review: ReviewConfig,
-    /// Where delivered binary assets are served from. Optional in the file so
-    /// `status`, `doctor` and `review` keep working for workspaces created before
-    /// delivery existed; publication fails closed when it is absent.
-    #[serde(default)]
-    assets: Option<AssetsConfig>,
-    /// Which source paths the public publication may consider. Absent means the
-    /// scope excludes nothing, which is exactly how every earlier workspace behaved.
-    #[serde(default)]
-    public: Option<PublicConfig>,
-    /// The optional private backup target. Absent means this workspace never backs
-    /// up, which is exactly how every workspace behaved before backups existed.
-    #[serde(default)]
-    backup: Option<BackupConfig>,
-}
+/// The YAML template, which the tests exercise as the shape of a workspace.
+#[cfg(test)]
+use mineral_publisher::config::DEFAULT_CONFIG;
+/// The raw configuration model, under the name this binary and its tests have
+/// always used for it. It is only ever held inside a validated configuration.
+#[cfg(test)]
+use mineral_publisher::config::RawConfig as Config;
 
-/// Which kind of namespace one workspace reads its source from.
-///
-/// It defaults to a local directory tree, which is what every workspace written
-/// before R2 sources existed means.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum SourceType {
-    #[default]
-    Local,
-    R2,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SourceConfig {
-    id: String,
-    #[serde(default, rename = "type")]
-    kind: Option<SourceType>,
-    /// The local source root. Required for a local source, and refused for an R2
-    /// source, so a workspace cannot silently keep reading a directory.
-    #[serde(default)]
-    path: Option<PathBuf>,
-    #[serde(default)]
-    r2: Option<SourceR2Config>,
-}
-
-impl SourceConfig {
-    fn kind(&self) -> SourceType {
-        self.kind.unwrap_or_default()
-    }
-}
-
-/// The connection one R2 source reads through.
-///
-/// The shape mirrors `assets.r2` on purpose: the same endpoint, bucket and
-/// credential mechanism reach the same kind of store, whether this engine is
-/// reading source objects or writing published ones.
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SourceR2Config {
-    endpoint: String,
-    bucket: String,
-    /// The one managed namespace this source reads. Required and non-empty.
-    prefix: String,
-    access_key_id: String,
-    secret_access_key_env: String,
-    #[serde(default)]
-    region: Option<String>,
-    #[serde(default)]
-    timeout_seconds: Option<u64>,
-}
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct StateConfig {
-    path: PathBuf,
-}
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct GitConfig {
-    repository: PathBuf,
-    remote: String,
-    reference: String,
-    /// Stable audit identity of the logical publication target. When it is
-    /// absent the derived `{remote}:{reference}` identity is used, which is also
-    /// what publication runs recorded before this field existed are migrated to.
-    #[serde(default)]
-    publish_target_id: Option<String>,
-    author_name: String,
-    author_email: String,
-    message: String,
-}
-
-impl GitConfig {
-    fn publish_target_id(&self) -> Result<PublishTargetId, Box<dyn Error>> {
-        let identity = match &self.publish_target_id {
-            Some(identity) => identity.clone(),
-            None => format!("{}:{}", self.remote, self.reference),
-        };
-        Ok(PublishTargetId::new(identity)?)
-    }
-}
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct AssetsConfig {
-    /// Absolute HTTPS base URL every published asset URL is built from.
-    public_base_url: String,
-    /// Where the native runtime places published objects.
-    #[serde(default)]
-    target_path: Option<PathBuf>,
-    /// An S3-compatible bucket, for runtimes that publish to object storage.
-    #[serde(default)]
-    r2: Option<R2Config>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct R2Config {
-    /// Absolute endpoint of the service, without the bucket and without a
-    /// trailing slash.
-    endpoint: String,
-    bucket: String,
-    access_key_id: String,
-    /// The name of the environment variable that holds the secret access key.
-    /// The key itself never belongs in a configuration file.
-    secret_access_key_env: String,
-    /// R2 accepts `auto`; a generic S3 endpoint may need its own region.
-    #[serde(default)]
-    region: Option<String>,
-    #[serde(default)]
-    timeout_seconds: Option<u64>,
-}
-/// The public publication scope.
-///
-/// The rules are validated while the workspace is loaded, so an unusable pattern
-/// stops the run before it can publish anything, and the canonical rules are what
-/// the publication records as its provenance.
-#[derive(Clone, Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PublicConfig {
-    #[serde(default)]
-    exclude: Vec<String>,
-}
-
-/// Defaults for a backup commit identity the configuration does not spell out.
-const DEFAULT_BACKUP_AUTHOR_NAME: &str = "Mineral Backup";
-const DEFAULT_BACKUP_AUTHOR_EMAIL: &str = "backup@example.invalid";
-const DEFAULT_BACKUP_MESSAGE: &str = "Backup knowledge snapshot";
-/// How long one backup LFS request may take when the configuration stays silent.
-const DEFAULT_BACKUP_LFS_TIMEOUT_SECONDS: u64 = 300;
-
-/// The optional private backup target.
-///
-/// A backup stores a byte-faithful restorable copy of every Snapshot in a Git
-/// repository, with binary objects in Git LFS. The section is optional and defaults
-/// to disabled, so a workspace that never mentions it behaves exactly as it did
-/// before backups existed, and a section present only to document a future target
-/// cannot start one by accident.
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct BackupConfig {
-    /// Whether this workspace backs up at all. Validation and execution only ever
-    /// happen for an enabled section; a disabled one is inert.
-    #[serde(default)]
-    enabled: bool,
-    #[serde(default)]
-    git: Option<BackupGitConfig>,
-    #[serde(default)]
-    lfs: Option<BackupLfsConfig>,
-}
-
-/// The Git repository one backup writes to.
-///
-/// Every field is optional at the type level because a disabled section may omit
-/// them; an enabled section requires the repository, and the remote, branch and
-/// commit identity are validated or defaulted while the workspace loads.
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct BackupGitConfig {
-    /// The local Git repository holding the backup ref. Required and absolutized
-    /// when the backup is enabled, exactly like `git.repository`.
-    #[serde(default)]
-    repository: Option<PathBuf>,
-    #[serde(default)]
-    remote: Option<String>,
-    /// The fully qualified destination ref, for example `refs/heads/mineral-backup`.
-    #[serde(default)]
-    branch: Option<String>,
-    #[serde(default)]
-    author_name: Option<String>,
-    #[serde(default)]
-    author_email: Option<String>,
-    #[serde(default)]
-    message: Option<String>,
-}
-
-/// The Git LFS endpoint binary backup objects are stored through.
-///
-/// Only the *names* of the credential variables live here: the username and token
-/// values are read from the environment when a backup runs and never reach a
-/// configuration field, a durable record or a report.
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct BackupLfsConfig {
-    #[serde(default)]
-    enabled: bool,
-    /// The endpoint root. Absent means it is derived from the Git remote URL.
-    #[serde(default)]
-    batch_url: Option<String>,
-    /// The name of the environment variable holding the LFS username.
-    #[serde(default)]
-    username_env: Option<String>,
-    /// The name of the environment variable holding the LFS token.
-    #[serde(default)]
-    token_env: Option<String>,
-    #[serde(default)]
-    timeout_seconds: Option<u64>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ReviewConfig {
-    api_base_url: String,
-    markdown_model: String,
-    asset_model: String,
-    api_key_env: String,
-    timeout_seconds: u64,
-    #[serde(default = "default_markdown_concurrency")]
-    markdown_concurrency: usize,
-    #[serde(default = "default_asset_concurrency")]
-    asset_concurrency: usize,
-}
-
-fn default_markdown_concurrency() -> usize {
-    4
-}
-
-fn default_asset_concurrency() -> usize {
-    2
-}
-
+/// One workspace this binary can act on: a validated configuration plus the
+/// adapters built from it.
 #[derive(Debug)]
 struct Workspace {
-    config: Config,
+    config: ValidatedConfig,
     config_path: PathBuf,
 }
 
+/// Reading a setting goes through the validated configuration, so a caller that
+/// holds a `Workspace` never has to ask whether the configuration is usable.
+impl std::ops::Deref for Workspace {
+    type Target = ValidatedConfig;
+
+    fn deref(&self) -> &Self::Target {
+        &self.config
+    }
+}
+
 impl Workspace {
+    /// Loads, validates and normalizes one configuration file.
+    ///
+    /// The work itself belongs to the configuration layer; this is the seam that
+    /// hands a file to it and keeps the path for the messages that name it.
     fn load(path: PathBuf) -> Result<Self, Box<dyn Error>> {
-        let bytes = fs::read_to_string(&path)?;
-        let mut config: Config = serde_yaml_ng::from_str(&bytes)?;
-        if config.review.markdown_concurrency == 0 || config.review.asset_concurrency == 0 {
-            return Err("review concurrency must be at least 1".into());
-        }
-        let base = path.parent().unwrap_or_else(|| Path::new("."));
-        // One source, chosen explicitly. A local source still requires its root, and
-        // an R2 source requires a managed prefix and must not name a local root:
-        // whichever one is configured decides where the Snapshot comes from.
-        match config.source.kind() {
-            SourceType::Local => {
-                if config.source.r2.is_some() {
-                    return Err(
-                        "source.r2 is configured but source.type is local; set type: r2".into(),
-                    );
-                }
-                let Some(source_path) = config.source.path.clone() else {
-                    return Err("source.path is required for a local source".into());
-                };
-                config.source.path = Some(absolute(base, &source_path)?);
-            }
-            SourceType::R2 => {
-                if config.source.path.is_some() {
-                    return Err(
-                        "source.path is not used by an R2 source; configure source.r2 instead"
-                            .into(),
-                    );
-                }
-                let r2 = config
-                    .source
-                    .r2
-                    .as_ref()
-                    .ok_or("source.type is r2 but source.r2 is not configured")?;
-                // The prefix is validated, and stored back in canonical form, before
-                // anything reads the namespace: an unusable namespace must stop the
-                // run, not a listing in the middle of one.
-                let prefix = R2SourcePrefix::new(&r2.prefix)
-                    .map_err(|error| format!("source.r2.prefix is unusable: {error}"))?;
-                config.source.r2.as_mut().expect("checked above").prefix =
-                    prefix.as_str().to_owned();
-            }
-        }
-        config.state.path = absolute(base, &config.state.path)?;
-        config.git.repository = absolute(base, &config.git.repository)?;
-        // Public scope is validated with the rest of the configuration: an unusable
-        // rule must be reported before a publication is under way, not during one.
-        if let Some(public) = &config.public {
-            PublicExclusionRules::new(public.exclude.clone())
-                .map_err(|error| format!("public.exclude contains an unusable rule: {error}"))?;
-        }
-        if let Some(assets) = &mut config.assets {
-            // One target, chosen explicitly: a workspace that names both (or
-            // neither) must fail before a publication picks one for it.
-            match (&assets.target_path, &assets.r2) {
-                (Some(_), Some(_)) => {
-                    return Err(
-                        "assets.target_path and assets.r2 are both configured; choose one".into(),
-                    );
-                }
-                (None, None) => {
-                    return Err(
-                        "assets must configure either target_path or r2 before publishing".into(),
-                    );
-                }
-                _ => {}
-            }
-            if let Some(target_path) = &assets.target_path {
-                assets.target_path = Some(absolute(base, target_path)?);
-            }
-        }
-        // The private backup target is validated once, while the workspace is
-        // loaded, so an unusable destination stops the run before a Snapshot is even
-        // taken. A disabled section is inert: it may omit everything, which is what
-        // makes `enabled: false` a safe way to keep a target documented.
-        if let Some(backup) = &mut config.backup
-            && backup.enabled
-        {
-            let git = backup
-                .git
-                .as_mut()
-                .ok_or("backup.git must be configured when backup is enabled")?;
-            let repository = git
-                .repository
-                .clone()
-                .filter(|path| !path.as_os_str().is_empty())
-                .ok_or("backup.git.repository is required when backup is enabled")?;
-            git.repository = Some(absolute(base, &repository)?);
-            let remote = git.remote.as_deref().unwrap_or_default();
-            if remote.trim().is_empty() || remote.contains(['\0', '\n', '\r']) {
-                return Err("backup.git.remote must be a non-empty name".into());
-            }
-            let branch = git.branch.as_deref().unwrap_or_default();
-            if branch.trim().is_empty() {
-                return Err("backup.git.branch must be non-empty".into());
-            }
-            // The branch is the one ref a backup compare-and-swaps, so it is
-            // validated with the same rule the publisher applies to its own ref.
-            GitRefTarget::new(remote, branch).map_err(|error| {
-                format!("backup.git.branch must be a fully qualified safe ref: {error}")
-            })?;
-            // A backup always stores binary objects through Git LFS, so the engine
-            // cannot run one without an endpoint. That is a configuration fact, not a
-            // run-time discovery: a workspace that could never complete a backup is
-            // refused while it is loaded, exactly like an unusable publication target.
-            let lfs = backup.lfs.as_ref().filter(|lfs| lfs.enabled).ok_or(
-                "backup.lfs must be configured and enabled when backup is enabled; \
-                 binary objects are stored in Git LFS",
-            )?;
-            // Only the variable *names* are validated here. The credential values are
-            // read from the environment at run time and never stored, recorded or
-            // printed.
-            if lfs
-                .username_env
-                .as_deref()
-                .is_none_or(|name| name.trim().is_empty())
-            {
-                return Err(
-                    "backup.lfs.username_env must be non-empty when backup.lfs is enabled".into(),
-                );
-            }
-            if lfs
-                .token_env
-                .as_deref()
-                .is_none_or(|name| name.trim().is_empty())
-            {
-                return Err(
-                    "backup.lfs.token_env must be non-empty when backup.lfs is enabled".into(),
-                );
-            }
-            if let Some(url) = &lfs.batch_url
-                && !is_absolute_http_url(url)
-            {
-                return Err(
-                    format!("backup.lfs.batch_url must be an absolute http(s) URL: {url}").into(),
-                );
-            }
-        }
-        // A source and a publication target that share one namespace on one bucket
-        // would make this engine read its own output back as input. That is refused
-        // here, before any publication can create the loop.
-        config.check_namespace_overlap()?;
+        let config = load_config(&path)?;
         Ok(Self {
             config,
             config_path: path,
         })
-    }
-    /// The configured source kind.
-    fn source_kind(&self) -> SourceType {
-        self.config.source.kind()
-    }
-
-    /// The local source root, refusing an R2 workspace.
-    fn local_source_path(&self) -> Result<&Path, Box<dyn Error>> {
-        self.config
-            .source
-            .path
-            .as_deref()
-            .ok_or_else(|| "this workspace reads an R2 source and has no local source path".into())
-    }
-
-    /// Where a human-readable description of the configured source comes from.
-    fn source_description(&self) -> String {
-        match self.source_kind() {
-            SourceType::Local => self
-                .config
-                .source
-                .path
-                .as_ref()
-                .map(|path| path.display().to_string())
-                .unwrap_or_else(|| "<unconfigured local source>".to_owned()),
-            SourceType::R2 => match &self.config.source.r2 {
-                Some(r2) => format!("r2:{}/{}/{}", r2.endpoint, r2.bucket, r2.prefix),
-                None => "<unconfigured r2 source>".to_owned(),
-            },
-        }
     }
 
     /// Builds the configured R2 source reader, reading its secret from the
@@ -611,10 +149,6 @@ impl Workspace {
             .path
             .join("source-materializations.sqlite3")
     }
-
-    fn cas(&self) -> PathBuf {
-        self.config.state.path.join("cas")
-    }
     fn document_db(&self) -> PathBuf {
         self.config.state.path.join("document-reviews.sqlite3")
     }
@@ -632,26 +166,6 @@ impl Workspace {
     }
     fn delivery_db(&self) -> PathBuf {
         self.config.state.path.join("delivery-projections.sqlite3")
-    }
-    /// The validated, canonical public scope for this workspace.
-    fn public_scope(&self) -> Result<PublicExclusionRules, Box<dyn Error>> {
-        let Some(public) = &self.config.public else {
-            return Ok(PublicExclusionRules::empty());
-        };
-        PublicExclusionRules::new(public.exclude.clone())
-            .map_err(|error| format!("public.exclude contains an unusable rule: {error}").into())
-    }
-
-    fn asset_delivery(&self) -> Result<AssetDeliveryConfig, Box<dyn Error>> {
-        Ok(AssetDeliveryConfig::new(
-            self.assets()?.public_base_url.clone(),
-        )?)
-    }
-    fn assets(&self) -> Result<&AssetsConfig, Box<dyn Error>> {
-        self.config.assets.as_ref().ok_or(
-            "assets.public_base_url and one asset target must be configured before publishing"
-                .into(),
-        )
     }
 
     /// Builds the configured target, reading the secret access key from the
@@ -695,67 +209,6 @@ impl Workspace {
     /// Where durable backup intents live, beside the publication runs.
     fn backup_db(&self) -> PathBuf {
         self.config.state.path.join("backup-runs.sqlite3")
-    }
-
-    /// Whether this workspace has an enabled backup target.
-    ///
-    /// Every backup command checks this first, so a workspace without a `backup:`
-    /// section keeps behaving exactly as it did before backups existed.
-    fn backup_enabled(&self) -> bool {
-        self.config
-            .backup
-            .as_ref()
-            .is_some_and(|backup| backup.enabled)
-    }
-
-    /// The enabled backup Git target, if this workspace has one.
-    fn backup_git(&self) -> Result<&BackupGitConfig, Box<dyn Error>> {
-        self.config
-            .backup
-            .as_ref()
-            .filter(|backup| backup.enabled)
-            .and_then(|backup| backup.git.as_ref())
-            .ok_or_else(|| "backup.git must be configured when backup is enabled".into())
-    }
-
-    /// The local backup repository, already absolutized while the workspace loaded.
-    fn backup_git_repository(&self) -> Result<&Path, Box<dyn Error>> {
-        self.backup_git()?
-            .repository
-            .as_deref()
-            .ok_or_else(|| "backup.git.repository is required when backup is enabled".into())
-    }
-
-    /// The remote and fully qualified ref one backup compare-and-swaps.
-    fn backup_target(&self) -> Result<GitRefTarget, Box<dyn Error>> {
-        let git = self.backup_git()?;
-        let remote = git
-            .remote
-            .as_deref()
-            .ok_or("backup.git.remote must be non-empty when backup is enabled")?;
-        let branch = git
-            .branch
-            .as_deref()
-            .ok_or("backup.git.branch must be a fully qualified ref when backup is enabled")?;
-        Ok(GitRefTarget::new(remote, branch)?)
-    }
-
-    /// The enabled LFS endpoint description, if this workspace has one.
-    /// The enabled LFS block.
-    ///
-    /// `Workspace::load` already refuses an enabled backup without one, so this is a
-    /// defensive guard rather than the place the requirement is discovered.
-    fn backup_lfs(&self) -> Result<&BackupLfsConfig, Box<dyn Error>> {
-        self.config
-            .backup
-            .as_ref()
-            .filter(|backup| backup.enabled)
-            .and_then(|backup| backup.lfs.as_ref())
-            .filter(|lfs| lfs.enabled)
-            .ok_or_else(|| {
-                "backup.lfs must be enabled to run a backup; binary objects are stored in Git LFS"
-                    .into()
-            })
     }
 
     /// Builds the configured LFS endpoint, reading the credentials from the
@@ -835,87 +288,39 @@ impl Workspace {
     }
 }
 
-impl Config {
-    /// Refuses a source and a publication target that share one namespace.
-    ///
-    /// Two namespaces overlap when one is a prefix of the other on the same bucket
-    /// of the same endpoint. Reading published assets back as source objects, or
-    /// publishing source objects on top of the source, is a loop this engine will
-    /// not create for itself.
-    fn check_namespace_overlap(&self) -> Result<(), Box<dyn Error>> {
-        let Some(source) = self.source.r2.as_ref() else {
-            return Ok(());
-        };
-        let Some(assets) = self.assets.as_ref().and_then(|assets| assets.r2.as_ref()) else {
-            return Ok(());
-        };
-        let same_account = source.endpoint.eq_ignore_ascii_case(&assets.endpoint);
-        if !same_account || source.bucket != assets.bucket {
-            return Ok(());
-        }
-        let source_prefix = R2SourcePrefix::new(&source.prefix)?.as_str().to_owned();
-        let publication_prefix = self.publication_namespace();
-        if namespaces_overlap(&source_prefix, &publication_prefix) {
-            return Err(format!(
-                "source.r2 prefix {source_prefix} overlaps the publication namespace                  {publication_prefix} on bucket {}; a source must not read this engine's own output",
-                source.bucket
-            )
-            .into());
-        }
-        Ok(())
-    }
-
-    /// Where published assets live inside the bucket, as a canonical prefix.
-    fn publication_namespace(&self) -> String {
-        format!("{ASSET_OBJECT_KEY_PREFIX}/")
-    }
-}
-
-/// Whether one canonical object namespace contains, or is contained by, another.
-///
-/// Both prefixes are canonical and end in `/`, so the relation is a plain string
-/// prefix test — and a namespace never overlaps itself by accident: two identical
-/// prefixes are exactly the loop this check exists to refuse.
-fn namespaces_overlap(left: &str, right: &str) -> bool {
-    left.starts_with(right) || right.starts_with(left)
-}
-
-/// Whether one configured URL is an absolute http(s) URL with a host.
-///
-/// The LFS adapter enforces the same rule when it builds an endpoint; applying it
-/// while the workspace loads means an unusable `batch_url` is reported before a
-/// backup starts rather than in the middle of one.
-fn is_absolute_http_url(value: &str) -> bool {
-    reqwest::Url::parse(value)
-        .is_ok_and(|url| matches!(url.scheme(), "http" | "https") && url.host_str().is_some())
-}
-
-fn absolute(base: &Path, value: &Path) -> Result<PathBuf, Box<dyn Error>> {
-    Ok(if value.is_absolute() {
-        value.to_path_buf()
-    } else {
-        env::current_dir()?.join(base).join(value)
-    })
-}
-
 pub fn run() -> Result<(), Box<dyn Error>> {
     let mut args = env::args().skip(1).collect::<Vec<_>>();
-    let config_path = if args.first().is_some_and(|arg| arg == "--config") {
+    let (config_path, configured) = if args.first().is_some_and(|arg| arg == "--config") {
         if args.len() < 2 {
             return Err("--config requires a path".into());
         }
         let value = PathBuf::from(args.remove(1));
         args.remove(0);
-        value
+        (value, true)
     } else {
-        PathBuf::from("mineral.yaml")
+        (default_config_path(), false)
     };
     let Some(command) = args.first().map(String::as_str) else {
         print_help();
         return Ok(());
     };
     match command {
-        "init" => init(&config_path),
+        "init" => {
+            // A fresh workspace may be written in either language. The flag also
+            // decides the name of the file when the operator did not choose one,
+            // so `mineral init --toml` cannot silently write YAML to `mineral.toml`.
+            let format = if args[1..].iter().any(|arg| arg == "--toml") {
+                ConfigFormat::Toml
+            } else {
+                ConfigFormat::Yaml
+            };
+            let path = if format == ConfigFormat::Toml && !configured {
+                PathBuf::from(format!("mineral.{}", format.extension()))
+            } else {
+                config_path
+            };
+            init(&path, format)
+        }
         "publish" => publish(Workspace::load(config_path)?),
         "status" => status(Workspace::load(config_path)?),
         "doctor" => doctor(Workspace::load(config_path)?),
@@ -929,20 +334,48 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     }
 }
 
+/// The configuration a command uses when the operator names none.
+///
+/// `mineral.yaml` stays the default, exactly as it always was. A workspace that
+/// was created with `mineral init --toml` is found too, so the language a file is
+/// written in never has to be repeated on every command line.
+fn default_config_path() -> PathBuf {
+    let yaml = PathBuf::from("mineral.yaml");
+    if !yaml.exists() {
+        let toml = PathBuf::from("mineral.toml");
+        if toml.exists() {
+            return toml;
+        }
+    }
+    yaml
+}
+
 fn print_help() {
     println!(
-        "Mineral Publisher\n\nUsage:\n  mineral [--config PATH] init\n  mineral [--config PATH] publish\n  mineral [--config PATH] status\n  mineral [--config PATH] review list\n  mineral [--config PATH] review show <document:ID|asset:ID>\n  mineral [--config PATH] review approve <document:ID|asset:ID>\n  mineral [--config PATH] review reject <document:ID|asset:ID>\n  mineral [--config PATH] backup\n  mineral [--config PATH] backup status\n  mineral [--config PATH] backup verify\n  mineral [--config PATH] backup init\n  mineral [--config PATH] doctor"
+        "Mineral Publisher\n\nUsage:\n  mineral [--config PATH] init [--toml]\n  mineral [--config PATH] publish\n  mineral [--config PATH] status\n  mineral [--config PATH] review list\n  mineral [--config PATH] review show <document:ID|asset:ID>\n  mineral [--config PATH] review approve <document:ID|asset:ID>\n  mineral [--config PATH] review reject <document:ID|asset:ID>\n  mineral [--config PATH] backup\n  mineral [--config PATH] backup status\n  mineral [--config PATH] backup verify\n  mineral [--config PATH] backup init\n  mineral [--config PATH] doctor"
     );
 }
 
-fn init(path: &Path) -> Result<(), Box<dyn Error>> {
+fn init(path: &Path, format: ConfigFormat) -> Result<(), Box<dyn Error>> {
     if path.exists() {
         return Err(format!("configuration already exists: {}", path.display()).into());
+    }
+    // The extension is what chooses the syntax when the file is read back, so a
+    // file whose name promises a language it is not written in is refused here
+    // rather than discovered by a parser later.
+    if ConfigFormat::of(path) != Some(format) {
+        return Err(format!(
+            "a {} configuration must be named with a .{} extension, not {}",
+            format.extension(),
+            format.extension(),
+            path.display()
+        )
+        .into());
     }
     if let Some(parent) = path.parent().filter(|path| !path.as_os_str().is_empty()) {
         fs::create_dir_all(parent)?;
     }
-    fs::write(path, DEFAULT_CONFIG)?;
+    fs::write(path, format.template())?;
     let workspace = Workspace::load(path.to_path_buf())?;
     if workspace.source_kind() == SourceType::Local {
         fs::create_dir_all(workspace.local_source_path()?)?;
@@ -2023,8 +1456,8 @@ mod tests {
     };
 
     use super::{
-        Config, DEFAULT_CONFIG, LfsHttpConfig, LfsHttpRemote, LfsToken, LocalContentStore,
-        SourceType, Workspace, backup, sqlite_positive_id,
+        Config, ConfigFormat, DEFAULT_CONFIG, LfsHttpConfig, LfsHttpRemote, LfsToken,
+        LocalContentStore, SourceType, Workspace, backup, init, sqlite_positive_id,
     };
 
     /// The three asset-target shapes a configuration can have: the native store,
@@ -2544,5 +1977,41 @@ mod tests {
         let remote = LfsHttpRemote::new(config).unwrap();
         assert!(remote.describe().contains("mineral-backup"));
         assert!(!remote.describe().contains(secret), "{}", remote.describe());
+    }
+
+    /// `init` writes the language the file name promises, and refuses to write
+    /// one whose name promises a different language.
+    ///
+    /// The extension is what chooses the syntax when the file is read back, so a
+    /// `.yaml` file holding TOML would be a workspace that cannot be opened —
+    /// refused here rather than by a parser later.
+    #[test]
+    fn init_writes_the_language_the_file_name_promises() {
+        let directory =
+            std::env::temp_dir().join(format!("mineral-cli-init-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+
+        let toml = directory.join("workspace.toml");
+        init(&toml, ConfigFormat::Toml).unwrap();
+        let text = std::fs::read_to_string(&toml).unwrap();
+        assert!(text.contains("[source]"), "{text}");
+        assert_eq!(
+            Workspace::load(toml.clone()).unwrap().source_kind(),
+            SourceType::Local
+        );
+
+        let mismatched = directory.join("workspace.yaml");
+        let error = init(&mismatched, ConfigFormat::Toml)
+            .expect_err("a .yaml name must not be written as TOML")
+            .to_string();
+        assert!(error.contains("toml"), "{error}");
+        assert!(!mismatched.exists());
+
+        let error = init(&toml, ConfigFormat::Toml)
+            .expect_err("an existing configuration must never be overwritten")
+            .to_string();
+        assert!(error.contains("already exists"), "{error}");
+
+        let _ = std::fs::remove_dir_all(&directory);
     }
 }
