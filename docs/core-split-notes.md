@@ -1020,3 +1020,36 @@ PublishRunPublication::CommitReady { commit_oid: String }
 
 无论哪条路线，`commit_spec` 字段与 SQLite 列都在**第 2 步**才加入，第 1 步不动 schema。
 
+
+### 2.4 端到端恢复：验证状态与网络阻塞
+
+`mineral backup verify` 对**已推送的 ref**（`EroSagiri/mineral-backup`
+`refs/heads/mineral-backup = 138be432…`，439 个 `vault/**` 文件 + `.gitattributes` +
+`.mineral-backup/manifest`，10 个 LFS 对象约 140MB）返回 verified：Git blob 逐个重新哈希、
+LFS pointer 的 oid/size 逐个核对、端点确认全部 required LFS object 存在。
+
+把这条链路换成"别人克隆后能否恢复"的独立复现（`git clone` 到干净目录 + `git lfs pull`）
+时，本机只完成了 Git 侧：
+
+| 项目 | 结果 |
+|---|---|
+| clone `--branch mineral-backup --single-branch` | 成功 |
+| Git blob 逐字节比对（`verify-manifest.py`） | 429/429 一致，0 mismatch |
+| LFS payload | 只落地 1/10 |
+| `git lfs fetch` 240s 内的字节增量 | **0 K**（`.git/lfs/objects` 停在 328K） |
+
+即本机到 GitHub LFS 传输端点（`objects.githubusercontent.com` 一侧）实际吞吐为 0，
+而 Git 协议本身可用（小仓库 fetch 正常）。这不是代码缺陷：`mineral backup verify` 的
+端点确认走的是 batch API 并且成功。**未完成的只是 9 个 LFS payload 的物理下载**，
+它需要一个能连通 LFS 传输端点的网络环境；在那之前不能声称"端到端恢复已验证"。
+
+复现命令（在能连通的环境里）：
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+rm -rf /tmp/lfs-restore
+git clone --branch mineral-backup --single-branch \
+    git@github.com:EroSagiri/mineral-backup.git /tmp/lfs-restore
+cd /tmp/lfs-restore && git lfs pull
+python3 verify-manifest.py     # 期望 439/439，mismatches 0
+```
