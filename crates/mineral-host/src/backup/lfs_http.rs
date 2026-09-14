@@ -69,7 +69,9 @@ const BASIC_TRANSFER: &str = "basic";
 const BATCH_PATH: &str = "objects/batch";
 
 /// The exact body the LFS specification sends to a verify action.
-const VERIFY_BODY: &str = "{}";
+/// The rule the endpoint checks when it asks for a verification.
+const VERIFY_BODY_PREFIX: &str = "{\"oid\":\"";
+const VERIFY_BODY_MIDDLE: &str = "\",\"size\":";
 
 /// Distinguishes the temporary upload spools of concurrent uploads.
 static NEXT_SPOOL: AtomicU64 = AtomicU64::new(1);
@@ -338,14 +340,26 @@ impl LfsHttpRemote {
         method: Method,
         href: &str,
         headers: &[(String, String)],
+        content_type: Option<&'static str>,
     ) -> Result<RequestBuilder, LfsHttpError> {
         let url = Url::parse(href).map_err(|_| LfsHttpError::Endpoint)?;
         if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
             return Err(LfsHttpError::Endpoint);
         }
         let mut builder = self.client.request(method, url);
+        let mut has_content_type = false;
         for (name, value) in headers {
+            if name.eq_ignore_ascii_case("content-type") {
+                has_content_type = true;
+            }
             builder = builder.header(name.as_str(), value.as_str());
+        }
+        // Never duplicate a content type an action already named: a repeated header
+        // value would change what the endpoint sees *and* what a signature covers.
+        if let Some(content_type) = content_type
+            && !has_content_type
+        {
+            builder = builder.header(reqwest::header::CONTENT_TYPE, content_type);
         }
         Ok(builder)
     }
@@ -410,7 +424,7 @@ impl LfsRemote for LfsHttpRemote {
                 sent: counted,
             });
         }
-        let request = self.action_request(Method::PUT, action.href(), action.headers())?;
+        let request = self.action_request(Method::PUT, action.href(), action.headers(), None)?;
         let response = request
             .body(Body::sized(file, object.size()))
             .send()
@@ -435,14 +449,24 @@ impl LfsRemote for LfsHttpRemote {
 
     fn verify(
         &self,
-        _object: &RequiredLfsObject,
+        object: &RequiredLfsObject,
         action: &Self::VerifyAction,
     ) -> Result<(), Self::Error> {
-        let request = self.action_request(Method::POST, action.href(), action.headers())?;
-        let response = request
-            .body(VERIFY_BODY)
-            .send()
-            .map_err(LfsHttpError::Transport)?;
+        // GitHub registers an uploaded object only when this request succeeds, and it
+        // requires the LFS media type plus the object's own identity in the body; a
+        // request without them is refused and the object stays missing.
+        let request = self.action_request(
+            Method::POST,
+            action.href(),
+            action.headers(),
+            Some(LFS_MEDIA_TYPE),
+        )?;
+        let body = format!(
+            "{VERIFY_BODY_PREFIX}{}{VERIFY_BODY_MIDDLE}{}}}",
+            object.oid(),
+            object.size()
+        );
+        let response = request.body(body).send().map_err(LfsHttpError::Transport)?;
         if !response.status().is_success() {
             return Err(LfsHttpError::UnexpectedStatus {
                 operation: "POST verify",
@@ -1260,8 +1284,20 @@ mod tests {
         let verifications = server.lfs.requests_for("POST", "/verify/");
         assert_eq!(verifications.len(), 1);
         assert_eq!(verifications[0].path, format!("/verify/{}", object.oid()));
-        assert_eq!(verifications[0].body, b"{}");
+        assert_eq!(
+            String::from_utf8(verifications[0].body.clone()).unwrap(),
+            format!(
+                "{{\"oid\":\"{}\",\"size\":{}}}",
+                object.oid(),
+                object.size()
+            )
+        );
         assert_eq!(verifications[0].accept.as_deref(), Some(LFS_MEDIA_TYPE));
+        assert_eq!(
+            verifications[0].content_type.as_deref(),
+            Some(LFS_MEDIA_TYPE),
+            "GitHub refuses a verify request without the LFS media type"
+        );
     }
 
     #[test]

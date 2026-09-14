@@ -160,6 +160,11 @@ impl TestWorkspace {
             .env("GIT_AUTHOR_EMAIL", "test@example.invalid")
             .env("GIT_COMMITTER_NAME", "Test")
             .env("GIT_COMMITTER_EMAIL", "test@example.invalid")
+            // The test must not depend on the machine's own Git configuration: an
+            // installed Git LFS would rewrite the pointer files this test reads back,
+            // and a partially configured one would fail the checkout instead.
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
             .output()
             .unwrap();
         assert!(
@@ -400,6 +405,44 @@ fn a_snapshot_becomes_a_backup_that_restores_byte_for_byte() {
     assert_eq!(report.commit(), &commit_oid);
     assert_eq!(report.files_verified(), snapshot.files().len());
     assert_eq!(report.lfs_objects_verified(), 1);
+}
+
+#[test]
+fn an_unchanged_backup_records_nothing_and_leaves_the_ref_where_it_is() {
+    let harness = Harness::new("noop");
+    let lfs = FakeLfs::default();
+    let run_ids =
+        SequentialBackupRunIdGenerator::new(mineral_core::backup::BackupRunId::new(1).unwrap());
+    let snapshot = snapshot(&harness.workspace.cas(), &[("notes/a.md", b"# note\n")]);
+    let first = harness.run(&snapshot, &lfs, &run_ids).unwrap();
+    assert!(matches!(
+        first.execution(),
+        BackupExecutionOutcome::BackedUp { .. }
+    ));
+    assert!(first.run_id().is_some());
+    let remote = harness.workspace.remote(&harness.repository);
+    let before =
+        mineral_core::publication::git::GitRemote::observe_ref(&remote, &TestWorkspace::target())
+            .unwrap();
+    let uploads_before = lfs.uploads.get();
+
+    // The same Snapshot again: the tree is exactly the tree the base commit holds, so
+    // there is nothing to record and nothing to advance.
+    let second = harness.run(&snapshot, &lfs, &run_ids).unwrap();
+
+    assert!(matches!(
+        second.execution(),
+        BackupExecutionOutcome::AlreadyBackedUp { .. }
+    ));
+    assert!(
+        second.run_id().is_none(),
+        "an unchanged backup records no intent"
+    );
+    assert_eq!(lfs.uploads.get(), uploads_before);
+    let after =
+        mineral_core::publication::git::GitRemote::observe_ref(&remote, &TestWorkspace::target())
+            .unwrap();
+    assert_eq!(before, after, "the backup ref must not move");
 }
 
 #[test]

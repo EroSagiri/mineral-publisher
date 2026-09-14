@@ -55,7 +55,9 @@ pub struct BackupApplicationRequest<'a> {
 /// What one backup attempt did, with the identities a report needs.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BackupApplicationOutcome {
-    run_id: BackupRunId,
+    /// The durable intent this attempt recorded, or `None` when the backup was
+    /// already up to date and nothing new was recorded.
+    run_id: Option<BackupRunId>,
     snapshot_id: SnapshotId,
     backup_projection_sha256: crate::domain::Sha256,
     delivery_sha256: crate::domain::Sha256,
@@ -65,7 +67,7 @@ pub struct BackupApplicationOutcome {
 }
 
 impl BackupApplicationOutcome {
-    pub fn run_id(&self) -> BackupRunId {
+    pub fn run_id(&self) -> Option<BackupRunId> {
         self.run_id
     }
 
@@ -138,6 +140,23 @@ where
         .materialize_backup(&base_commit, &tree)
         .map_err(BackupApplicationError::Repository)?;
 
+    // An unchanged Snapshot materializes exactly the tree the base commit already
+    // holds. Creating a commit for it would advance the branch with an empty diff on
+    // every run, so the attempt reports the existing backup and records nothing.
+    if reviewed.is_noop() {
+        return Ok(BackupApplicationOutcome {
+            run_id: None,
+            snapshot_id: projection.snapshot_id(),
+            backup_projection_sha256: projection.projection_sha256(),
+            delivery_sha256: delivery.delivery_sha256(),
+            files: delivery.files().len(),
+            lfs_objects: delivery.required_lfs_objects().len(),
+            execution: BackupExecutionOutcome::AlreadyBackedUp {
+                commit: base_commit,
+            },
+        });
+    }
+
     let spec = GitCommitSpec::new(
         base_commit.clone(),
         reviewed.tree_oid().clone(),
@@ -174,7 +193,7 @@ where
         .map_err(BackupApplicationError::Execution)?;
 
     Ok(BackupApplicationOutcome {
-        run_id,
+        run_id: Some(run_id),
         snapshot_id: projection.snapshot_id(),
         backup_projection_sha256: projection.projection_sha256(),
         delivery_sha256: delivery.delivery_sha256(),

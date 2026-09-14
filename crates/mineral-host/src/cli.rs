@@ -1539,7 +1539,10 @@ fn render_backup_outcome(
     };
     println!(
         "Backup\n  status: {status}\n  run: {}\n  snapshot: {}\n  files: {}\n  lfs objects: {}\n  ref: {} {}\n  endpoint: {}",
-        outcome.run_id().get(),
+        outcome
+            .run_id()
+            .map(|id| id.get().to_string())
+            .unwrap_or_else(|| "none (already up to date)".to_owned()),
         outcome.snapshot_id().get(),
         outcome.files(),
         outcome.lfs_objects(),
