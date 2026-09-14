@@ -3,3 +3,4 @@
 /.mineral
 /mineral.yaml
 crates/mineral-host/examples/fixtures/deepseek_markdown_reviewer_smoke
+/backup-repo
