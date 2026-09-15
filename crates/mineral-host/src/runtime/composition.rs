@@ -209,7 +209,7 @@ pub fn r2_source(
         .map_err(|error| connection(format!("source.r2.prefix is unusable: {error}")))?;
     let secret = credential(
         secrets,
-        "source.r2.secret_access_key_env",
+        "source.r2.secret_access_key",
         config.source_r2_secret_name()?,
     )?;
     let mut endpoint = R2ObjectStoreConfig::new(
@@ -247,7 +247,7 @@ pub fn asset_target(
     })?;
     let secret = credential(
         secrets,
-        "assets.r2.secret_access_key_env",
+        "assets.r2.secret_access_key",
         config.assets_r2_secret_name()?,
     )?;
     let mut endpoint = R2ObjectStoreConfig::new(
@@ -443,7 +443,7 @@ impl Reviewer for LazyMarkdownReviewer {
                 let key = DeepSeekApiKey::new(
                     credential(
                         self.secrets.as_ref(),
-                        "review.api_key_env",
+                        "review.api_key",
                         self.api_key_name.clone(),
                     )?
                     .expose()
@@ -495,7 +495,7 @@ impl AssetReviewer for LazyAssetReviewer {
                 let key = DeepSeekApiKey::new(
                     credential(
                         self.secrets.as_ref(),
-                        "review.api_key_env",
+                        "review.api_key",
                         self.api_key_name.clone(),
                     )?
                     .expose()

@@ -172,7 +172,7 @@ fn a_validated_configuration_names_credentials_and_never_carries_them() {
     assert_eq!(token.as_str(), "MINERAL_CONFIG_TEST_TOKEN");
     assert_eq!(
         config.review_api_key_name().unwrap().as_str(),
-        "MINERAL_DEEPSEEK_API_KEY"
+        "__mineral_inline_review_api_key"
     );
 
     // The dump a log or an error report would carry names the variables and

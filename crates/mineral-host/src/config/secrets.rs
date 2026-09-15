@@ -131,6 +131,37 @@ pub struct StaticSecretProvider {
     values: BTreeMap<String, String>,
 }
 
+/// Resolves inline configuration credentials first, then fixed legacy-free
+/// environment names supplied by the runtime.
+#[derive(Clone, Debug, Default)]
+pub struct InlineSecretProvider {
+    values: BTreeMap<String, String>,
+}
+
+impl InlineSecretProvider {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.values.insert(name.into(), value.into());
+        self
+    }
+}
+
+impl SecretProvider for InlineSecretProvider {
+    fn resolve(&self, name: &SecretName) -> Result<SecretValue, SecretError> {
+        match self.values.get(name.as_str()) {
+            Some(value) => SecretValue::new(value.clone()),
+            None => EnvSecretProvider.resolve(name),
+        }
+    }
+
+    fn is_present(&self, name: &SecretName) -> bool {
+        self.values.contains_key(name.as_str()) || EnvSecretProvider.is_present(name)
+    }
+}
+
 /// A provider holds values, so its `Debug` names the variables it can resolve
 /// and never what they hold. A dump of a runtime must be safe to log.
 impl fmt::Debug for StaticSecretProvider {

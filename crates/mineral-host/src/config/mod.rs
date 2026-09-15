@@ -33,6 +33,7 @@ pub use model::{
     ReviewConfig, SourceConfig, SourceR2Config, SourceType, StateConfig,
 };
 pub use secrets::{
-    EnvSecretProvider, SecretError, SecretName, SecretProvider, SecretValue, StaticSecretProvider,
+    EnvSecretProvider, InlineSecretProvider, SecretError, SecretName, SecretProvider, SecretValue,
+    StaticSecretProvider,
 };
 pub use validate::{ConfigError, ValidatedConfig};

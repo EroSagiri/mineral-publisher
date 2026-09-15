@@ -16,7 +16,7 @@ use std::{ops::Deref, path::PathBuf, sync::Arc};
 use crate::{
     asset::ConfiguredAssetTarget,
     backup::{git_backup::GitBackupRepository, lfs_http::LfsHttpRemote},
-    config::{ConfigError, EnvSecretProvider, SecretName, SecretProvider, ValidatedConfig},
+    config::{ConfigError, InlineSecretProvider, SecretName, SecretProvider, ValidatedConfig},
     domain::{Sha256, Snapshot, SourceId},
     publisher::{GitCommitMetadata, GitCommitOid, GitRefTarget, GitRemoteAdapter, RemoteRefState},
     source::{LocalSource, r2::R2Source},
@@ -125,9 +125,19 @@ impl Deref for WorkspaceRuntime {
 }
 
 impl WorkspaceRuntime {
-    /// Loads a workspace and resolves its credentials from the environment.
+    /// Loads a workspace and resolves inline credentials from the configuration.
     pub fn load(path: PathBuf) -> Result<Self, RuntimeError> {
-        Self::with_secrets(path, Arc::new(EnvSecretProvider))
+        let config = crate::config::load(&path)?;
+        let mut provider = InlineSecretProvider::new();
+        for (name, value) in config.inline_secrets() {
+            provider = provider.with(name, value);
+        }
+        let secrets: Arc<dyn SecretProvider> = Arc::new(provider);
+        Ok(Self {
+            config,
+            config_path: path,
+            secrets,
+        })
     }
 
     /// Loads a workspace with an explicit secret provider.

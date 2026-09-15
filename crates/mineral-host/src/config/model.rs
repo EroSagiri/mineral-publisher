@@ -7,7 +7,7 @@
 //! configuration without a file system, and what makes "the file said X" a
 //! different question from "X is allowed".
 
-use std::path::PathBuf;
+use std::{fmt, path::PathBuf};
 
 use serde::Deserialize;
 
@@ -32,7 +32,7 @@ pub const DEFAULT_CONFIG: &str = r#"source:
   #   bucket: mineral-vault
   #   prefix: vault/
   #   access_key_id: <access key id>
-  #   secret_access_key_env: MINERAL_R2_SECRET_ACCESS_KEY
+  #   secret_access_key: <secret access key>
   #   region: auto
   #   timeout_seconds: 300
 state:
@@ -53,7 +53,7 @@ assets:
   #   endpoint: https://<account>.r2.cloudflarestorage.com
   #   bucket: mineral-assets
   #   access_key_id: <access key id>
-  #   secret_access_key_env: MINERAL_R2_SECRET_ACCESS_KEY
+  #   secret_access_key: <secret access key>
   #   region: auto
   #   timeout_seconds: 300
 public:
@@ -70,7 +70,7 @@ review:
   api_base_url: https://api.deepseek.com
   markdown_model: deepseek-flash
   asset_model: deepseek-flash
-  api_key_env: MINERAL_DEEPSEEK_API_KEY
+  api_key: <DeepSeek API key>
   timeout_seconds: 45
   markdown_concurrency: 4
   asset_concurrency: 2
@@ -117,7 +117,7 @@ path = "./vault"
 # bucket = "mineral-vault"
 # prefix = "vault/"
 # access_key_id = "<access key id>"
-# secret_access_key_env = "MINERAL_R2_SECRET_ACCESS_KEY"
+# secret_access_key = "<secret access key>"
 # region = "auto"
 # timeout_seconds = 300
 
@@ -141,7 +141,7 @@ target_path = "./asset-target"
 # endpoint = "https://<account>.r2.cloudflarestorage.com"
 # bucket = "mineral-assets"
 # access_key_id = "<access key id>"
-# secret_access_key_env = "MINERAL_R2_SECRET_ACCESS_KEY"
+# secret_access_key = "<secret access key>"
 # region = "auto"
 # timeout_seconds = 300
 
@@ -154,7 +154,7 @@ exclude = []
 api_base_url = "https://api.deepseek.com"
 markdown_model = "deepseek-flash"
 asset_model = "deepseek-flash"
-api_key_env = "MINERAL_DEEPSEEK_API_KEY"
+api_key = "<DeepSeek API key>"
 timeout_seconds = 45
 markdown_concurrency = 4
 asset_concurrency = 2
@@ -241,7 +241,7 @@ impl SourceConfig {
 /// The shape mirrors `assets.r2` on purpose: the same endpoint, bucket and
 /// credential mechanism reach the same kind of store, whether this engine is
 /// reading source objects or writing published ones.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SourceR2Config {
     pub endpoint: String,
@@ -249,7 +249,9 @@ pub struct SourceR2Config {
     /// The one managed namespace this source reads. Required and non-empty.
     pub prefix: String,
     pub access_key_id: String,
-    pub secret_access_key_env: String,
+    /// The secret access key. Prefer this direct configuration value for simple deployments.
+    #[serde(default)]
+    pub secret_access_key: Option<String>,
     #[serde(default)]
     pub region: Option<String>,
     #[serde(default)]
@@ -301,7 +303,7 @@ pub struct AssetsConfig {
     pub r2: Option<R2Config>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct R2Config {
     /// Absolute endpoint of the service, without the bucket and without a
@@ -309,9 +311,9 @@ pub struct R2Config {
     pub endpoint: String,
     pub bucket: String,
     pub access_key_id: String,
-    /// The name of the environment variable that holds the secret access key.
-    /// The key itself never belongs in a configuration file.
-    pub secret_access_key_env: String,
+    /// The secret access key. Prefer this direct configuration value for simple deployments.
+    #[serde(default)]
+    pub secret_access_key: Option<String>,
     /// R2 accepts `auto`; a generic S3 endpoint may need its own region.
     #[serde(default)]
     pub region: Option<String>,
@@ -406,13 +408,15 @@ pub struct BackupLfsConfig {
     pub timeout_seconds: Option<u64>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReviewConfig {
     pub api_base_url: String,
     pub markdown_model: String,
     pub asset_model: String,
-    pub api_key_env: String,
+    /// The DeepSeek API key. Prefer this direct configuration value for simple deployments.
+    #[serde(default)]
+    pub api_key: Option<String>,
     pub timeout_seconds: u64,
     #[serde(default = "default_markdown_concurrency")]
     pub markdown_concurrency: usize,
@@ -426,4 +430,51 @@ fn default_markdown_concurrency() -> usize {
 
 fn default_asset_concurrency() -> usize {
     2
+}
+
+impl fmt::Debug for SourceR2Config {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SourceR2Config")
+            .field("endpoint", &self.endpoint)
+            .field("bucket", &self.bucket)
+            .field("prefix", &self.prefix)
+            .field("access_key_id", &self.access_key_id)
+            .field(
+                "secret_access_key",
+                &self.secret_access_key.as_ref().map(|_| "<redacted>"),
+            )
+            .field("region", &self.region)
+            .field("timeout_seconds", &self.timeout_seconds)
+            .finish()
+    }
+}
+
+impl fmt::Debug for R2Config {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("R2Config")
+            .field("endpoint", &self.endpoint)
+            .field("bucket", &self.bucket)
+            .field("access_key_id", &self.access_key_id)
+            .field(
+                "secret_access_key",
+                &self.secret_access_key.as_ref().map(|_| "<redacted>"),
+            )
+            .field("region", &self.region)
+            .field("timeout_seconds", &self.timeout_seconds)
+            .finish()
+    }
+}
+
+impl fmt::Debug for ReviewConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ReviewConfig")
+            .field("api_base_url", &self.api_base_url)
+            .field("markdown_model", &self.markdown_model)
+            .field("asset_model", &self.asset_model)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("timeout_seconds", &self.timeout_seconds)
+            .field("markdown_concurrency", &self.markdown_concurrency)
+            .field("asset_concurrency", &self.asset_concurrency)
+            .finish()
+    }
 }

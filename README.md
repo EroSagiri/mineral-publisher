@@ -40,7 +40,9 @@ cargo run --bin mineral -- status
 
 使用其他配置文件时，在命令前传入 `--config PATH`。`init` 会创建示例配置、源目录、CAS
 和各持久化 schema，但不会覆盖已有配置。`doctor` 只做读取和存在性检查；API key 只报告
-`present`/`missing`。`publish` 仅在真正需要 provider review 时读取配置指定的环境变量。
+`present`/`missing`。R2 与 DeepSeek 凭据直接写在配置文件的 `secret_access_key` / `api_key`
+字段中；缺少直接值时固定回退到 `MINERAL_R2_SECRET_ACCESS_KEY` 和
+`MINERAL_DEEPSEEK_API_KEY`，不再从配置文件读取环境变量名称。
 默认 Markdown 与资源模型均为 `deepseek-flash`。审核请求分别使用可配置的
 `markdown_concurrency`（默认 4）和 `asset_concurrency`（默认 2）进行有界并发；stderr
 持续显示阶段与单文件进度，stdout 保留稳定的最终报告。相同 Snapshot、内容与审核合同的

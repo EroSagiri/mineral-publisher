@@ -33,6 +33,12 @@ use super::{
     secrets::SecretName,
 };
 
+pub const INLINE_SOURCE_R2_SECRET: &str = "__mineral_inline_source_r2_secret";
+pub const INLINE_ASSETS_R2_SECRET: &str = "__mineral_inline_assets_r2_secret";
+pub const INLINE_REVIEW_API_KEY: &str = "__mineral_inline_review_api_key";
+pub const R2_SECRET_ENV: &str = "MINERAL_R2_SECRET_ACCESS_KEY";
+pub const DEEPSEEK_API_KEY_ENV: &str = "MINERAL_DEEPSEEK_API_KEY";
+
 /// One workspace configuration that has been validated and normalized.
 ///
 /// It dereferences to the model it was built from, so reading a setting is
@@ -405,36 +411,52 @@ impl ValidatedConfig {
 
     /// The credential name an R2 source resolves.
     pub fn source_r2_secret_name(&self) -> Result<SecretName, ConfigError> {
-        let name = self
-            .model
-            .source
-            .r2
-            .as_ref()
-            .map(|r2| r2.secret_access_key_env.as_str())
-            .ok_or_else(|| {
-                ConfigError::invalid("source.type is r2 but source.r2 is not configured")
-            })?;
-        secret_name("source.r2.secret_access_key_env", name)
+        let r2 = self.model.source.r2.as_ref().ok_or_else(|| {
+            ConfigError::invalid("source.type is r2 but source.r2 is not configured")
+        })?;
+        if r2.secret_access_key.is_some() {
+            return secret_name("source.r2.secret_access_key", INLINE_SOURCE_R2_SECRET);
+        }
+        secret_name("source.r2.secret_access_key", R2_SECRET_ENV)
     }
 
     /// The credential name an asset target resolves.
     pub fn assets_r2_secret_name(&self) -> Result<SecretName, ConfigError> {
-        let name = self
-            .assets()?
-            .r2
-            .as_ref()
-            .map(|r2| r2.secret_access_key_env.as_str())
-            .ok_or_else(|| {
-                ConfigError::invalid(
-                    "assets must configure either target_path or r2 before publishing",
-                )
-            })?;
-        secret_name("assets.r2.secret_access_key_env", name)
+        let r2 = self.assets()?.r2.as_ref().ok_or_else(|| {
+            ConfigError::invalid("assets must configure either target_path or r2 before publishing")
+        })?;
+        if r2.secret_access_key.is_some() {
+            return secret_name("assets.r2.secret_access_key", INLINE_ASSETS_R2_SECRET);
+        }
+        secret_name("assets.r2.secret_access_key", R2_SECRET_ENV)
     }
 
     /// The credential name the review provider resolves.
     pub fn review_api_key_name(&self) -> Result<SecretName, ConfigError> {
-        secret_name("review.api_key_env", &self.model.review.api_key_env)
+        if self.model.review.api_key.is_some() {
+            return secret_name("review.api_key", INLINE_REVIEW_API_KEY);
+        }
+        secret_name("review.api_key", DEEPSEEK_API_KEY_ENV)
+    }
+
+    /// Inline credentials to be installed into the runtime's in-memory provider.
+    pub fn inline_secrets(&self) -> Vec<(&'static str, &str)> {
+        let mut values = Vec::new();
+        if let Some(r2) = &self.model.source.r2
+            && let Some(value) = r2.secret_access_key.as_deref()
+        {
+            values.push((INLINE_SOURCE_R2_SECRET, value));
+        }
+        if let Some(assets) = &self.model.assets
+            && let Some(r2) = &assets.r2
+            && let Some(value) = r2.secret_access_key.as_deref()
+        {
+            values.push((INLINE_ASSETS_R2_SECRET, value));
+        }
+        if let Some(value) = self.model.review.api_key.as_deref() {
+            values.push((INLINE_REVIEW_API_KEY, value));
+        }
+        values
     }
 
     /// The review settings, which every reviewer construction reads.
