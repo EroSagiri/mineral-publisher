@@ -68,14 +68,14 @@ impl Drop for Scratch {
     }
 }
 
-const WORKSPACE: &str = "source:\n  id: local-vault\n  path: ./vault\nstate:\n  path: ./.mineral\ngit:\n  repository: ./publication\n  remote: origin\n  reference: refs/heads/main\n  author_name: Bot\n  author_email: bot@example.invalid\n  message: Publish Mineral content\nassets:\n  public_base_url: https://assets.example.com\n  target_path: ./asset-target\nreview:\n  api_base_url: https://api.deepseek.com\n  markdown_model: deepseek-flash\n  asset_model: deepseek-flash\n  api_key: operations-test-key\n  timeout_seconds: 45\n";
+const WORKSPACE: &str = "[source]\nid = \"local-vault\"\npath = \"./vault\"\n\n[state]\npath = \"./.mineral\"\n\n[git]\nrepository = \"./publication\"\nremote = \"origin\"\nreference = \"refs/heads/main\"\nauthor_name = \"Bot\"\nauthor_email = \"bot@example.invalid\"\nmessage = \"Publish Mineral content\"\n\n[assets]\npublic_base_url = \"https://assets.example.com\"\ntarget_path = \"./asset-target\"\n\n[review]\napi_base_url = \"https://api.deepseek.com\"\nmarkdown_model = \"deepseek-flash\"\nasset_model = \"deepseek-flash\"\napi_key = \"operations-test-key\"\ntimeout_seconds = 45\n";
 
 /// An initialized workspace, built the way `mineral init` would build it.
 fn workspace(name: &str) -> (Scratch, Arc<WorkspaceRuntime>) {
     let scratch = Scratch::new(name);
-    let path = scratch.0.join("mineral.yaml");
+    let path = scratch.0.join("mineral.toml");
     fs::write(&path, WORKSPACE).unwrap();
-    let model: RawConfig = serde_yaml_ng::from_str(WORKSPACE).unwrap();
+    let model: RawConfig = toml::from_str(WORKSPACE).unwrap();
     let config = ValidatedConfig::from_raw(model, &path).unwrap();
     let secrets = Arc::new(
         StaticSecretProvider::new().with("__mineral_inline_review_api_key", "operations-test-key"),

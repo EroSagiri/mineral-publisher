@@ -72,8 +72,8 @@ mod tests {
             Invocation::Help
         ));
         assert!(matches!(
-            parse(args(&["--config", "w.yaml", "publish"]).into_iter()).unwrap(),
-            Invocation::Publish { config } if config == *"w.yaml"
+            parse(args(&["--config", "workspace.toml", "publish"]).into_iter()).unwrap(),
+            Invocation::Publish { config } if config == *"workspace.toml"
         ));
         // TOML is the only supported default configuration format.
         assert!(matches!(
@@ -106,7 +106,6 @@ mod tests {
     /// `init` writes the language the file name promises, and refuses to write
     /// one whose name promises a different language.
     ///
-    /// A `.yaml` filename is refused because TOML is the only configuration format.
     #[test]
     fn init_writes_the_language_the_file_name_promises() {
         let directory =
@@ -121,13 +120,6 @@ mod tests {
             WorkspaceRuntime::load(toml.clone()).unwrap().source_kind(),
             mineral_publisher::config::SourceType::Local
         );
-
-        let mismatched = directory.join("workspace.yaml");
-        let error = init(&mismatched, ConfigFormat::Toml)
-            .expect_err("a .yaml name must not be written as TOML")
-            .to_string();
-        assert!(error.contains("toml"), "{error}");
-        assert!(!mismatched.exists());
 
         let error = init(&toml, ConfigFormat::Toml)
             .expect_err("an existing configuration must never be overwritten")

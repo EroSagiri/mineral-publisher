@@ -37,7 +37,7 @@ Application → std::env / println ✗  凭据走 SecretProvider，输出走调�
 ```text
 crates/mineral-host/src/
 ├── config/                 文件 → RawConfig → ValidatedConfig → Secrets
-│   ├── model.rs            serde 模型、默认值、示例配置（TOML / YAML）
+│   ├── model.rs            serde 模型、默认值、示例配置（TOML）
 │   ├── load.rs             读文件、按扩展名选择格式
 │   ├── validate.rs         校验 + 规范化（fail closed，顺序与错误信息稳定）
 │   ├── secrets.rs          SecretName / SecretValue / SecretProvider
@@ -143,7 +143,7 @@ Public Pipeline（URL rewrite / R2 assets / privacy / review / sanitization / Gi
 
 | 阶段 | 提交 | 内容 |
 |---|---|---|
-| A | `refactor(host): extract the configuration layer from the CLI` | `config/{model,load,validate,secrets}`，TOML 与 YAML 并存，`mineral init --toml` |
+| A | `refactor(host): extract the configuration layer from the CLI` | `config/{model,load,validate,secrets}`，统一使用 TOML，`mineral init --toml` |
 | B | `refactor(host): move the composition root into a runtime layer` | `runtime/{workspace,composition}`，CLI 不再构造任何 adapter |
 | C+D | `refactor(host): add the application layer and reduce the CLI to an entry point` | `application/{publish,backup,review,status,doctor}`，`cli/{args,commands,output}` |
 

@@ -71,17 +71,17 @@ impl Drop for Scratch {
 }
 
 /// A minimal workspace configuration with a local source, written to disk.
-const WORKSPACE: &str = "source:\n  id: local-vault\n  path: ./vault\nstate:\n  path: ./.mineral\ngit:\n  repository: ./publication\n  remote: origin\n  reference: refs/heads/main\n  author_name: Bot\n  author_email: bot@example.invalid\n  message: Publish Mineral content\nassets:\n  public_base_url: https://assets.example.com\n  target_path: ./asset-target\npublic:\n  exclude: []\nreview:\n  api_base_url: https://api.deepseek.com\n  markdown_model: deepseek-flash\n  asset_model: deepseek-flash\n  api_key: application-test-key\n  timeout_seconds: 45\n";
+const WORKSPACE: &str = "[source]\nid = \"local-vault\"\npath = \"./vault\"\n\n[state]\npath = \"./.mineral\"\n\n[git]\nrepository = \"./publication\"\nremote = \"origin\"\nreference = \"refs/heads/main\"\nauthor_name = \"Bot\"\nauthor_email = \"bot@example.invalid\"\nmessage = \"Publish Mineral content\"\n\n[assets]\npublic_base_url = \"https://assets.example.com\"\ntarget_path = \"./asset-target\"\n\n[public]\nexclude = []\n\n[review]\napi_base_url = \"https://api.deepseek.com\"\nmarkdown_model = \"deepseek-flash\"\nasset_model = \"deepseek-flash\"\napi_key = \"application-test-key\"\ntimeout_seconds = 45\n";
 
 /// A workspace with an enabled backup target, so backup use cases are reachable.
-const BACKUP_WORKSPACE: &str = "source:\n  id: local-vault\n  path: ./vault\nstate:\n  path: ./.mineral\ngit:\n  repository: ./publication\n  remote: origin\n  reference: refs/heads/main\n  author_name: Bot\n  author_email: bot@example.invalid\n  message: Publish Mineral content\nassets:\n  public_base_url: https://assets.example.com\n  target_path: ./asset-target\nreview:\n  api_base_url: https://api.deepseek.com\n  markdown_model: deepseek-flash\n  asset_model: deepseek-flash\n  api_key: application-test-key\n  timeout_seconds: 45\nbackup:\n  enabled: true\n  git:\n    repository: ./backup-repo\n    remote: origin\n    branch: refs/heads/mineral-backup\n    author_name: Mineral Backup\n    author_email: backup@example.invalid\n    message: Backup knowledge snapshot\n  lfs:\n    enabled: true\n    batch_url: https://github.com/owner/repo.git/info/lfs\n    username_env: MINERAL_APPLICATION_TEST_USER\n    token_env: MINERAL_APPLICATION_TEST_TOKEN\n";
+const BACKUP_WORKSPACE: &str = "[source]\nid = \"local-vault\"\npath = \"./vault\"\n\n[state]\npath = \"./.mineral\"\n\n[git]\nrepository = \"./publication\"\nremote = \"origin\"\nreference = \"refs/heads/main\"\nauthor_name = \"Bot\"\nauthor_email = \"bot@example.invalid\"\nmessage = \"Publish Mineral content\"\n\n[assets]\npublic_base_url = \"https://assets.example.com\"\ntarget_path = \"./asset-target\"\n\n[review]\napi_base_url = \"https://api.deepseek.com\"\nmarkdown_model = \"deepseek-flash\"\nasset_model = \"deepseek-flash\"\napi_key = \"application-test-key\"\ntimeout_seconds = 45\n\n[backup]\nenabled = true\n\n[backup.git]\nrepository = \"./backup-repo\"\nremote = \"origin\"\nbranch = \"refs/heads/mineral-backup\"\nauthor_name = \"Mineral Backup\"\nauthor_email = \"backup@example.invalid\"\nmessage = \"Backup knowledge snapshot\"\n\n[backup.lfs]\nenabled = true\nbatch_url = \"https://github.com/owner/repo.git/info/lfs\"\nusername_env = \"MINERAL_APPLICATION_TEST_USER\"\ntoken_env = \"MINERAL_APPLICATION_TEST_TOKEN\"\n";
 
 /// Builds an initialized workspace, exactly the way `mineral init` would.
 fn workspace(name: &str, text: &str) -> (Scratch, WorkspaceRuntime) {
     let scratch = Scratch::new(name);
-    let path = scratch.path().join("mineral.yaml");
+    let path = scratch.path().join("mineral.toml");
     fs::write(&path, text).unwrap();
-    let model: RawConfig = serde_yaml_ng::from_str(text).unwrap();
+    let model: RawConfig = toml::from_str(text).unwrap();
     let config = ValidatedConfig::from_raw(model, &path).unwrap();
     let secrets = Arc::new(
         StaticSecretProvider::new()

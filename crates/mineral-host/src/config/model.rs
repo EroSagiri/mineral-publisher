@@ -11,97 +11,11 @@ use std::{fmt, path::PathBuf};
 
 use serde::Deserialize;
 
-/// Legacy YAML fixture retained only by unit tests; workspace files are TOML only.
+/// The TOML template a fresh workspace is born with.
 ///
-/// It is the documented shape of a workspace: every section, every default and
-/// every credential *name* in one place, with the optional sections commented out
-/// so that an untouched workspace behaves exactly as one written before they
-/// existed.
-#[cfg(test)]
-pub const DEFAULT_CONFIG: &str = r#"source:
-  # One active source. `type` is optional and defaults to a local directory tree, so
-  # every configuration written before R2 sources existed keeps working unchanged.
-  type: local
-  id: local-vault
-  path: ./vault
-  # An R2 source instead reads one managed prefix of a bucket. It needs a non-empty
-  # prefix (never the whole bucket) and the same credential mechanism as the asset
-  # target: the secret is named here, never written here.
-  # type: r2
-  # r2:
-  #   endpoint: https://<account>.r2.cloudflarestorage.com
-  #   bucket: mineral-vault
-  #   prefix: vault/
-  #   access_key_id: <access key id>
-  #   secret_access_key: <secret access key>
-  #   region: auto
-  #   timeout_seconds: 300
-state:
-  path: ./.mineral
-git:
-  repository: ./publication
-  remote: origin
-  reference: refs/heads/main
-  author_name: Mineral Publisher
-  author_email: publisher@example.invalid
-  message: Publish Mineral content
-assets:
-  public_base_url: https://assets.example.com
-  # Exactly one target: the native store on this machine, or an S3-compatible
-  # bucket. The secret key is never written here, only the variable that holds it.
-  target_path: ./asset-target
-  # r2:
-  #   endpoint: https://<account>.r2.cloudflarestorage.com
-  #   bucket: mineral-assets
-  #   access_key_id: <access key id>
-  #   secret_access_key: <secret access key>
-  #   region: auto
-  #   timeout_seconds: 300
-public:
-  # Source paths that stay in the Snapshot and in the content store but never enter
-  # the public candidate set: no privacy scan, no review, no publication.
-  exclude: []
-  # exclude:
-  #   - "private/**"
-  #   - "drafts/**"
-  #   - "secret.md"
-  #   - "notes/internal.md"
-  #   - "**/*.tmp"
-review:
-  api_base_url: https://api.deepseek.com
-  markdown_model: deepseek-flash
-  asset_model: deepseek-flash
-  # api_key: <DeepSeek API key>
-  timeout_seconds: 45
-  markdown_concurrency: 4
-  asset_concurrency: 2
-# An optional private backup of every Snapshot, byte-faithful and restorable.
-# It is absent here because every workspace worked before backups existed and
-# must keep working unchanged. Credentials are named here, never written here.
-# backup:
-#   enabled: true
-#   git:
-#     repository: ./backup-repo
-#     remote: origin
-#     branch: refs/heads/mineral-backup
-#     author_name: Mineral Backup
-#     author_email: backup@example.invalid
-#     message: Backup knowledge snapshot
-#   lfs:
-#     # Required whenever the backup is enabled: binary objects live in Git LFS.
-#     enabled: true
-#     # Omit batch_url to derive it from the Git remote URL, or name the endpoint.
-#     batch_url: https://github.com/<owner>/<repo>.git/info/lfs
-#     username_env: MINERAL_BACKUP_LFS_USER
-#     token_env: MINERAL_BACKUP_LFS_TOKEN
-#     timeout_seconds: 300
-"#;
-
-/// The same workspace, in TOML.
-///
-/// The two templates describe exactly the same configuration; only the surface
-/// syntax differs. A configuration file's format is chosen by its extension, so a
-/// workspace written in either language is loaded by the same validation.
+/// Credential keys deliberately remain commented out. Their absence selects the
+/// documented environment variables, whereas a placeholder value would be treated
+/// as an inline credential and suppress environment-based resolution.
 pub const DEFAULT_CONFIG_TOML: &str = r#"# Mineral Publisher workspace.
 # Workspace configuration is TOML only.
 
@@ -117,6 +31,7 @@ path = "./vault"
 # bucket = "mineral-vault"
 # prefix = "vault/"
 # access_key_id = "<access key id>"
+# Leave this key absent to use MINERAL_R2_SECRET_ACCESS_KEY from the environment.
 # secret_access_key = "<secret access key>"
 # region = "auto"
 # timeout_seconds = 300
@@ -141,6 +56,7 @@ target_path = "./asset-target"
 # endpoint = "https://<account>.r2.cloudflarestorage.com"
 # bucket = "mineral-assets"
 # access_key_id = "<access key id>"
+# Leave this key absent to use MINERAL_R2_SECRET_ACCESS_KEY from the environment.
 # secret_access_key = "<secret access key>"
 # region = "auto"
 # timeout_seconds = 300
@@ -154,7 +70,8 @@ exclude = []
 api_base_url = "https://api.deepseek.com"
 markdown_model = "deepseek-flash"
 asset_model = "deepseek-flash"
-  # api_key = "<DeepSeek API key>"
+# Leave this key absent to use DEEPSEEK_API_KEY from the environment.
+# api_key = "<DeepSeek API key>"
 timeout_seconds = 45
 markdown_concurrency = 4
 asset_concurrency = 2

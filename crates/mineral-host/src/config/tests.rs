@@ -7,7 +7,7 @@
 use std::{fs, path::PathBuf};
 
 use super::{
-    ConfigFormat, DEFAULT_CONFIG, DEFAULT_CONFIG_TOML, RawConfig, SourceType, StaticSecretProvider,
+    ConfigFormat, DEFAULT_CONFIG_TOML, RawConfig, SourceType, StaticSecretProvider,
     ValidatedConfig, load,
     model::SourceConfig,
     secrets::{EnvSecretProvider, SecretName, SecretProvider, SecretValue},
@@ -23,73 +23,33 @@ fn scratch(name: &str) -> PathBuf {
     directory
 }
 
-/// The two templates describe the same workspace.
-///
-/// This is the promise TOML support makes: the language is surface syntax, and
-/// nothing downstream can tell which one a workspace was written in. Comparing
-/// the *validated* forms is what makes that a real claim rather than a claim
-/// about two similar-looking strings.
+/// The generated TOML template describes a usable local workspace.
 #[test]
-fn the_toml_and_yaml_templates_describe_the_same_workspace() {
+fn the_toml_template_describes_a_workspace() {
     let directory = scratch("templates");
-    let yaml = directory.join("mineral.yaml");
     let toml = directory.join("mineral.toml");
-    fs::write(&yaml, DEFAULT_CONFIG).unwrap();
     fs::write(&toml, DEFAULT_CONFIG_TOML).unwrap();
 
-    let from_yaml = load(&yaml).unwrap();
-    let from_toml = load(&toml).unwrap();
-
-    assert_eq!(from_yaml.source_kind(), from_toml.source_kind());
-    assert_eq!(from_yaml.source.id, from_toml.source.id);
-    assert_eq!(from_yaml.state.path, from_toml.state.path);
-    assert_eq!(from_yaml.git.repository, from_toml.git.repository);
-    assert_eq!(from_yaml.git.remote, from_toml.git.remote);
-    assert_eq!(from_yaml.git.reference, from_toml.git.reference);
-    assert_eq!(from_yaml.git.author_email, from_toml.git.author_email);
-    assert_eq!(
-        from_yaml.assets.as_ref().unwrap().public_base_url,
-        from_toml.assets.as_ref().unwrap().public_base_url
-    );
-    assert_eq!(
-        from_yaml.assets.as_ref().unwrap().target_path,
-        from_toml.assets.as_ref().unwrap().target_path
-    );
-    assert_eq!(
-        from_yaml.public.as_ref().unwrap().exclude,
-        from_toml.public.as_ref().unwrap().exclude
-    );
-    assert_eq!(
-        from_yaml.review.markdown_model,
-        from_toml.review.markdown_model
-    );
-    assert_eq!(from_yaml.review.asset_model, from_toml.review.asset_model);
-    assert_eq!(
-        from_yaml.review.markdown_concurrency,
-        from_toml.review.markdown_concurrency
-    );
-    assert_eq!(from_yaml.backup_enabled(), from_toml.backup_enabled());
+    let config = load(&toml).unwrap();
+    assert_eq!(config.source_kind(), SourceType::Local);
+    assert_eq!(config.source.id, "local-vault");
+    assert!(!config.backup_enabled());
 
     let _ = fs::remove_dir_all(&directory);
 }
 
-/// A relative path is resolved against the directory the file lives in, in
-/// either language, so the two templates produce byte-identical paths.
+/// A relative path is resolved against the directory the TOML file lives in.
 #[test]
-fn both_languages_resolve_relative_paths_the_same_way() {
+fn toml_resolves_relative_paths_against_its_directory() {
     let directory = scratch("relative");
-    let yaml = directory.join("mineral.yaml");
     let toml = directory.join("mineral.toml");
-    fs::write(&yaml, DEFAULT_CONFIG).unwrap();
     fs::write(&toml, DEFAULT_CONFIG_TOML).unwrap();
 
-    let from_yaml = load(&yaml).unwrap();
-    let from_toml = load(&toml).unwrap();
+    let config = load(&toml).unwrap();
 
-    assert!(from_yaml.state.path.is_absolute());
-    assert_eq!(from_yaml.state.path, from_toml.state.path);
+    assert!(config.state.path.is_absolute());
     assert_eq!(
-        from_yaml.source.path.as_deref().unwrap().parent(),
+        config.source.path.as_deref().unwrap().parent(),
         Some(directory.as_path())
     );
 
@@ -102,7 +62,7 @@ fn both_languages_resolve_relative_paths_the_same_way() {
 fn a_configuration_file_must_name_its_language() {
     let directory = scratch("extension");
     let path = directory.join("mineral.conf");
-    fs::write(&path, DEFAULT_CONFIG).unwrap();
+    fs::write(&path, DEFAULT_CONFIG_TOML).unwrap();
 
     let error = load(&path).expect_err("an unknown extension must be refused");
     assert!(error.to_string().contains("toml"), "{error}");
@@ -110,18 +70,12 @@ fn a_configuration_file_must_name_its_language() {
     let _ = fs::remove_dir_all(&directory);
 }
 
-/// A typo is a refusal, in either language: a workspace must not silently
+/// A typo is a refusal: a workspace must not silently
 /// publish with the setting the author did not mean.
 #[test]
-fn a_misspelled_key_is_refused_in_either_language() {
+fn a_misspelled_key_is_refused() {
     let directory = scratch("typo");
 
-    let yaml = directory.join("mineral.yaml");
-    fs::write(
-        &yaml,
-        DEFAULT_CONFIG.replace("  id: local-vault\n", "  ident: local-vault\n"),
-    )
-    .unwrap();
     let toml = directory.join("mineral.toml");
     fs::write(
         &toml,
@@ -129,14 +83,8 @@ fn a_misspelled_key_is_refused_in_either_language() {
     )
     .unwrap();
 
-    for path in [&yaml, &toml] {
-        let error = load(path).expect_err("a misspelled key must be refused");
-        assert!(
-            error.to_string().contains("ident"),
-            "{}: {error}",
-            path.display()
-        );
-    }
+    let error = load(&toml).expect_err("a misspelled key must be refused");
+    assert!(error.to_string().contains("ident"), "{error}");
 
     let _ = fs::remove_dir_all(&directory);
 }
@@ -148,8 +96,8 @@ fn a_misspelled_key_is_refused_in_either_language() {
 /// is a pure function rather than a step inside file reading.
 #[test]
 fn a_model_can_be_validated_without_a_file() {
-    let model: RawConfig = serde_yaml_ng::from_str(DEFAULT_CONFIG).unwrap();
-    let config = ValidatedConfig::from_raw(model, "in-memory.yaml").unwrap();
+    let model: RawConfig = toml::from_str(DEFAULT_CONFIG_TOML).unwrap();
+    let config = ValidatedConfig::from_raw(model, "in-memory.toml").unwrap();
 
     assert_eq!(config.source_kind(), SourceType::Local);
     assert!(config.state_path().is_absolute());
@@ -162,17 +110,17 @@ fn a_model_can_be_validated_without_a_file() {
 #[test]
 fn a_validated_configuration_names_credentials_and_never_carries_them() {
     let text = format!(
-        "{DEFAULT_CONFIG}backup:\n  enabled: true\n  git:\n    repository: ./backup-repo\n    remote: origin\n    branch: refs/heads/mineral-backup\n  lfs:\n    enabled: true\n    batch_url: https://github.com/owner/repo.git/info/lfs\n    username_env: MINERAL_CONFIG_TEST_USER\n    token_env: MINERAL_CONFIG_TEST_TOKEN\n"
+        "{DEFAULT_CONFIG_TOML}\n[backup]\nenabled = true\n\n[backup.git]\nrepository = \"./backup-repo\"\nremote = \"origin\"\nbranch = \"refs/heads/mineral-backup\"\n\n[backup.lfs]\nenabled = true\nbatch_url = \"https://github.com/owner/repo.git/info/lfs\"\nusername_env = \"MINERAL_CONFIG_TEST_USER\"\ntoken_env = \"MINERAL_CONFIG_TEST_TOKEN\"\n"
     );
-    let model: RawConfig = serde_yaml_ng::from_str(&text).unwrap();
-    let config = ValidatedConfig::from_raw(model, "in-memory.yaml").unwrap();
+    let model: RawConfig = toml::from_str(&text).unwrap();
+    let config = ValidatedConfig::from_raw(model, "in-memory.toml").unwrap();
 
     let (username, token) = config.backup_lfs_credential_names().unwrap();
     assert_eq!(username.as_str(), "MINERAL_CONFIG_TEST_USER");
     assert_eq!(token.as_str(), "MINERAL_CONFIG_TEST_TOKEN");
     assert_eq!(
         config.review_api_key_name().unwrap().as_str(),
-        "__mineral_inline_review_api_key"
+        "MINERAL_DEEPSEEK_API_KEY"
     );
 
     // The dump a log or an error report would carry names the variables and
@@ -181,8 +129,7 @@ fn a_validated_configuration_names_credentials_and_never_carries_them() {
     assert!(dump.contains("MINERAL_CONFIG_TEST_TOKEN"), "{dump}");
 }
 
-/// Two languages, one rule: an empty credential name is refused while the
-/// configuration is validated, in either file.
+/// An empty credential name is refused while the TOML configuration is validated.
 #[test]
 fn an_unusable_credential_name_is_refused_while_the_configuration_loads() {
     let directory = scratch("secret-name");
@@ -269,8 +216,6 @@ fn a_format_knows_its_extension_and_its_template() {
         ConfigFormat::of(&PathBuf::from("a.toml")),
         Some(ConfigFormat::Toml)
     );
-    assert_eq!(ConfigFormat::of(&PathBuf::from("a.yaml")), None);
-    assert_eq!(ConfigFormat::of(&PathBuf::from("a.yml")), None);
     assert_eq!(ConfigFormat::of(&PathBuf::from("a.conf")), None);
     assert_eq!(ConfigFormat::Toml.extension(), "toml");
     assert!(ConfigFormat::Toml.template().contains("[source]"));
@@ -282,14 +227,14 @@ fn a_format_knows_its_extension_and_its_template() {
 /// A model with a source kind that contradicts its fields is refused by name.
 #[test]
 fn validation_refuses_a_contradictory_source() {
-    let mut model: RawConfig = serde_yaml_ng::from_str(DEFAULT_CONFIG).unwrap();
+    let mut model: RawConfig = toml::from_str(DEFAULT_CONFIG_TOML).unwrap();
     model.source = SourceConfig {
         id: "local-vault".to_owned(),
         kind: Some(SourceType::R2),
         path: Some(PathBuf::from("./vault")),
         r2: None,
     };
-    let error = ValidatedConfig::from_raw(model, "in-memory.yaml")
+    let error = ValidatedConfig::from_raw(model, "in-memory.toml")
         .expect_err("an R2 source with a local path must be refused");
     assert!(error.is_about("source.path"), "{error}");
 }
