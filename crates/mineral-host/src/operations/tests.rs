@@ -68,7 +68,7 @@ impl Drop for Scratch {
     }
 }
 
-const WORKSPACE: &str = "source:\n  id: local-vault\n  path: ./vault\nstate:\n  path: ./.mineral\ngit:\n  repository: ./publication\n  remote: origin\n  reference: refs/heads/main\n  author_name: Bot\n  author_email: bot@example.invalid\n  message: Publish Mineral content\nassets:\n  public_base_url: https://assets.example.com\n  target_path: ./asset-target\nreview:\n  api_base_url: https://api.deepseek.com\n  markdown_model: deepseek-flash\n  asset_model: deepseek-flash\n  api_key_env: MINERAL_OPERATIONS_TEST_KEY\n  timeout_seconds: 45\n";
+const WORKSPACE: &str = "source:\n  id: local-vault\n  path: ./vault\nstate:\n  path: ./.mineral\ngit:\n  repository: ./publication\n  remote: origin\n  reference: refs/heads/main\n  author_name: Bot\n  author_email: bot@example.invalid\n  message: Publish Mineral content\nassets:\n  public_base_url: https://assets.example.com\n  target_path: ./asset-target\nreview:\n  api_base_url: https://api.deepseek.com\n  markdown_model: deepseek-flash\n  asset_model: deepseek-flash\n  api_key: operations-test-key\n  timeout_seconds: 45\n";
 
 /// An initialized workspace, built the way `mineral init` would build it.
 fn workspace(name: &str) -> (Scratch, Arc<WorkspaceRuntime>) {
@@ -78,7 +78,7 @@ fn workspace(name: &str) -> (Scratch, Arc<WorkspaceRuntime>) {
     let model: RawConfig = serde_yaml_ng::from_str(WORKSPACE).unwrap();
     let config = ValidatedConfig::from_raw(model, &path).unwrap();
     let secrets = Arc::new(
-        StaticSecretProvider::new().with("MINERAL_OPERATIONS_TEST_KEY", "operations-test-key"),
+        StaticSecretProvider::new().with("__mineral_inline_review_api_key", "operations-test-key"),
     ) as Arc<dyn SecretProvider>;
     let runtime = Arc::new(WorkspaceRuntime::new(config, path, secrets));
     runtime.prepare().unwrap();

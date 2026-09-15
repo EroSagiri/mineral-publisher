@@ -26,7 +26,7 @@ fn workspace(name: &str, text: &str) -> (PathBuf, ValidatedConfig) {
 }
 
 /// A workspace whose backup target names two credential variables.
-const BACKUP_WORKSPACE: &str = "source:\n  id: local-vault\n  path: ./vault\nstate:\n  path: ./.mineral\ngit:\n  repository: ./publication\n  remote: origin\n  reference: refs/heads/main\n  author_name: Bot\n  author_email: bot@example.invalid\n  message: Publish Mineral content\nassets:\n  public_base_url: https://assets.example.com\n  target_path: ./asset-target\nreview:\n  api_base_url: https://api.deepseek.com\n  markdown_model: deepseek-flash\n  asset_model: deepseek-flash\n  api_key_env: MINERAL_DEEPSEEK_API_KEY\n  timeout_seconds: 45\nbackup:\n  enabled: true\n  git:\n    repository: ./backup-repo\n    remote: origin\n    branch: refs/heads/mineral-backup\n  lfs:\n    enabled: true\n    batch_url: https://github.com/owner/repo.git/info/lfs\n    username_env: MINERAL_RUNTIME_TEST_USER\n    token_env: MINERAL_RUNTIME_TEST_TOKEN\n";
+const BACKUP_WORKSPACE: &str = "source:\n  id: local-vault\n  path: ./vault\nstate:\n  path: ./.mineral\ngit:\n  repository: ./publication\n  remote: origin\n  reference: refs/heads/main\n  author_name: Bot\n  author_email: bot@example.invalid\n  message: Publish Mineral content\nassets:\n  public_base_url: https://assets.example.com\n  target_path: ./asset-target\nreview:\n  api_base_url: https://api.deepseek.com\n  markdown_model: deepseek-flash\n  asset_model: deepseek-flash\n  api_key: runtime-test-key\n  timeout_seconds: 45\nbackup:\n  enabled: true\n  git:\n    repository: ./backup-repo\n    remote: origin\n    branch: refs/heads/mineral-backup\n  lfs:\n    enabled: true\n    batch_url: https://github.com/owner/repo.git/info/lfs\n    username_env: MINERAL_RUNTIME_TEST_USER\n    token_env: MINERAL_RUNTIME_TEST_TOKEN\n";
 
 /// A caller supplies the credentials, so the runtime never consults the
 /// environment. This is the seam a web host or a test uses.
@@ -152,7 +152,7 @@ mod workspace_configuration {
         let directory =
             std::env::temp_dir().join(format!("mineral-cli-assets-{}", std::process::id()));
         std::fs::create_dir_all(&directory).unwrap();
-        let r2 = "  r2:\n    endpoint: https://account.r2.cloudflarestorage.com\n    bucket: mineral-assets\n    access_key_id: AKIDEXAMPLE\n    secret_access_key_env: MINERAL_R2_SECRET_ACCESS_KEY\n";
+        let r2 = "  r2:\n    endpoint: https://account.r2.cloudflarestorage.com\n    bucket: mineral-assets\n    access_key_id: AKIDEXAMPLE\n";
 
         let native = DEFAULT_CONFIG.to_owned();
         let neither = DEFAULT_CONFIG.replace("  target_path: ./asset-target\n", "");
@@ -239,7 +239,7 @@ mod workspace_configuration {
         std::fs::create_dir_all(&directory).unwrap();
         let text = DEFAULT_CONFIG.replace(
             "  target_path: ./asset-target\n",
-            "  r2:\n    endpoint: https://account.r2.cloudflarestorage.com\n    bucket: mineral-assets\n    access_key_id: AKIDEXAMPLE\n    secret_access_key_env: MINERAL_R2_TEST_UNSET_SECRET\n",
+            "  r2:\n    endpoint: https://account.r2.cloudflarestorage.com\n    bucket: mineral-assets\n    access_key_id: AKIDEXAMPLE\n",
         );
         let path = directory.join("r2.yml");
         std::fs::write(&path, text).unwrap();
@@ -251,7 +251,7 @@ mod workspace_configuration {
             .expect("an unset secret must be refused")
             .to_string();
 
-        assert!(error.contains("MINERAL_R2_TEST_UNSET_SECRET"), "{error}");
+        assert!(error.contains("MINERAL_R2_SECRET_ACCESS_KEY"), "{error}");
         let _ = std::fs::remove_dir_all(&directory);
     }
 
@@ -278,7 +278,7 @@ mod workspace_configuration {
     /// block, everything else minimal.
     fn source_workspace(source: &str, assets: &str) -> Result<Workspace, Box<dyn Error>> {
         let text = format!(
-            "source:\n{source}state:\n  path: ./.mineral\ngit:\n  repository: ./publication\n  remote: origin\n  reference: refs/heads/main\n  author_name: Bot\n  author_email: bot@example.invalid\n  message: Publish Mineral content\n{assets}review:\n  api_base_url: https://api.deepseek.com\n  markdown_model: deepseek-flash\n  asset_model: deepseek-flash\n  api_key_env: MINERAL_DEEPSEEK_API_KEY\n  timeout_seconds: 45\n"
+            "source:\n{source}state:\n  path: ./.mineral\ngit:\n  repository: ./publication\n  remote: origin\n  reference: refs/heads/main\n  author_name: Bot\n  author_email: bot@example.invalid\n  message: Publish Mineral content\n{assets}review:\n  api_base_url: https://api.deepseek.com\n  markdown_model: deepseek-flash\n  asset_model: deepseek-flash\n  timeout_seconds: 45\n"
         );
         static NEXT: AtomicUsize = AtomicUsize::new(1);
         let directory = std::env::temp_dir().join(format!(
@@ -294,13 +294,13 @@ mod workspace_configuration {
 
     fn r2_source_block(prefix: &str) -> String {
         format!(
-            "  id: r2-vault\n  type: r2\n  r2:\n    endpoint: https://account.r2.cloudflarestorage.com\n    bucket: mineral-vault\n    prefix: {prefix}\n    access_key_id: AKIDEXAMPLE\n    secret_access_key_env: MINERAL_R2_TEST_UNSET_SECRET\n"
+            "  id: r2-vault\n  type: r2\n  r2:\n    endpoint: https://account.r2.cloudflarestorage.com\n    bucket: mineral-vault\n    prefix: {prefix}\n    access_key_id: AKIDEXAMPLE\n"
         )
     }
 
     fn r2_assets_block(bucket: &str) -> String {
         format!(
-            "assets:\n  public_base_url: https://assets.example.com\n  r2:\n    endpoint: https://account.r2.cloudflarestorage.com\n    bucket: {bucket}\n    access_key_id: AKIDEXAMPLE\n    secret_access_key_env: MINERAL_R2_TEST_UNSET_SECRET\n"
+            "assets:\n  public_base_url: https://assets.example.com\n  r2:\n    endpoint: https://account.r2.cloudflarestorage.com\n    bucket: {bucket}\n    access_key_id: AKIDEXAMPLE\n"
         )
     }
 
@@ -335,14 +335,14 @@ mod workspace_configuration {
             Ok(_) => panic!("an unset secret must be refused"),
             Err(error) => error.to_string(),
         };
-        assert!(error.contains("MINERAL_R2_TEST_UNSET_SECRET"), "{error}");
+        assert!(error.contains("MINERAL_R2_SECRET_ACCESS_KEY"), "{error}");
     }
 
     #[test]
     fn a_source_must_choose_exactly_one_kind() {
         // `type: local` cannot also carry an R2 namespace.
         let local_with_r2 = source_workspace(
-            "  id: local-vault\n  path: ./vault\n  type: local\n  r2:\n    endpoint: https://account.r2.cloudflarestorage.com\n    bucket: mineral-vault\n    prefix: vault/\n    access_key_id: A\n    secret_access_key_env: X\n",
+            "  id: local-vault\n  path: ./vault\n  type: local\n  r2:\n    endpoint: https://account.r2.cloudflarestorage.com\n    bucket: mineral-vault\n    prefix: vault/\n    access_key_id: A\n",
             "",
         )
         .unwrap_err()
@@ -470,7 +470,7 @@ mod workspace_configuration {
         backup: &str,
     ) -> Result<Workspace, Box<dyn Error>> {
         let text = format!(
-            "source:\n{source}state:\n  path: ./.mineral\ngit:\n  repository: ./publication\n  remote: origin\n  reference: refs/heads/main\n  author_name: Bot\n  author_email: bot@example.invalid\n  message: Publish Mineral content\n{assets}{backup}review:\n  api_base_url: https://api.deepseek.com\n  markdown_model: deepseek-flash\n  asset_model: deepseek-flash\n  api_key_env: MINERAL_DEEPSEEK_API_KEY\n  timeout_seconds: 45\n"
+            "source:\n{source}state:\n  path: ./.mineral\ngit:\n  repository: ./publication\n  remote: origin\n  reference: refs/heads/main\n  author_name: Bot\n  author_email: bot@example.invalid\n  message: Publish Mineral content\n{assets}{backup}review:\n  api_base_url: https://api.deepseek.com\n  markdown_model: deepseek-flash\n  asset_model: deepseek-flash\n  timeout_seconds: 45\n"
         );
         static NEXT: AtomicUsize = AtomicUsize::new(1);
         let directory = std::env::temp_dir().join(format!(
