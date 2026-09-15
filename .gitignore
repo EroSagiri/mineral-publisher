@@ -4,5 +4,7 @@
 /mineral.yaml
 /mineral.backup.yaml
 /mineral.toml
+/publication
+/vault
 crates/mineral-host/examples/fixtures/deepseek_markdown_reviewer_smoke
 /backup-repo
