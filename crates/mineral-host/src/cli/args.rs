@@ -53,16 +53,8 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Invocation, Box<dyn E
     let rest = args[1..].to_vec();
     match command {
         "init" => {
-            // A fresh workspace may be written in either language. The flag also
-            // decides the name of the file when the operator did not choose one,
-            // so `mineral init --toml` cannot silently write YAML to
-            // `mineral.toml`.
-            let format = if rest.iter().any(|arg| arg == "--toml") {
-                ConfigFormat::Toml
-            } else {
-                ConfigFormat::Yaml
-            };
-            let path = if format == ConfigFormat::Toml && !configured {
+            let format = ConfigFormat::Toml;
+            let path = if !configured {
                 PathBuf::from(format!("mineral.{}", format.extension()))
             } else {
                 config_path
@@ -117,18 +109,9 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Invocation, Box<dyn E
 
 /// The configuration a command uses when the operator names none.
 ///
-/// `mineral.yaml` stays the default, exactly as it always was. A workspace that
-/// was created with `mineral init --toml` is found too, so the language a file is
-/// written in never has to be repeated on every command line.
+/// `mineral.toml` is the only supported default configuration path.
 pub fn default_config_path() -> PathBuf {
-    let yaml = PathBuf::from("mineral.yaml");
-    if !yaml.exists() {
-        let toml = PathBuf::from("mineral.toml");
-        if toml.exists() {
-            return toml;
-        }
-    }
-    yaml
+    PathBuf::from("mineral.toml")
 }
 
 pub fn print_help() {
@@ -141,7 +124,7 @@ pub fn usage() -> String {
         "Mineral Publisher",
         "",
         "Usage:",
-        "  mineral [--config PATH] init [--toml]",
+        "  mineral [--config PATH] init",
         "  mineral [--config PATH] publish",
         "  mineral [--config PATH] status",
         "  mineral [--config PATH] review list",

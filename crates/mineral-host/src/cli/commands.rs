@@ -68,6 +68,9 @@ fn operate(
 
 /// Creates a fresh workspace in the language its name promises.
 pub fn init(path: &Path, format: ConfigFormat) -> Result<(), Box<dyn Error>> {
+    if format != ConfigFormat::Toml {
+        return Err("only TOML configuration is supported".into());
+    }
     if path.exists() {
         return Err(format!("configuration already exists: {}", path.display()).into());
     }

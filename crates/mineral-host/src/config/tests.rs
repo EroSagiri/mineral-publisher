@@ -269,22 +269,14 @@ fn a_format_knows_its_extension_and_its_template() {
         ConfigFormat::of(&PathBuf::from("a.toml")),
         Some(ConfigFormat::Toml)
     );
-    assert_eq!(
-        ConfigFormat::of(&PathBuf::from("a.yaml")),
-        Some(ConfigFormat::Yaml)
-    );
-    assert_eq!(
-        ConfigFormat::of(&PathBuf::from("a.yml")),
-        Some(ConfigFormat::Yaml)
-    );
+    assert_eq!(ConfigFormat::of(&PathBuf::from("a.yaml")), None);
+    assert_eq!(ConfigFormat::of(&PathBuf::from("a.yml")), None);
     assert_eq!(ConfigFormat::of(&PathBuf::from("a.conf")), None);
     assert_eq!(ConfigFormat::Toml.extension(), "toml");
     assert!(ConfigFormat::Toml.template().contains("[source]"));
-    assert!(ConfigFormat::Yaml.template().contains("source:"));
 
-    // Either template parses as its own language.
+    // The only generated template parses as TOML.
     let _: RawConfig = toml::from_str(ConfigFormat::Toml.template()).unwrap();
-    let _: RawConfig = serde_yaml_ng::from_str(ConfigFormat::Yaml.template()).unwrap();
 }
 
 /// A model with a source kind that contradicts its fields is refused by name.

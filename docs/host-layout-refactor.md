@@ -69,7 +69,7 @@ crates/mineral-host/src/
 ## 三个配置层
 
 ```text
-mineral.toml           文件（TOML 为主；.yaml/.yml 仍可读，旧工作区不受影响）
+mineral.toml           文件（仅支持 TOML）
       │  config::load
       ▼
 RawConfig              只表达“文件里写了什么”，serde + deny_unknown_fields
@@ -108,7 +108,7 @@ pub fn backup(runtime: &WorkspaceRuntime, request: BackupRequest)
 
 | 阶段 | 内容 | 验收 |
 |---|---|---|
-| A | `config/`（model / load / validate / secrets），YAML 保持可用，新增 TOML | 现有测试不改动即通过；新增 TOML/Secret 测试 |
+| A | `config/`（model / load / validate / secrets），统一使用 TOML | 配置格式固定为 TOML |
 | B | `runtime/`（`WorkspaceRuntime` + composition），`cli.rs` 不再自己 new 适配器 | 现有测试不改动即通过 |
 | C | `application/`：publish / backup / review / status / doctor 各自 Request→Outcome，**零打印** | 新增 application 级测试直接调用 use case |
 | D | `cli/`：args + commands + output，只做解析与渲染 | CLI 测试改为断言 Outcome；行为不变 |

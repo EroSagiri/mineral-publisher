@@ -1,4 +1,4 @@
-//! Reading a configuration file, in either supported language.
+//! Reading the TOML workspace configuration file.
 //!
 //! Format is chosen by extension and never guessed from content: a file that
 //! claims to be TOML is parsed as TOML, so a syntax error is reported against
@@ -15,17 +15,11 @@ use super::{
     validate::{ConfigError, ValidatedConfig},
 };
 
-/// The two surface syntaxes this host reads.
-///
-/// They describe exactly the same configuration; the model, the validation and
-/// every default are shared, so nothing downstream can tell which one a
-/// workspace was written in.
+/// The supported configuration syntax.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConfigFormat {
     /// TOML, read from a `.toml` file.
     Toml,
-    /// YAML, read from a `.yaml` or `.yml` file.
-    Yaml,
 }
 
 impl ConfigFormat {
@@ -33,7 +27,6 @@ impl ConfigFormat {
     pub fn of(path: &Path) -> Option<Self> {
         match path.extension().and_then(|extension| extension.to_str()) {
             Some("toml") => Some(Self::Toml),
-            Some("yaml" | "yml") => Some(Self::Yaml),
             _ => None,
         }
     }
@@ -42,7 +35,6 @@ impl ConfigFormat {
     pub fn extension(self) -> &'static str {
         match self {
             Self::Toml => "toml",
-            Self::Yaml => "yaml",
         }
     }
 
@@ -50,7 +42,6 @@ impl ConfigFormat {
     pub fn template(self) -> &'static str {
         match self {
             Self::Toml => super::model::DEFAULT_CONFIG_TOML,
-            Self::Yaml => super::model::DEFAULT_CONFIG,
         }
     }
 }
@@ -59,7 +50,7 @@ impl ConfigFormat {
 pub fn load(path: &Path) -> Result<ValidatedConfig, ConfigError> {
     let format = ConfigFormat::of(path).ok_or_else(|| ConfigError::Format {
         path: path.to_path_buf(),
-        message: "configuration must be a .toml, .yaml or .yml file".to_owned(),
+        message: "configuration must be a .toml file".to_owned(),
     })?;
     parse(path, format)
 }
@@ -75,12 +66,6 @@ pub fn parse(path: &Path, format: ConfigFormat) -> Result<ValidatedConfig, Confi
             path: PathBuf::from(path),
             message: error.to_string(),
         })?,
-        ConfigFormat::Yaml => {
-            serde_yaml_ng::from_str(&bytes).map_err(|error| ConfigError::Format {
-                path: PathBuf::from(path),
-                message: error.to_string(),
-            })?
-        }
     };
     ValidatedConfig::from_raw(model, path)
 }

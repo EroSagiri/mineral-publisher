@@ -2,7 +2,7 @@
 //! secrets.
 //!
 //! ```text
-//! mineral.toml / mineral.yaml
+//! mineral.toml
 //!       │  load::load          extension chooses the syntax
 //!       ▼
 //! RawConfig                     what the file said, and nothing more
@@ -26,11 +26,13 @@ mod tests;
 pub mod validate;
 
 pub use load::{ConfigFormat, load, parse};
+#[cfg(test)]
+pub use model::DEFAULT_CONFIG;
 pub use model::{
     AssetsConfig, BackupConfig, BackupGitConfig, BackupLfsConfig, DEFAULT_BACKUP_AUTHOR_EMAIL,
     DEFAULT_BACKUP_AUTHOR_NAME, DEFAULT_BACKUP_LFS_TIMEOUT_SECONDS, DEFAULT_BACKUP_MESSAGE,
-    DEFAULT_CONFIG, DEFAULT_CONFIG_TOML, GitConfig, PublicConfig, R2Config, RawConfig,
-    ReviewConfig, SourceConfig, SourceR2Config, SourceType, StateConfig,
+    DEFAULT_CONFIG_TOML, GitConfig, PublicConfig, R2Config, RawConfig, ReviewConfig, SourceConfig,
+    SourceR2Config, SourceType, StateConfig,
 };
 pub use secrets::{
     EnvSecretProvider, InlineSecretProvider, SecretError, SecretName, SecretProvider, SecretValue,

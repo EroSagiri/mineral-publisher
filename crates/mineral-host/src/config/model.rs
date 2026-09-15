@@ -11,12 +11,13 @@ use std::{fmt, path::PathBuf};
 
 use serde::Deserialize;
 
-/// The configuration a fresh workspace is born with, in YAML.
+/// Legacy YAML fixture retained only by unit tests; workspace files are TOML only.
 ///
 /// It is the documented shape of a workspace: every section, every default and
 /// every credential *name* in one place, with the optional sections commented out
 /// so that an untouched workspace behaves exactly as one written before they
 /// existed.
+#[cfg(test)]
 pub const DEFAULT_CONFIG: &str = r#"source:
   # One active source. `type` is optional and defaults to a local directory tree, so
   # every configuration written before R2 sources existed keeps working unchanged.
@@ -70,7 +71,7 @@ review:
   api_base_url: https://api.deepseek.com
   markdown_model: deepseek-flash
   asset_model: deepseek-flash
-  api_key: <DeepSeek API key>
+  # api_key: <DeepSeek API key>
   timeout_seconds: 45
   markdown_concurrency: 4
   asset_concurrency: 2
@@ -102,8 +103,7 @@ review:
 /// syntax differs. A configuration file's format is chosen by its extension, so a
 /// workspace written in either language is loaded by the same validation.
 pub const DEFAULT_CONFIG_TOML: &str = r#"# Mineral Publisher workspace.
-# The YAML template in `mineral.yaml` describes the same file; either language
-# loads through the same validation.
+# Workspace configuration is TOML only.
 
 [source]
 # One active source. `type` defaults to a local directory tree.
@@ -154,7 +154,7 @@ exclude = []
 api_base_url = "https://api.deepseek.com"
 markdown_model = "deepseek-flash"
 asset_model = "deepseek-flash"
-api_key = "<DeepSeek API key>"
+  # api_key = "<DeepSeek API key>"
 timeout_seconds = 45
 markdown_concurrency = 4
 asset_concurrency = 2

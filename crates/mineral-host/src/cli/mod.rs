@@ -75,10 +75,10 @@ mod tests {
             parse(args(&["--config", "w.yaml", "publish"]).into_iter()).unwrap(),
             Invocation::Publish { config } if config == *"w.yaml"
         ));
-        // The default is YAML, exactly as it always was.
+        // TOML is the only supported default configuration format.
         assert!(matches!(
             parse(args(&["status"]).into_iter()).unwrap(),
-            Invocation::Status { config } if config == *"mineral.yaml"
+            Invocation::Status { config } if config == *"mineral.toml"
         ));
         // `--toml` chooses both the language and, when unnamed, the file.
         assert!(matches!(
@@ -106,9 +106,7 @@ mod tests {
     /// `init` writes the language the file name promises, and refuses to write
     /// one whose name promises a different language.
     ///
-    /// The extension is what chooses the syntax when the file is read back, so a
-    /// `.yaml` file holding TOML would be a workspace that cannot be opened —
-    /// refused here rather than by a parser later.
+    /// A `.yaml` filename is refused because TOML is the only configuration format.
     #[test]
     fn init_writes_the_language_the_file_name_promises() {
         let directory =

@@ -25,7 +25,7 @@ Source
 
 ## CLI
 
-CLI 可执行文件名为 `mineral`，默认读取当前目录的 `mineral.yaml`：
+CLI 可执行文件名为 `mineral`，默认读取当前目录的 `mineral.toml`：
 
 ```bash
 cargo run --bin mineral -- init
