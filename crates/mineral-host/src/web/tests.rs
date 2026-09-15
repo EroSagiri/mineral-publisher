@@ -15,7 +15,7 @@ use std::{
     fs,
     io::{Read, Write},
     net::{SocketAddr, TcpStream},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -491,6 +491,10 @@ async fn a_second_mutation_is_a_409_and_never_reaches_the_engine() {
     let (status, accepted) = post(&app, "/api/v1/operations/backup").await;
     assert_eq!(status, StatusCode::ACCEPTED);
     let holder = accepted["operation_id"].as_str().unwrap().to_owned();
+    // The worker is started by another thread. Wait for it, so the refusals
+    // below are proven to happen while it is running — and so the "exactly
+    // once" assertion is about the refusals rather than a race.
+    wait_until_started(&executor);
 
     for uri in [
         "/api/v1/operations/publish",
@@ -787,6 +791,157 @@ async fn events_for_an_unknown_operation_are_refused() {
     let (status, body) = get(&app, "/api/v1/operations/op-77/events").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(body["code"], "operation_not_found");
+}
+
+// ---------------------------------------------------------------------------
+// The UI and the API share one origin, and never each other's fallback
+// ---------------------------------------------------------------------------
+
+/// A built UI, without needing Node to make one.
+///
+/// The fixture is two files with recognisable contents, which is all the router
+/// cares about. Rust tests must not depend on npm having run.
+struct FakeUi {
+    /// Owned, because a `Scratch` deletes itself when it is dropped.
+    _scratch: Scratch,
+    dist: PathBuf,
+}
+
+impl FakeUi {
+    fn new(name: &str) -> Self {
+        let scratch = Scratch::new(name);
+        let dist = scratch.0.join("dist");
+        fs::create_dir_all(dist.join("assets")).unwrap();
+        fs::write(
+            dist.join("index.html"),
+            "<!doctype html><title>mineral ui</title><div id=root></div>",
+        )
+        .unwrap();
+        fs::write(dist.join("assets/app.js"), "console.log('mineral')\n").unwrap();
+        Self {
+            _scratch: scratch,
+            dist,
+        }
+    }
+
+    fn path(&self) -> &Path {
+        &self.dist
+    }
+}
+
+async fn raw_get(app: &Router, uri: &str) -> (StatusCode, String, String) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 22)
+        .await
+        .unwrap();
+    (
+        status,
+        content_type,
+        String::from_utf8_lossy(&bytes).into_owned(),
+    )
+}
+
+/// A client-side route is served the application shell, so a reload works.
+#[tokio::test(flavor = "multi_thread")]
+async fn client_routes_are_served_the_application_shell() {
+    let (_scratch, runtime) = workspace("spa");
+    let ui = FakeUi::new("spa-assets");
+    let state = Arc::new(WebState::with_assets(
+        runtime,
+        Some(ui.path().to_path_buf()),
+    ));
+    let app = web::router(state);
+
+    for route in ["/", "/reviews", "/operations/op-17", "/doctor"] {
+        let (status, content_type, body) = raw_get(&app, route).await;
+        assert_eq!(status, StatusCode::OK, "{route}");
+        assert!(
+            content_type.starts_with("text/html"),
+            "{route}: {content_type}"
+        );
+        assert!(body.contains("mineral ui"), "{route}: {body}");
+    }
+
+    // A real asset is served as itself, not as the shell.
+    let (status, content_type, body) = raw_get(&app, "/assets/app.js").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(content_type.contains("javascript"), "{content_type}");
+    assert!(body.contains("console.log"), "{body}");
+}
+
+/// The API's own 404 is never swallowed by the UI fallback.
+///
+/// This is the guarantee that keeps a client able to tell "no such endpoint"
+/// from "here is a page": an API caller that receives HTML cannot read a code.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_broken_api_call_stays_a_json_404() {
+    let (_scratch, runtime) = workspace("api-404");
+    let ui = FakeUi::new("api-404-assets");
+    let state = Arc::new(WebState::with_assets(
+        runtime,
+        Some(ui.path().to_path_buf()),
+    ));
+    let app = web::router(state);
+
+    for route in ["/api/v1/nonsense", "/api/nope", "/api"] {
+        let (status, content_type, body) = raw_get(&app, route).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{route}");
+        assert!(
+            content_type.starts_with("application/json"),
+            "{route}: {content_type}"
+        );
+        let parsed: Value = serde_json::from_str(&body).expect("an API 404 is JSON");
+        assert_eq!(parsed["code"], "endpoint_not_found", "{route}");
+    }
+
+    // And the API still works with the UI in front of it.
+    let (status, _, body) = raw_get(&app, "/api/v1/status").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("\"configured\""), "{body}");
+}
+
+/// Without a build, the API works and the pages explain what to do.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unbuilt_ui_says_so_and_leaves_the_api_alone() {
+    let (_scratch, runtime) = workspace("no-ui");
+    let app = web::router(Arc::new(WebState::with_assets(runtime, None)));
+
+    let (status, _, body) = raw_get(&app, "/").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(body.contains("npm --prefix web-ui"), "{body}");
+
+    let (status, _, _) = raw_get(&app, "/api/v1/status").await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+/// A directory without an index is not a built UI, so it is not served as one.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_empty_directory_is_not_a_built_ui() {
+    let (_scratch, runtime) = workspace("empty-ui");
+    let empty = Scratch::new("empty-ui-assets");
+    let state = Arc::new(WebState::with_assets(runtime, Some(empty.0.clone())));
+    assert!(state.assets().is_none());
+    let app = web::router(state);
+
+    let (status, _, _) = raw_get(&app, "/").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
 }
 
 // ---------------------------------------------------------------------------

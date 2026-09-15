@@ -45,7 +45,7 @@ mod status;
 #[cfg(test)]
 mod tests;
 
-use std::{future::Future, net::SocketAddr, sync::Arc};
+use std::{future::Future, net::SocketAddr, path::Path, path::PathBuf, sync::Arc};
 
 use crate::{
     operations::{ApplicationExecutor, OperationSupervisor},
@@ -65,6 +65,13 @@ pub use router::router;
 /// Where a local admin API listens when nothing says otherwise.
 pub const DEFAULT_BIND: &str = "127.0.0.1:8787";
 
+/// Where a built Web UI is looked for when nothing says otherwise.
+///
+/// `cargo` never builds it: a Rust build that shelled out to `npm` would make
+/// every Rust CI run depend on Node. The UI is built once by hand, and the
+/// server finds it here — or is told where it is.
+pub const DEFAULT_ASSETS: &str = "web-ui/dist";
+
 /// Everything a request handler needs.
 ///
 /// One workspace, one supervisor. The supervisor's single-flight rule is per
@@ -72,17 +79,25 @@ pub const DEFAULT_BIND: &str = "127.0.0.1:8787";
 pub struct WebState {
     runtime: Arc<WorkspaceRuntime>,
     supervisor: Arc<OperationSupervisor>,
+    assets: Option<PathBuf>,
 }
 
 impl WebState {
-    /// Builds the state for one workspace.
+    /// Builds the state for one workspace, serving the default asset directory
+    /// when it has been built.
     pub fn new(runtime: Arc<WorkspaceRuntime>) -> Self {
+        Self::with_assets(runtime, Some(PathBuf::from(DEFAULT_ASSETS)))
+    }
+
+    /// Builds the state with an explicit asset directory.
+    pub fn with_assets(runtime: Arc<WorkspaceRuntime>, assets: Option<PathBuf>) -> Self {
         let supervisor = Arc::new(OperationSupervisor::new(Arc::new(
             ApplicationExecutor::new(Arc::clone(&runtime)),
         )));
         Self {
             runtime,
             supervisor,
+            assets: assets.filter(|directory| router::is_built_ui(directory)),
         }
     }
 
@@ -95,7 +110,13 @@ impl WebState {
         Self {
             runtime,
             supervisor,
+            assets: None,
         }
+    }
+
+    /// The built UI this server serves, if one was found.
+    pub fn assets(&self) -> Option<&Path> {
+        self.assets.as_deref()
     }
 
     /// The workspace every read is answered from.

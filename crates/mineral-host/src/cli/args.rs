@@ -25,10 +25,12 @@ pub enum Invocation {
     Review { config: PathBuf, args: Vec<String> },
     /// Run or inspect the private backup.
     Backup { config: PathBuf, args: Vec<String> },
-    /// Serve the local HTTP API.
+    /// Serve the local HTTP API and the built Web UI.
     Web {
         config: PathBuf,
         bind: Option<String>,
+        /// Where the built UI lives. Defaults to `web-ui/dist`.
+        assets: Option<PathBuf>,
     },
 }
 
@@ -84,20 +86,28 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Invocation, Box<dyn E
             config: config_path,
             args: rest,
         }),
-        // `--bind` is the one place this server is told to leave loopback, so it
-        // is parsed explicitly rather than tolerated among the arguments.
+        // `--bind` is the one place this server is told to leave loopback, so
+        // both flags are parsed explicitly rather than tolerated among the
+        // arguments.
         "web" => {
-            let bind = match rest.first().map(String::as_str) {
-                None => None,
-                Some("--bind") => Some(rest.get(1).ok_or("--bind requires an address")?.to_owned()),
-                Some(other) => return Err(format!("unknown web option: {other}").into()),
-            };
-            if rest.len() > 2 {
-                return Err("too many arguments for web".into());
+            let mut bind = None;
+            let mut assets = None;
+            let mut flags = rest.into_iter();
+            while let Some(flag) = flags.next() {
+                match flag.as_str() {
+                    "--bind" => bind = Some(flags.next().ok_or("--bind requires an address")?),
+                    "--assets" => {
+                        assets = Some(PathBuf::from(
+                            flags.next().ok_or("--assets requires a path")?,
+                        ));
+                    }
+                    other => return Err(format!("unknown web option: {other}").into()),
+                }
             }
             Ok(Invocation::Web {
                 config: config_path,
                 bind,
+                assets,
             })
         }
         "help" | "--help" | "-h" => Ok(Invocation::Help),
@@ -143,7 +153,7 @@ pub fn usage() -> String {
         "  mineral [--config PATH] backup verify",
         "  mineral [--config PATH] backup init",
         "  mineral [--config PATH] doctor",
-        "  mineral [--config PATH] web [--bind ADDRESS]",
+        "  mineral [--config PATH] web [--bind ADDRESS] [--assets PATH]",
     ]
     .join("\n")
 }

@@ -184,7 +184,11 @@ pub fn backup(workspace: WorkspaceRuntime, args: &[String]) -> Result<(), Box<dy
 /// The default address is loopback: this interface can publish, back up and
 /// approve content, and it has no authentication. A caller that binds elsewhere
 /// is told exactly what it is doing.
-pub fn web(workspace: WorkspaceRuntime, bind: Option<&str>) -> Result<(), Box<dyn Error>> {
+pub fn web(
+    workspace: WorkspaceRuntime,
+    bind: Option<&str>,
+    assets: Option<&Path>,
+) -> Result<(), Box<dyn Error>> {
     let address: std::net::SocketAddr = bind
         .unwrap_or(mineral_publisher::web::DEFAULT_BIND)
         .parse()
@@ -196,8 +200,14 @@ pub fn web(workspace: WorkspaceRuntime, bind: Option<&str>) -> Result<(), Box<dy
              authentication or TLS. Only do this on a network you trust."
         );
     }
-    let state = Arc::new(mineral_publisher::web::WebState::new(Arc::new(workspace)));
-    output::serving(address);
+    let assets = assets
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| std::path::PathBuf::from(mineral_publisher::web::DEFAULT_ASSETS));
+    let state = Arc::new(mineral_publisher::web::WebState::with_assets(
+        Arc::new(workspace),
+        Some(assets),
+    ));
+    output::serving(address, state.assets());
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

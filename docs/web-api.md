@@ -233,7 +233,30 @@ debug = false                    # 依赖不带 debug info
 panic 仍然报告准确的文件与行号；代价是不能在调试器里看依赖的变量。
 这样 `target/debug` 从约 10.5G 降到可接受范围。
 
-## 下一步（S8.3）
+## 同源提供 Web UI（S8.3）
+
+`mineral web` 同时提供 API 和构建好的 UI：
+
+```text
+/api/*        → JSON API       （未知路径仍然是 JSON 404）
+其它路径      → web-ui/dist    （未知路径返回 index.html）
+```
+
+这个划分是 SPA 的必要条件，也是它的危险点：
+
+- 浏览器刷新 `/operations/op-17` 是在请求一条**客户端路由**，不是文件；返回 404 会破坏刷新。
+- 但它绝不能吞掉 API：`/api/v1/nonsense` 是一次坏掉的 API 调用，客户端收到 HTML 就无法
+  读取 code。这条由测试 `a_broken_api_call_stays_a_json_404` 钉住。
+
+实现细节：用 `ServeDir::fallback` 而**不是** `not_found_service`——后者会把 fallback 的
+状态码强制改成 404，对"文件不存在"正确，对"客户端路由由 shell 以 200 回答"就错了。
+
+UI 没构建时，API 照常工作，页面返回 503 加一段构建说明。
+
+前端在 `web-ui/`（Vite + React + TypeScript），开发/构建流程与 build profile 的原因见
+[`development.md`](development.md)。
+
+## 下一步（S8.4）
 
 Web UI MVP 直接消费这一层，建议顺序：Dashboard（status）→ Reviews（列表 / 详情 /
 approve / reject）→ Operations（进度 + 结果）→ Publish 按钮 → Backup → Doctor。

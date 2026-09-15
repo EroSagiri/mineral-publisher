@@ -60,9 +60,16 @@ pub fn operated(result: &OperationResult) {
     }
 }
 
-/// The address the local API is listening on.
-pub fn serving(address: std::net::SocketAddr) {
-    emit!("Mineral Web API listening on http://{address}/api/v1");
+/// The address the local API is listening on, and whether a UI was found.
+pub fn serving(address: std::net::SocketAddr, assets: Option<&std::path::Path>) {
+    emit!("Mineral Web API listening on http://{address}");
+    match assets {
+        Some(directory) => emit!("  Web UI: {}", directory.display()),
+        None => emit!(
+            "  Web UI: not built. The JSON API works; build the UI with\n    \
+             npm --prefix web-ui install && npm --prefix web-ui run build"
+        ),
+    }
 }
 
 /// The workspace `init` just created.
