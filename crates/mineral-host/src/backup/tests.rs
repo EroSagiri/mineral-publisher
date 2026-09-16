@@ -274,6 +274,7 @@ impl Harness {
         let metadata = metadata();
         run_backup(
             BackupApplicationRequest {
+                progress: &crate::runtime::NoProgress,
                 snapshot,
                 target: &target,
                 commit_metadata: &metadata,
@@ -532,6 +533,7 @@ fn a_ref_that_does_not_exist_yet_fails_closed_instead_of_inventing_a_base() {
 
     let error = run_backup(
         BackupApplicationRequest {
+            progress: &crate::runtime::NoProgress,
             snapshot: &snapshot,
             target: &target,
             commit_metadata: &metadata,

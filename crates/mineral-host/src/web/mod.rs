@@ -24,22 +24,24 @@
 //! * It does not classify failures. Codes come from the operation vocabulary,
 //!   which the CLI also uses.
 //! * It does not carry secrets. There is no field for one on any response.
-//! * It does not persist operations. An operation is in-process work; the
-//!   durable facts are the runs the engine records.
+//! * Live operation IDs belong to one process; the service journal records
+//!   execution history and steps durably under independent UUIDs.
 //!
 //! ## Security model
 //!
-//! This is a **local** administration interface. It can publish, back up and
-//! approve content, so it binds [`DEFAULT_BIND`] — loopback only — and there is
-//! no authentication, no TLS and no multi-user model. Nothing here is meant to
-//! be reached from another machine; a caller that overrides the bind address is
-//! deliberately taking on that decision, and is warned about it.
+//! Production Web/daemon entry points require an environment credential and use
+//! [`WebState::persistent`]. Sessions expire after 12 hours, cookie mutations
+//! require a custom CSRF header, and automation uses Bearer authentication.
+//! The default bind is loopback. Unauthenticated constructors are for embedded
+//! callers and adapter tests; the CLI never uses them.
 
+mod auth;
 mod dto;
 mod error;
 mod operations;
 mod reviews;
 mod router;
+mod service;
 mod sse;
 mod status;
 #[cfg(test)]
@@ -80,6 +82,9 @@ pub struct WebState {
     runtime: Arc<WorkspaceRuntime>,
     supervisor: Arc<OperationSupervisor>,
     assets: Option<PathBuf>,
+    auth: Option<auth::Auth>,
+    store: Option<Arc<crate::service::ServiceStore>>,
+    scheduler_enabled: bool,
 }
 
 impl WebState {
@@ -95,6 +100,9 @@ impl WebState {
             ApplicationExecutor::new(Arc::clone(&runtime)),
         )));
         Self {
+            auth: None,
+            store: None,
+            scheduler_enabled: false,
             runtime,
             supervisor,
             assets: assets.filter(|directory| router::is_built_ui(directory)),
@@ -108,10 +116,49 @@ impl WebState {
         supervisor: Arc<OperationSupervisor>,
     ) -> Self {
         Self {
+            auth: None,
+            store: None,
+            scheduler_enabled: false,
             runtime,
             supervisor,
             assets: None,
         }
+    }
+
+    pub fn persistent(
+        runtime: Arc<WorkspaceRuntime>,
+        assets: Option<PathBuf>,
+        token: &str,
+        scheduler_enabled: bool,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        runtime.prepare().map_err(|e| e.to_string())?;
+        let auth = auth::Auth::new(token, runtime.config.daemon.secure_cookie)?;
+        let store = Arc::new(crate::service::ServiceStore::open(
+            &runtime.config.state_file("service.sqlite3"),
+            &runtime.config.daemon,
+        )?);
+        let supervisor = Arc::new(OperationSupervisor::with_id_seed(
+            Arc::new(crate::service::JournalExecutor {
+                inner: Arc::new(ApplicationExecutor::new(runtime.clone())),
+                store: store.clone(),
+            }),
+            (uuid::Uuid::new_v4().as_u128() as u64) & 0x3fff_ffff_ffff_ffff,
+        ));
+        Ok(Self {
+            runtime,
+            supervisor,
+            assets: assets.filter(|d| router::is_built_ui(d)),
+            auth: Some(auth),
+            store: Some(store),
+            scheduler_enabled,
+        })
+    }
+
+    pub fn scheduler_tick(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if let Some(store) = &self.store {
+            crate::service::tick(store, &self.supervisor, crate::service::now_ms())?;
+        }
+        Ok(())
     }
 
     /// The built UI this server serves, if one was found.
@@ -143,6 +190,14 @@ pub async fn serve_with_shutdown(
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(address).await?;
+    serve_listener_with_shutdown(state, listener, shutdown).await
+}
+
+pub async fn serve_listener_with_shutdown(
+    state: Arc<WebState>,
+    listener: tokio::net::TcpListener,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> std::io::Result<()> {
     axum::serve(listener, router(state))
         .with_graceful_shutdown(shutdown)
         .await

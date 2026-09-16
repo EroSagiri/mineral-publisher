@@ -1,6 +1,6 @@
-# S8.2 — Local HTTP API
+# HTTP API 与认证控制台
 
-`mineral web` 起一个**只监听 loopback** 的本地管理 API。它是与 CLI 同级的第二个入口，
+`mineral web` 启动默认监听 loopback 的认证管理 API。`mineral daemon` 另启每日调度。它是与 CLI 同级的第二个入口，
 两者都只是 `operations/` + `application/` 的 adapter：
 
 ```text
@@ -18,28 +18,21 @@
 启动：
 
 ```bash
+export MINERAL_WEB_TOKEN="$(openssl rand -hex 32)"
 mineral web                       # 默认 127.0.0.1:8787
 mineral web --bind 127.0.0.1:9000 # 换端口
 ```
 
-## 安全模型（本阶段最重要的约束）
+## 安全模型
 
-这个接口能 **publish / backup / 批准内容**，所以：
+默认监听 `127.0.0.1:8787`。生产 Web 和 daemon 都强制要求环境凭据，浏览器使用
+HttpOnly / SameSite=Strict 会话；插件使用 Bearer 认证。Cookie 写请求还必须带
+`X-Mineral-Request: 1`。除登录与会话状态外，API 均需认证，未认证返回 401。
 
-```text
-默认 bind = 127.0.0.1:8787
-```
+可用 `--bind` 更改地址；远程访问通过 HTTPS 反向代理并启用 `daemon.secure_cookie`。
+当前为单管理员权限，不提供 OAuth、多用户 RBAC 或服务内 TLS。
 
-不是 `0.0.0.0`。`--bind` 可以覆盖，但覆盖时会明确警告：
-
-```text
-warning: binding 0.0.0.0:8787, which is not loopback.
-         This interface can publish, back up and approve content, and it has no
-         authentication or TLS. Only do this on a network you trust.
-```
-
-MVP 明确是**本机管理界面，不是远程管理服务**，因此这一轮不做：账号系统、session、
-OAuth、TLS、多用户授权。这样也不会不小心把 `POST /reviews/.../approve` 暴露给局域网。
+完整启动、调度、认证、执行历史接口和 systemd 配置见 [daemon 文档](daemon.md)。
 
 ## 端点
 
@@ -153,10 +146,10 @@ OperationErrorCode  ──>  WebApiError { code, message, causes, ... }
 Mineral 进程重启
   → operation record 丢失
   → GET /operations/:id 返回 404 operation_not_found
-  → UI 回落到 durable 状态：/status、review queue、PublishRun 等
+  → UI 查看 /history 中的持久化执行记录和步骤，也可查看 /status 与审核队列
 ```
 
-这是第一版**明确允许**的语义。真正的审计事实由 durable model 承担
+实时 OperationId 与持久化 history UUID 分离；执行步骤由 service journal 保存。真正的发布审计事实由 durable model 承担
 （`PublishRun` / `ReviewRun` / `HumanReview` / `RemoteObservation` / `DeliveryProjection`），
 operation 只是"某个前端发起的一次正在执行的应用调用及其实时进度"。
 
@@ -167,17 +160,11 @@ operation 只是"某个前端发起的一次正在执行的应用调用及其实
 `operation_not_found` 因此同时意味着"不存在 / 已过期 / server 重启过"，
 UI 遇到它不要猜状态，直接重新拉 durable 状态。
 
-## 这一轮刻意不做
+## 控制台与调度扩展
 
-```text
-❌ 前端
-❌ operation 持久化
-❌ 远程认证 / session / TLS
-❌ 配置编辑 / secret 编辑
-❌ 多 workspace
-❌ WebSocket（SSE 够用：命令走普通 HTTP，进度走单向流）
-❌ 拆新 crate（web 就在 mineral-host 里，和 cli 对称）
-```
+当前已经提供 React 控制台、认证会话、持久化执行历史、逐步骤查看、人工审核站内通知，
+以及发布/备份每日时间设置。实时 Operation API 保持原协议，新增 `/history`、`/schedules`
+和 `/auth/*`。单 workspace 的进程租约同时约束 Web、daemon 与 CLI 写操作。
 
 ## 验收
 

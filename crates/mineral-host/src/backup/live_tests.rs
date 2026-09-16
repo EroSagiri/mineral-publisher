@@ -173,6 +173,7 @@ fn a_real_private_repository_restores_every_byte_after_git_lfs_pull() {
 
     let outcome = run_backup(
         BackupApplicationRequest {
+            progress: &crate::runtime::NoProgress,
             snapshot: &snapshot,
             target: &target,
             commit_metadata: &metadata,

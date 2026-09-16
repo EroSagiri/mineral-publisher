@@ -76,6 +76,14 @@ timeout_seconds = 45
 markdown_concurrency = 4
 asset_concurrency = 2
 
+# Daemon daily schedules (seeded once; subsequent edits live in the Web console).
+# [daemon]
+# publish_at = "09:00"
+# backup_at = "23:00" # Requires backup.enabled = true.
+# utc_offset_minutes = 480
+# token_env = "MINERAL_WEB_TOKEN"
+# secure_cookie = false # Set true when accessed through HTTPS.
+
 # An optional private backup of every Snapshot, byte-faithful and restorable.
 # [backup]
 # enabled = true
@@ -102,6 +110,8 @@ asset_concurrency = 2
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawConfig {
+    #[serde(default)]
+    pub daemon: crate::service::DaemonConfig,
     pub source: SourceConfig,
     pub state: StateConfig,
     pub git: GitConfig,

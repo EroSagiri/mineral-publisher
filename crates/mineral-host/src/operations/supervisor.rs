@@ -241,6 +241,13 @@ impl OperationSupervisor {
         }
     }
 
+    /// Seed service identities independently of a previous process lifetime.
+    pub fn with_id_seed(executor: Arc<dyn OperationExecutor>, first: u64) -> Self {
+        let supervisor = Self::new(executor);
+        supervisor.lock().next_id = OperationId::from_number(first.max(1));
+        supervisor
+    }
+
     /// Accepts an operation and returns its identity immediately.
     ///
     /// The work runs on its own thread, so a caller never waits for a

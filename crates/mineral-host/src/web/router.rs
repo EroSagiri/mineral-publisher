@@ -29,8 +29,21 @@ use super::{WebState, error::WebApiError, operations, reviews, sse, status};
 /// The UI is served when a build exists; when it does not, the API still works
 /// and every page answers with an explanation rather than a blank error.
 pub fn router(state: Arc<WebState>) -> Router {
-    let api = api_router();
-    match state.assets() {
+    let api = api_router()
+        .route(
+            "/v1/schedules",
+            get(super::service::schedules).post(super::service::save),
+        )
+        .route("/v1/history", get(super::service::history))
+        .route("/v1/history/:id/steps", get(super::service::steps))
+        .route("/v1/auth/logout", post(super::auth::logout))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            super::auth::guard,
+        ))
+        .route("/v1/auth/login", post(super::auth::login))
+        .route("/v1/auth/session", get(super::auth::status));
+    let app = match state.assets() {
         Some(directory) => Router::new()
             .nest("/api", api)
             // `fallback`, not `not_found_service`: the latter overrides the
@@ -44,7 +57,24 @@ pub fn router(state: Arc<WebState>) -> Router {
             .nest("/api", api)
             .fallback(missing_ui)
             .with_state(state),
+    };
+    app.layer(axum::middleware::from_fn(security_headers))
+}
+
+async fn security_headers(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let api = request.uri().path().starts_with("/api/");
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers.insert("x-content-type-options", "nosniff".parse().unwrap());
+    headers.insert("x-frame-options", "DENY".parse().unwrap());
+    headers.insert("referrer-policy", "same-origin".parse().unwrap());
+    if api {
+        headers.insert("cache-control", "no-store".parse().unwrap());
     }
+    response
 }
 
 /// The JSON API alone, with no UI behind it.

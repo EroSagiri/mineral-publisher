@@ -13,6 +13,11 @@ use mineral_publisher::config::ConfigFormat;
 pub enum Invocation {
     /// Print the usage text.
     Help,
+    Daemon {
+        config: PathBuf,
+        bind: Option<String>,
+        assets: Option<PathBuf>,
+    },
     /// Create a fresh workspace in one language.
     Init { path: PathBuf, format: ConfigFormat },
     /// Publish the current source state.
@@ -81,7 +86,7 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Invocation, Box<dyn E
         // `--bind` is the one place this server is told to leave loopback, so
         // both flags are parsed explicitly rather than tolerated among the
         // arguments.
-        "web" => {
+        "web" | "daemon" => {
             let mut bind = None;
             let mut assets = None;
             let mut flags = rest.into_iter();
@@ -95,6 +100,13 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Invocation, Box<dyn E
                     }
                     other => return Err(format!("unknown web option: {other}").into()),
                 }
+            }
+            if command == "daemon" {
+                return Ok(Invocation::Daemon {
+                    config: config_path,
+                    bind,
+                    assets,
+                });
             }
             Ok(Invocation::Web {
                 config: config_path,
@@ -136,6 +148,7 @@ pub fn usage() -> String {
         "  mineral [--config PATH] backup verify",
         "  mineral [--config PATH] backup init",
         "  mineral [--config PATH] doctor",
+        "  mineral [--config PATH] daemon [--bind ADDRESS] [--assets PATH]",
         "  mineral [--config PATH] web [--bind ADDRESS] [--assets PATH]",
     ]
     .join("\n")

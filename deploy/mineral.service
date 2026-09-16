@@ -1,0 +1,22 @@
+[Unit]
+Description=Mineral Publisher daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mineral
+Group=mineral
+WorkingDirectory=/var/lib/mineral
+EnvironmentFile=/etc/mineral/environment
+ExecStart=/usr/local/bin/mineral --config /etc/mineral/mineral.toml daemon --bind 127.0.0.1:8787 --assets /usr/local/share/mineral/web
+Restart=on-failure
+RestartSec=10
+# SIGTERM stops scheduling and waits for accepted operations to finish.
+TimeoutStopSec=infinity
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

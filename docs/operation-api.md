@@ -187,3 +187,9 @@ HTTP adapter 应该很薄：`POST /api/v1/operations/publish` 立刻返回 `{"op
   引擎自己写的 durable record（publish run / backup run），不靠这个 id。
 - 并发目前是"每 supervisor 一个闸门"。多工作区（多个 supervisor）天然并行，
   没有全局锁。
+
+## 常驻服务扩展
+
+上述 supervisor 内存语义保持不变。当前 Web/daemon 的 JournalExecutor 将执行历史与步骤
+持久化到 `service.sqlite3`，使用独立 UUID；生产入口还持有工作区进程租约，阻止同一
+工作区多个服务或 CLI 同时写入。调度器和 Web 共用 supervisor。见 [daemon 文档](daemon.md)。

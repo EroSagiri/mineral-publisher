@@ -815,6 +815,7 @@ fn a_live_bucket_receives_the_asset_before_a_real_git_compare_and_swap() {
     let base = repository.remote_head();
 
     let first = GitPublicationApplication::prepare_and_publish(
+        &crate::runtime::NoProgress,
         &projection,
         &snapshot,
         &live_public_scope(),
@@ -877,6 +878,7 @@ fn a_live_bucket_receives_the_asset_before_a_real_git_compare_and_swap() {
     // bucket already serves bytes that hash to the frozen identity, so nothing is
     // uploaded a second time and the ref does not move.
     let second = GitPublicationApplication::prepare_and_publish(
+        &crate::runtime::NoProgress,
         &projection,
         &snapshot,
         &live_public_scope(),

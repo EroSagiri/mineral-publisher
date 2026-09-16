@@ -179,6 +179,7 @@ impl PublicationApplication {
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     pub fn run<R, AR, D, A, H, P, DP, T, S, G, O, DI, AI, PI, OI, B>(
         request: PublicationApplicationRequest<'_>,
+        progress: &dyn crate::runtime::Progress,
         content_store: &B,
         markdown_reviewer: &R,
         asset_reviewer: &AR,
@@ -230,6 +231,7 @@ impl PublicationApplication {
         PI::Error: 'static,
         OI::Error: 'static,
     {
+        progress.stage("Markdown: private filter, program checks and semantic review");
         let documents = PublicPolicyRun::execute_at(
             request.snapshot,
             content_store,
@@ -243,6 +245,19 @@ impl PublicationApplication {
             markdown_evaluator,
         )
         .map_err(|e| stage("markdown review", e))?;
+        for outcome in documents.document_outcomes() {
+            let status = match outcome.decision() {
+                crate::policy::PublicPolicyDecision::ProgramIssues(_) => "program_blocked",
+                crate::policy::PublicPolicyDecision::ReviewApproved => "approved",
+                crate::policy::PublicPolicyDecision::ReviewRejected => "rejected",
+                crate::policy::PublicPolicyDecision::NeedsHumanReview(_) => "needs_human_review",
+            };
+            progress.detail(&format!(
+                "Markdown {}: {status}; document:{}",
+                outcome.content_path(),
+                outcome.id().get()
+            ));
+        }
         validate_explicit_selection(
             &request.human_reviews,
             human_store,
@@ -252,6 +267,7 @@ impl PublicationApplication {
             request.asset_policy,
         )?;
         let no_assets = AssetReviewWorkflowResult::empty(request.snapshot.id());
+        progress.stage("Markdown: bind automatic attempts and human decisions");
         let document_effective = EffectiveReviewSet::build(
             &documents,
             &no_assets,
@@ -263,6 +279,7 @@ impl PublicationApplication {
         )
         .map_err(|e| stage("Markdown human resolution", e))?;
         if document_effective.has_pending_review() {
+            progress.stage("Publication paused: human review required");
             return Ok(PublicationApplicationOutcome::NeedsHumanReview {
                 trace: PublicationTrace {
                     snapshot: request.snapshot.clone(),
@@ -277,9 +294,11 @@ impl PublicationApplication {
             .dependency_graph()
             .cloned()
             .ok_or(PublicationApplicationError::MissingDependencyGraph)?;
+        progress.stage("Assets: resolve required dependencies");
         let candidates =
             CandidateAssetSet::select_effective(&document_effective, &graph, request.public_scope)
                 .map_err(|e| stage("candidate asset selection", e))?;
+        progress.stage("Assets: program checks and semantic review");
         let assets = AssetReviewWorkflow::execute_at(
             AssetReviewWorkflowInput::new(
                 &candidates,
@@ -303,6 +322,7 @@ impl PublicationApplication {
             request.snapshot,
             request.asset_policy,
         )?;
+        progress.stage("Assets: bind human decisions and check publication readiness");
         let effective = EffectiveReviewSet::build(
             &documents,
             &assets,
@@ -321,8 +341,10 @@ impl PublicationApplication {
             effective_reviews: effective,
         };
         if trace.effective_reviews.has_pending_review() {
+            progress.stage("Publication paused: human review required");
             return Ok(PublicationApplicationOutcome::NeedsHumanReview { trace });
         }
+        progress.stage("Assets: strip metadata and create publication bytes");
         let sanitized = AssetSanitizer::new(content_store.clone())
             .sanitize(
                 trace.effective_reviews(),
@@ -330,6 +352,7 @@ impl PublicationApplication {
                 request.snapshot,
             )
             .map_err(|e| stage("asset sanitization", e))?;
+        progress.stage("Projection: close dependencies and remove orphan assets");
         let publication_set = FinalPublicationSet::close(
             trace.effective_reviews(),
             &graph,
@@ -337,13 +360,17 @@ impl PublicationApplication {
             request.snapshot,
         )
         .map_err(|e| stage("final dependency closure", e))?;
+        progress.stage("Projection: build complete desired state");
         let projection = PublicProjection::build(
             &publication_set,
             request.snapshot,
             ManagedRoot::repository_root(),
         )
         .map_err(|e| stage("public projection", e))?;
+        progress
+            .stage("Publisher: deliver assets, validate exact Git tree, record intent and push");
         let publication = GitPublicationApplication::prepare_and_publish(
+            progress,
             &projection,
             request.snapshot,
             request.public_scope,

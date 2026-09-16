@@ -39,6 +39,16 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         Invocation::Backup { config, args } => {
             commands::backup(WorkspaceRuntime::load(config)?, &args)
         }
+        Invocation::Daemon {
+            config,
+            bind,
+            assets,
+        } => commands::serve(
+            WorkspaceRuntime::load(config)?,
+            bind.as_deref(),
+            assets.as_deref(),
+            true,
+        ),
         Invocation::Web {
             config,
             bind,

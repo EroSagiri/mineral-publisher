@@ -35,6 +35,13 @@ fn operate(
     workspace: WorkspaceRuntime,
     request: OperationRequest,
 ) -> Result<Arc<OperationResult>, Box<dyn Error>> {
+    workspace.prepare()?;
+    let _lease = if request.kind().is_mutating() {
+        Some(mineral_publisher::service::process_lease(&workspace.config.state_file("daemon-lock.sqlite3"))
+            .map_err(|_| "workspace is owned by a Web/daemon process; submit this operation through its authenticated API")?)
+    } else {
+        None
+    };
     let supervisor =
         OperationSupervisor::new(Arc::new(ApplicationExecutor::new(Arc::new(workspace))));
     let id = supervisor.start(request)?;
@@ -184,40 +191,92 @@ pub fn backup(workspace: WorkspaceRuntime, args: &[String]) -> Result<(), Box<dy
 
 /// Serves the local HTTP API until the process is stopped.
 ///
-/// The default address is loopback: this interface can publish, back up and
-/// approve content, and it has no authentication. A caller that binds elsewhere
-/// is told exactly what it is doing.
+/// The default address is loopback; authentication is required on every bind.
 pub fn web(
     workspace: WorkspaceRuntime,
     bind: Option<&str>,
     assets: Option<&Path>,
 ) -> Result<(), Box<dyn Error>> {
+    serve(workspace, bind, assets, false)
+}
+
+pub fn serve(
+    workspace: WorkspaceRuntime,
+    bind: Option<&str>,
+    assets: Option<&Path>,
+    daemon: bool,
+) -> Result<(), Box<dyn Error>> {
     let address: std::net::SocketAddr = bind
         .unwrap_or(mineral_publisher::web::DEFAULT_BIND)
-        .parse()
-        .map_err(|error| format!("--bind needs an address like 127.0.0.1:8787: {error}"))?;
-    if !mineral_publisher::web::is_loopback(&address) {
-        eprintln!(
-            "warning: binding {address}, which is not loopback.\n         \
-             This interface can publish, back up and approve content, and it has no\n         \
-             authentication or TLS. Only do this on a network you trust."
-        );
-    }
+        .parse()?;
+    workspace.prepare()?;
+    let _lease = mineral_publisher::service::process_lease(
+        &workspace.config.state_file("daemon-lock.sqlite3"),
+    )
+    .map_err(
+        |_| "another Web/daemon process already owns this workspace, or the lease cannot be opened",
+    )?;
+    let token = std::env::var(&workspace.config.daemon.token_env).map_err(|_| {
+        format!(
+            "set {} to a random token of at least 32 bytes before starting Web/daemon",
+            workspace.config.daemon.token_env
+        )
+    })?;
     let assets = assets
         .map(Path::to_path_buf)
-        .unwrap_or_else(|| std::path::PathBuf::from(mineral_publisher::web::DEFAULT_ASSETS));
-    let state = Arc::new(mineral_publisher::web::WebState::with_assets(
-        Arc::new(workspace),
-        Some(assets),
-    ));
+        .unwrap_or_else(|| mineral_publisher::web::DEFAULT_ASSETS.into());
+    let state = Arc::new(
+        mineral_publisher::web::WebState::persistent(
+            Arc::new(workspace),
+            Some(assets),
+            &token,
+            daemon,
+        )
+        .map_err(|e| e.to_string())?,
+    );
     output::serving(address, state.assets());
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .build()
-        .map_err(|error| format!("could not start the async runtime: {error}"))?;
-    runtime
-        .block_on(mineral_publisher::web::serve(state, address))
-        .map_err(|error| format!("the server stopped: {error}").into())
+        .build()?;
+    runtime.block_on(async move {
+        let listener = tokio::net::TcpListener::bind(address).await?;
+        let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
+        let shutdown_tx = stop_tx.clone();
+        let scheduler_state = state.clone();
+        let scheduler = tokio::spawn(async move {
+            if !daemon { return; }
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = stop_rx.changed() => break,
+                    _ = interval.tick() => {
+                        let s = scheduler_state.clone();
+                        if !matches!(tokio::task::spawn_blocking(move || s.scheduler_tick()).await, Ok(Ok(()))) {
+                            eprintln!("scheduler storage error; next tick will recheck durable claims");
+                        }
+                    }
+                }
+            }
+        });
+        let result = mineral_publisher::web::serve_listener_with_shutdown(state.clone(), listener, async move {
+            #[cfg(unix)] {
+                let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("SIGTERM handler");
+                tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = term.recv() => {} }
+            }
+            #[cfg(not(unix))] { let _ = tokio::signal::ctrl_c().await; }
+            let _ = shutdown_tx.send(true);
+        }).await;
+        let _ = stop_tx.send(true);
+        let _ = scheduler.await;
+        // Wait for accepted work, including verification, before releasing the lease.
+        let supervisor = state.supervisor().clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            for operation in supervisor.snapshots() { supervisor.wait(operation.id); }
+        }).await;
+        result
+    })?;
+    Ok(())
 }
 
 /// The positional argument a subcommand requires.

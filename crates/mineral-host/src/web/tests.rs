@@ -980,3 +980,155 @@ async fn no_response_can_carry_a_secret() {
         assert_no_secret_field(body);
     }
 }
+
+#[tokio::test]
+async fn authenticated_console_protects_reads_mutations_sse_and_logout() {
+    let (_scratch, runtime) = workspace("authenticated-console");
+    let token = "test-secret-012345678901234567890123456789";
+    let state = Arc::new(super::WebState::persistent(runtime, None, token, true).unwrap());
+    let app = super::router(state);
+    for path in [
+        "/api/v1/status",
+        "/api/v1/history",
+        "/api/v1/reviews",
+        "/api/v1/operations/op-1/events",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
+    }
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/login")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::json!({"token":token}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let cookie = response.headers()["set-cookie"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert!(cookie.contains("HttpOnly"));
+    assert!(cookie.contains("SameSite=Strict"));
+    let cookie = cookie.split(';').next().unwrap();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/history")
+                .header("cookie", cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/logout")
+                .header("cookie", cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/logout")
+                .header("cookie", cookie)
+                .header("x-mineral-request", "1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/history")
+                .header("cookie", cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/schedules")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn schedules_validate_and_persist_without_exposing_credentials() {
+    let (_scratch, runtime) = workspace("schedule-api");
+    let token = "test-schedule-012345678901234567890123456789";
+    let state = Arc::new(super::WebState::persistent(runtime.clone(), None, token, true).unwrap());
+    let app = super::router(state);
+    for (at, expected) in [
+        ("25:00", StatusCode::BAD_REQUEST),
+        ("09:15", StatusCode::OK),
+    ] {
+        let body =
+            serde_json::json!({"kind":"publish","at":at,"enabled":true,"utc_offset_minutes":480});
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/schedules")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected);
+    }
+    drop(app);
+    let state = Arc::new(super::WebState::persistent(runtime, None, token, true).unwrap());
+    let app = super::router(state);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/schedules")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let body = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(body.contains("09:15"));
+    assert!(!body.contains(token));
+}

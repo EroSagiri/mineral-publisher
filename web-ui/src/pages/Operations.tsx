@@ -21,14 +21,20 @@ function Detail({ id }: { id: string }) {
     const controller = new AbortController();
     setSnapshot(null);
     setError(null);
-    fetchOperation(id, controller.signal)
-      .then(setSnapshot)
-      .catch((cause: unknown) => {
-        if (!controller.signal.aborted) {
-          setError(cause);
-        }
-      });
-    return () => controller.abort();
+    const refresh = () =>
+      fetchOperation(id, controller.signal)
+        .then(setSnapshot)
+        .catch((cause: unknown) => {
+          if (!controller.signal.aborted) {
+            setError(cause);
+          }
+        });
+    void refresh();
+    const timer = setInterval(() => void refresh(), 4000);
+    return () => {
+      controller.abort();
+      clearInterval(timer);
+    };
   }, [id]);
 
   if (error !== null) {
@@ -39,8 +45,8 @@ function Detail({ id }: { id: string }) {
         <Problem error={error} what={`operation ${id}`} />
         <p className="muted small">
           An operation is not durable. If the server restarted, read{" "}
-          <Link to="/">the current state</Link> instead — the publication and backup
-          runs it produced are recorded separately.
+          <Link to="/">the current state</Link> instead — the publication and
+          backup runs it produced are recorded separately.
         </p>
       </>
     );
@@ -59,14 +65,20 @@ export function Operations() {
 
   useEffect(() => {
     const controller = new AbortController();
-    fetchOperations(controller.signal)
-      .then(setSummaries)
-      .catch((cause: unknown) => {
-        if (!controller.signal.aborted) {
-          setError(cause);
-        }
-      });
-    return () => controller.abort();
+    const refresh = () =>
+      fetchOperations(controller.signal)
+        .then(setSummaries)
+        .catch((cause: unknown) => {
+          if (!controller.signal.aborted) {
+            setError(cause);
+          }
+        });
+    void refresh();
+    const timer = setInterval(() => void refresh(), 4000);
+    return () => {
+      controller.abort();
+      clearInterval(timer);
+    };
   }, [version]);
 
   return (
@@ -93,7 +105,9 @@ export function Operations() {
                       <Link
                         to={`/operations/${summary.id}`}
                         className={
-                          summary.id === id ? "queue-item selected" : "queue-item"
+                          summary.id === id
+                            ? "queue-item selected"
+                            : "queue-item"
                         }
                       >
                         <span className="mono small">{summary.id}</span>

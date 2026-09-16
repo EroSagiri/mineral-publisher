@@ -170,6 +170,7 @@ pub fn publish(
     progress.stage("[2/4] Running privacy, program checks, and semantic review...");
     let outcome = PublicationApplication::run(
         publication_request,
+        progress.as_ref(),
         &content_store,
         &markdown_reviewer,
         &asset_reviewer,

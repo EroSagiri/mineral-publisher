@@ -1954,11 +1954,12 @@ mod tests {
                 .to_string()
                 .contains("super-secret-key")
         );
-        assert!(
-            server
-                .raw_request(0)
-                .contains("authorization: Bearer super-secret-key")
-        );
+        assert!(server.raw_request(0).lines().any(|line| {
+            let Some((name, value)) = line.split_once(':') else {
+                return false;
+            };
+            name.eq_ignore_ascii_case("authorization") && value.trim() == "Bearer super-secret-key"
+        }));
     }
 
     #[test]

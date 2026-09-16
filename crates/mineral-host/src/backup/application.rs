@@ -44,6 +44,7 @@ impl BackupRunIdGenerator for SequentialBackupRunIdGenerator {
 
 /// Everything one backup attempt needs that is not a port.
 pub struct BackupApplicationRequest<'a> {
+    pub progress: &'a dyn crate::runtime::Progress,
     pub snapshot: &'a Snapshot,
     pub target: &'a GitRefTarget,
     pub commit_metadata: &'a GitCommitMetadata,
@@ -119,14 +120,26 @@ where
     L: LfsRemote,
     B: BlobStore,
 {
+    request
+        .progress
+        .stage("Backup: build complete snapshot projection");
     let projection =
         BackupProjection::build(request.snapshot).map_err(BackupApplicationError::Projection)?;
+    request
+        .progress
+        .stage("Backup: materialize files and Git LFS pointers");
     let delivery = build_backup_delivery(&projection, request.policy, blobs)
         .map_err(BackupApplicationError::Delivery)?;
+    request.progress.detail(&format!(
+        "{} files; {} required LFS objects",
+        delivery.files().len(),
+        delivery.required_lfs_objects().len()
+    ));
     let tree = build_backup_tree(&delivery).map_err(BackupApplicationError::Delivery)?;
 
     // The base is observed, never chosen: a backup either continues the ref it found
     // or refuses to move it.
+    request.progress.stage("Backup: observe remote base commit");
     let base_commit = match remote
         .observe_ref(request.target)
         .map_err(BackupApplicationError::Remote)?
@@ -136,6 +149,9 @@ where
             return Err(BackupApplicationError::NoBaseCommit(request.target.clone()));
         }
     };
+    request
+        .progress
+        .stage("Backup: materialize and validate exact Git tree");
     let reviewed = repository
         .materialize_backup(&base_commit, &tree)
         .map_err(BackupApplicationError::Repository)?;
@@ -169,10 +185,19 @@ where
         request.commit_metadata.message(),
     )
     .map_err(BackupApplicationError::CommitSpec)?;
+    request
+        .progress
+        .stage("Backup: create commit from validated tree");
     let desired_commit = repository
         .create_commit(&spec)
         .map_err(BackupApplicationError::Repository)?;
 
+    request.progress.detail(&format!(
+        "Base {}; reviewed tree {}; commit {}",
+        base_commit.as_str(),
+        reviewed.tree_oid().as_str(),
+        desired_commit.as_str()
+    ));
     let run_id = run_ids.next_id();
     let run = BackupRun::new(
         run_id,
@@ -186,9 +211,18 @@ where
         request.created_at.as_unix_millis(),
     )
     .map_err(BackupApplicationError::Run)?;
+    request
+        .progress
+        .detail(&format!("Backup run {}", run_id.get()));
     // Durable before any remote side effect: a restart resumes this attempt.
+    request
+        .progress
+        .stage("Backup: persist immutable intent before remote effects");
     store.save(&run).map_err(BackupApplicationError::Store)?;
 
+    request
+        .progress
+        .stage("Backup: deliver required LFS objects and compare-and-swap remote ref");
     let execution = execute_backup(store, repository, remote, lfs, blobs, run_id)
         .map_err(BackupApplicationError::Execution)?;
 

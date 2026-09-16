@@ -72,3 +72,7 @@ cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets --all-features
 ```
+
+## 常驻调度与认证 Web
+
+`mineral daemon` 同时提供每天定时发布、定时备份和认证控制台；`mineral web` 只提供控制台。设置 `MINERAL_WEB_TOKEN` 后启动，可在 Web 编辑计划、查看持久化步骤和提交详情、处理人工审核通知及验证备份。配置、API 和 systemd 部署方法见 [daemon 文档](docs/daemon.md)。

@@ -2023,3 +2023,9 @@ Quartz / Cloudflare Pages 集成
 第一版目标只有：
 
 > 建立一条简单、可靠、自动、可审核、可追溯的内容发布流水线。
+
+# 46. 常驻调度与控制台执行记录
+
+Host 的 `service` 层增加每日调度和持久化执行日志，复用 OperationSupervisor 与既有 application 流程。调度器和 Web 共用一个 supervisor；进程间通过工作区 SQLite 排他租约协调。每日 slot 在派发前写入 SQLite，同一天不会因重启自动再次派发。中断窗口保持不确定状态，不能以重试覆盖未知远端结果。
+
+`service.sqlite3` 保存调度计划、派发记录、执行历史和逐阶段事件；这些是运维记录，不替代不可变 Snapshot、ReviewRun、PublishRun、BackupRun 与远端 observation。业务结果仍由原流程决定。控制台使用环境凭据认证，Cookie 会话或 Bearer API 访问；人工审查决定仍绑定具体 attempt。详见 `docs/daemon.md`。

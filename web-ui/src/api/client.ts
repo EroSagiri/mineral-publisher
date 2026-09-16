@@ -55,11 +55,12 @@ async function request<T>(
 ): Promise<T> {
   const response = await fetch(`${BASE}${path}`, {
     method,
-    headers: { Accept: "application/json" },
+    headers: { Accept: "application/json", "X-Mineral-Request": "1" },
     signal,
   });
 
   if (!response.ok) {
+    if (response.status === 401) window.dispatchEvent(new Event("mineral-auth-expired"));
     // A failure the API described is JSON. Anything else (a proxy error page, a
     // dropped connection) becomes a synthetic error with the real status.
     let body: Partial<ApiErrorBody> = {};

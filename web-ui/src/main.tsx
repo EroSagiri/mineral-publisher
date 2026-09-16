@@ -2,6 +2,7 @@ import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { BrowserRouter } from "react-router-dom";
 
+import { Auth } from "./Auth";
 import { App } from "./App";
 import { OperationsProvider } from "./state/operations";
 import "./styles.css";
@@ -14,9 +15,9 @@ if (container === null) {
 createRoot(container).render(
   <StrictMode>
     <BrowserRouter>
-      <OperationsProvider>
+      <Auth><OperationsProvider>
         <App />
-      </OperationsProvider>
+      </OperationsProvider></Auth>
     </BrowserRouter>
   </StrictMode>,
 );

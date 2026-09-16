@@ -138,6 +138,7 @@ pub fn backup(
     }
     runtime.prepare()?;
     let content_store = runtime.content_store();
+    progress.stage("Backup: create immutable source snapshot");
     let snapshot = runtime.snapshot(progress)?;
     let store = runtime.backup_runs()?;
     let repository = runtime.backup_repository()?;
@@ -147,6 +148,7 @@ pub fn backup(
     let metadata = runtime.backup_commit_metadata()?;
     let policy = TypeFirstBackupRepresentationPolicy;
     let request = crate::backup::application::BackupApplicationRequest {
+        progress,
         snapshot: &snapshot,
         target: &target,
         commit_metadata: &metadata,

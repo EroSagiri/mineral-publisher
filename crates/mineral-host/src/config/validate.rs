@@ -72,6 +72,12 @@ impl ValidatedConfig {
             .unwrap_or_else(|| Path::new("."))
             .to_path_buf();
         let mut model = model;
+        model.daemon.validate().map_err(ConfigError::invalid)?;
+        if model.daemon.backup_at.is_some() && !model.backup.as_ref().is_some_and(|b| b.enabled) {
+            return Err(ConfigError::invalid(
+                "daemon.backup_at requires an enabled backup target",
+            ));
+        }
         if model.review.markdown_concurrency == 0 || model.review.asset_concurrency == 0 {
             return Err(ConfigError::invalid(
                 "review concurrency must be at least 1",

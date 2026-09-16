@@ -346,6 +346,7 @@ impl<
 impl GitPublicationApplication {
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     pub fn prepare_and_publish<P, D, T, S, G, O, R, I, B>(
+        progress: &dyn crate::runtime::Progress,
         projection: &PublicProjection,
         snapshot: &Snapshot,
         public_scope: &PublicExclusionRules,
@@ -391,6 +392,7 @@ impl GitPublicationApplication {
             .map_err(GitPublicationApplicationError::RepositoryIdentity)?;
         // The remote observation stays here: the portable prepare stage is told
         // which base the target holds instead of reaching for a remote itself.
+        progress.stage("Git: observe exact remote base");
         let observed = GitRemoteObserver::observe_target(repository.path(), &target)
             .map_err(GitPublicationApplicationError::PreparationObservation)?;
         let RemoteRefState::Present { commit_oid } = observed else {
@@ -399,6 +401,7 @@ impl GitPublicationApplication {
         // The delivery split happens before any Git fact is read: the runtime is
         // handed the final text side, so binary assets and reference rewriting are
         // decided in the engine rather than by the Git adapter.
+        progress.stage("Delivery: resolve asset destinations and rewrite references");
         let delivery =
             DeliveryProjectionBuilder::build(projection, snapshot, delivery_config, content_store)
                 .map_err(GitPublicationApplicationError::Delivery)?;
@@ -407,6 +410,7 @@ impl GitPublicationApplication {
         // bound, so that projection has to exist first. An orphan projection whose
         // run never gets saved is harmless — it is content-addressed and describes
         // an intent nothing acted on.
+        progress.stage("Delivery: persist frozen delivery projection");
         delivery_projections
             .save(&delivery)
             .map_err(GitPublicationApplicationError::DeliveryPersistence)?;
@@ -428,6 +432,7 @@ impl GitPublicationApplication {
         let publish_run_id = publish_run_ids
             .next_id()
             .map_err(GitPublicationApplicationError::PublishRunId)?;
+        progress.stage("Git: build plan, validate reviewed tree and create commit");
         let preparation = GitPublicationPreparer::prepare(
             &git_repository,
             &GitPublicationPrepareRequest {
@@ -447,14 +452,27 @@ impl GitPublicationApplication {
         .map_err(GitPublicationApplicationError::Prepare)?;
         let publish_plan_sha256 = preparation.publish_plan_sha256();
         let publish_run = preparation.into_publish_run();
+        progress.detail(&format!(
+            "Publish run {}; base {}; reviewed tree {}; commit {}",
+            publish_run.id().get(),
+            publish_run.base_commit(),
+            publish_run.reviewed_tree(),
+            publish_run
+                .desired_commit()
+                .map(|c| c.as_str())
+                .unwrap_or("noop")
+        ));
         // The scope this attempt was decided under is frozen beside the intent and
         // becomes durable in the same write: a recorded attempt can never be left
         // without the provenance that explains its public scope.
+        progress.stage("Git: persist publication intent");
         publish_run_store
             .save(&publish_run, &FrozenPublicScope::of(public_scope))
             .map_err(GitPublicationApplicationError::PublishRunPersistence)?;
         let remote = GitRemoteAdapter::new(repository.path())
             .map_err(GitPublicationApplicationError::RemoteAdapter)?;
+        progress
+            .stage("Publisher: upload dependencies, push exact commit and reconcile remote state");
         let workflow = DeliveryPublicationExecutor::execute(
             publish_run_id,
             publish_run_store,
@@ -867,6 +885,7 @@ mod tests {
             SequentialRemoteObservationIdGenerator::new(RemoteObservationId::new(1).unwrap());
 
         let result = GitPublicationApplication::prepare_and_publish(
+            &crate::runtime::NoProgress,
             &projection,
             &snapshot,
             &PublicExclusionRules::empty(),
@@ -920,6 +939,7 @@ mod tests {
             SequentialRemoteObservationIdGenerator::new(RemoteObservationId::new(1).unwrap());
 
         let result = GitPublicationApplication::prepare_and_publish(
+            &crate::runtime::NoProgress,
             &projection,
             &snapshot,
             &PublicExclusionRules::empty(),
@@ -973,6 +993,7 @@ mod tests {
             SequentialRemoteObservationIdGenerator::new(RemoteObservationId::new(1).unwrap());
 
         let result = GitPublicationApplication::prepare_and_publish(
+            &crate::runtime::NoProgress,
             &projection,
             &snapshot,
             &PublicExclusionRules::empty(),
@@ -1033,6 +1054,7 @@ mod tests {
             SequentialRemoteObservationIdGenerator::new(RemoteObservationId::new(1).unwrap());
 
         let result = GitPublicationApplication::prepare_and_publish(
+            &crate::runtime::NoProgress,
             &projection,
             &snapshot,
             &PublicExclusionRules::empty(),
@@ -1093,6 +1115,7 @@ mod tests {
             SequentialRemoteObservationIdGenerator::new(RemoteObservationId::new(1).unwrap());
 
         let result = GitPublicationApplication::prepare_and_publish(
+            &crate::runtime::NoProgress,
             &projection,
             &snapshot,
             &PublicExclusionRules::empty(),
@@ -1186,6 +1209,7 @@ mod tests {
             PublicExclusionRules::new(["secret.md".to_owned(), "private/**".to_owned()]).unwrap();
 
         let result = GitPublicationApplication::prepare_and_publish(
+            &crate::runtime::NoProgress,
             &projection,
             &snapshot,
             &scope,
@@ -1245,6 +1269,7 @@ mod tests {
             SequentialRemoteObservationIdGenerator::new(RemoteObservationId::new(1).unwrap());
 
         let result = GitPublicationApplication::prepare_and_publish(
+            &crate::runtime::NoProgress,
             &projection,
             &snapshot,
             &PublicExclusionRules::empty(),
@@ -1326,6 +1351,7 @@ mod tests {
             SequentialRemoteObservationIdGenerator::new(RemoteObservationId::new(1).unwrap());
 
         let result = GitPublicationApplication::prepare_and_publish(
+            &crate::runtime::NoProgress,
             &projection,
             &snapshot,
             &PublicExclusionRules::empty(),
